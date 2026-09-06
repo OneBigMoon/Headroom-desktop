@@ -65,6 +65,10 @@
      in both modes, promoted to a token so text on a plain surface can reach
      for it without re-inlining the hex. */
   --success:            #1f4a36;
+  --runtime-running:    #22c55e;
+  --runtime-error:      #ef4444;
+  --runtime-starting:   #eab308;
+  --runtime-stopped:    #9ca3af;
 
   /* Activity feed badge accents — one hue per event kind */
   --activity-train-strong:     #2a5e80;
@@ -6978,12 +6982,29 @@ html[data-edition="local-community"] #root {
   font-size: var(--text-xxs);
 }
 
-.community-sidebar__local-dot {
+.runtime-status-indicator[data-runtime-state="running"] {
+  --runtime-indicator-color: var(--runtime-running);
+}
+
+.runtime-status-indicator[data-runtime-state="error"] {
+  --runtime-indicator-color: var(--runtime-error);
+}
+
+.runtime-status-indicator[data-runtime-state="starting"] {
+  --runtime-indicator-color: var(--runtime-starting);
+}
+
+.runtime-status-indicator[data-runtime-state="stopped"] {
+  --runtime-indicator-color: var(--runtime-stopped);
+}
+
+.runtime-status-indicator__dot {
   width: 7px;
   height: 7px;
+  flex-shrink: 0;
   border-radius: 99px;
-  background: var(--success);
-  box-shadow: 0 0 0 3px var(--accent-tint);
+  background: var(--runtime-indicator-color);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--runtime-indicator-color) 14%, transparent);
 }
 
 .community-main {
@@ -7978,10 +7999,9 @@ html[data-edition="local-community"] .community-sidebar__footer {
   font-size: 9.5px;
 }
 
-html[data-edition="local-community"] .community-sidebar__local-dot {
+html[data-edition="local-community"] .community-sidebar__footer .runtime-status-indicator__dot {
   width: 6px;
   height: 6px;
-  box-shadow: 0 0 0 3px var(--community-green-soft);
 }
 
 html[data-edition="local-community"] .community-main {

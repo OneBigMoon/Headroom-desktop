@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   bridgeConnectionNeedsRepair,
+  bridgeNeedsRestart,
   bridgePairingIsUsable,
   bridgeResponseIsCurrent,
   chooseCodexBridgeActionWorkspace,
@@ -11,6 +12,11 @@ import { RECOMMENDED_ADDON_PRESET } from "./components/AddonPresetBar";
 import { mockDashboard } from "./lib/mockData";
 
 describe("bridge connector endpoint changes", () => {
+  it("restarts a stopped bridge without reauthorizing a valid connector", () => {
+    expect(bridgeNeedsRestart({ paired: true, installed: true, running: false })).toBe(true);
+    expect(bridgeNeedsRestart({ paired: true, installed: true, running: true })).toBe(false);
+    expect(bridgeNeedsRestart({ paired: false, installed: true, running: false })).toBe(false);
+  });
   it("invalidates an old action after switching away and back to the same workspace", () => {
     const original = { workspace: "/workspace/a", generation: 0 };
     const switched = nextBridgeWorkspaceGeneration(original, "/workspace/b");

@@ -358,6 +358,7 @@ html[data-edition="local-community"] .tray-panel__title {
 html[data-edition="local-community"] .tray-panel__local-status {
   display: inline-flex;
   align-items: center;
+  gap: 6px;
   min-height: 26px;
   padding: 4px 9px;
   border: 1px solid var(--border-subtle);
@@ -367,16 +368,6 @@ html[data-edition="local-community"] .tray-panel__local-status {
   font-size: var(--text-xxs);
   font-weight: 600;
   white-space: nowrap;
-}
-
-html[data-edition="local-community"] .tray-panel__local-status::before {
-  width: 7px;
-  height: 7px;
-  margin-right: 6px;
-  border-radius: 50%;
-  background: var(--success);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 14%, transparent);
-  content: "";
 }
 
 html[data-edition="local-community"] .tray-content {

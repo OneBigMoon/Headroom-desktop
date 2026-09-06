@@ -15,6 +15,7 @@ import { ActivityFeed } from "./components/ActivityFeed";
 import { ConnectorIcon } from "./components/ConnectorIcon";
 import { LearnScanStatusLine } from "./components/LearnScanStatusLine";
 import { OptimizePanel } from "./components/OptimizePanel";
+import { RuntimeStatusIndicator } from "./components/RuntimeStatusIndicator";
 import { localeOptions, useI18n, type Locale, type Translate, type TranslationKey } from "./lib/i18n";
 import { LOCAL_COMMUNITY_NAME } from "./lib/localEdition";
 import { conflictHeadingCopy, conflictMatrixCopy, getActivationScopeCopy, groupToolsByCategory, sourceLinkCopy, toolCategoryCopy, toolCopy, TOOL_CATEGORY_ORDER, workflowGroupCopy } from "./lib/workflowCatalog";
@@ -711,10 +712,11 @@ export function CommunityApp() {
           })}
         </nav>
 
-        <div className="community-sidebar__footer">
-          <span className="community-sidebar__local-dot" aria-hidden="true" />
-          <span>{t("brand.runsOnThisMac")}</span>
-        </div>
+        <RuntimeStatusIndicator
+          className="community-sidebar__footer"
+          runtime={runtime}
+          label={t("brand.runsOnThisMac")}
+        />
       </aside>
 
       <section className="community-main">

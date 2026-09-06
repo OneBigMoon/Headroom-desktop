@@ -1,0 +1,91 @@
+diff --git a/src/auth/oauth.ts b/src/auth/oauth.ts
+index 5530639..5ba3868 100644
+--- a/src/auth/oauth.ts
++++ b/src/auth/oauth.ts
+@@ -5,6 +5,7 @@ import { PairingManager } from "../pairing/manager.js";
+ import type { Logger } from "../logger/index.js";
+ import { PRODUCT_NAME } from "../version.js";
+ import { escapeHtml, setAuthSecurityHeaders } from "./html.js";
++import { BrowserAuth } from "./browser-auth.js";
+ 
+ export interface OAuthDeps {
+   store: AuthStore;
+@@ -23,6 +24,7 @@ interface PendingAuthRequest {
+   codeChallenge: string;
+   resource?: string;
+   expiresAt: number;
++  browserSession?: string;
+ }
+ 
+ function isAllowedRedirectUri(uri: string): boolean {
+@@ -136,6 +138,8 @@ function pairingPage(opts: {
+ 
+ export function createOAuthRouter(deps: OAuthDeps): Router {
+   const router = Router();
++  const browserAuth = new BrowserAuth(deps);
++  router.use(browserAuth.router);
+   const pendingRequests = new Map<string, PendingAuthRequest>();
+ 
+   const prunePending = (): void => {
+@@ -222,6 +226,7 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
+       return;
+     }
+     const scopes = filterScopes(query.scope);
++    const browserSession = browserAuth.sessionFor(req, redirectUri);
+     const request: PendingAuthRequest = {
+       id: randomBytes(16).toString("hex"),
+       clientId: client.clientId,
+@@ -231,26 +236,36 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
+       codeChallenge: query.code_challenge,
+       resource: query.resource,
+       expiresAt: Date.now() + 10 * 60_000,
++      browserSession: browserSession?.key,
+     };
+     pendingRequests.set(request.id, request);
+     setAuthSecurityHeaders(res);
+     res
+       .status(200)
+       .type("html")
+-      .send(pairingPage({ requestId: request.id, workspaceName: deps.workspaceName, scopes }));
++      .send(browserSession
++        ? browserAuth.consentPage(request, browserSession.lang)
++        : pairingPage({ requestId: request.id, workspaceName: deps.workspaceName, scopes }));
+   });
+ 
+   router.post("/oauth/authorize", urlencoded({ extended: false }), (req, res) => {
+     prunePending();
+-    const body = req.body as { request_id?: string; pairing_code?: string };
++    const body = req.body as { request_id?: string; pairing_code?: string; decision?: string };
+     const request = body.request_id ? pendingRequests.get(body.request_id) : undefined;
+     if (!request) {
+       setAuthSecurityHeaders(res);
+       res.status(400).send("This authorization request has expired. Please reconnect from ChatGPT.");
+       return;
+     }
+-    const verdict = deps.pairing.verify(body.pairing_code ?? "", req.ip);
++    const verdict = request.browserSession
++      ? browserAuth.approve(req, request.browserSession)
++      : deps.pairing.verify(body.pairing_code ?? "", req.ip);
+     if (!verdict.ok) {
++      if (request.browserSession) {
++        setAuthSecurityHeaders(res);
++        res.status(401).type("html").send(browserAuth.expiredPage(req, request));
++        return;
++      }
+       const messages: Record<string, string> = {
+         invalid: `Incorrect pairing code.${verdict.attemptsLeft !== undefined ? ` ${verdict.attemptsLeft} attempts left.` : ""}`,
+         expired: "This pairing code has expired. Ask Codex to generate a new one.",
+@@ -274,6 +289,13 @@ export function createOAuthRouter(deps: OAuthDeps): Router {
+       return;
+     }
+     pendingRequests.delete(request.id);
++    if (body.decision === "deny") {
++      const denied = new URL(request.redirectUri);
++      denied.searchParams.set("error", "access_denied");
++      if (request.state) denied.searchParams.set("state", request.state);
++      res.redirect(denied.toString());
++      return;
++    }
+     const code = deps.store.createAuthorizationCode({
+       clientId: request.clientId,
+       redirectUri: request.redirectUri,

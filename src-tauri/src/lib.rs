@@ -759,6 +759,15 @@ async fn check_for_app_update(
         .on_before_exit(move || {
             log::info!("update: stopping the backend before the installer exits the app");
             SHUTTING_DOWN.store(true, Ordering::Release);
+            // Restore client routes before the updater terminates the process.
+            // Windows exits through `std::process::exit`, which does not deliver
+            // Tauri's RunEvent::Exit; otherwise Codex keeps calling the dead
+            // Headroom port throughout the update.
+            if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
+                if let Err(err) = client_adapters::clear_client_setups() {
+                    log::warn!("update: clear_client_setups failed: {err}");
+                }
+            }
             let state: tauri::State<'_, AppState> = teardown.state();
             state.stop_headroom();
         })
@@ -922,6 +931,11 @@ async fn restart_app(app: AppHandle) {
     // new desktop reuses it via the reachability check). Without this, any
     // proxy-arg change shipped by an upgrade silently never takes effect.
     {
+        if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
+            if let Err(err) = client_adapters::clear_client_setups() {
+                log::warn!("restart_app: clear_client_setups failed: {err}");
+            }
+        }
         let state: tauri::State<'_, AppState> = app.state();
         state.stop_headroom();
     }
@@ -4064,6 +4078,15 @@ async fn run_codex_bridge_action(
     crate::codex_bridge::action(action, workspace).await
 }
 
+#[tauri::command]
+async fn configure_codex_bridge_tunnel(
+    mode: String,
+    zone: Option<String>,
+    workspace: Option<String>,
+) -> Result<crate::codex_bridge::CodexBridgeStatus, String> {
+    crate::codex_bridge::configure_tunnel(mode, zone, workspace).await
+}
+
 /// Open the native folder picker and return the selected directory as a POSIX path.
 /// Cancellation is a normal empty result.
 #[tauri::command]
@@ -4817,7 +4840,7 @@ pub fn run() {
     let mut builder =
         tauri::Builder::default().plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // Second launch: focus the existing window and exit the new process.
-            let _ = show_launcher_window(app);
+            let _ = show_user_window(app);
         }));
 
     // tauri-plugin-autostart canonicalizes current_exe() while initializing and
@@ -5066,7 +5089,7 @@ pub fn run() {
                 std::sync::Arc::clone(&state.intercept_bind_error),
             );
             if state.should_present_on_launch() && !launched_from_autostart {
-                let _ = show_launcher_window(app.handle());
+                let _ = show_user_window(app.handle());
             }
             if state.tool_manager.python_runtime_installed() {
                 state.set_runtime_starting(true);
@@ -5207,6 +5230,7 @@ pub fn run() {
             install_codex_bridge,
             uninstall_codex_bridge,
             run_codex_bridge_action,
+            configure_codex_bridge_tunnel,
             pick_workspace_directory,
             get_headroom_learn_prereq_status,
             get_transformations_feed,
@@ -5242,6 +5266,11 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if matches!(&event, tauri::RunEvent::Reopen { .. }) {
+                let _ = show_user_window(app);
+            }
+
             // Tear down the proxy on every exit path (Cmd-Q, dock quit, signal,
             // or our explicit quit/restart commands). Without this, the proxy
             // outlives the desktop and the next launch reuses an orphan.
@@ -7647,6 +7676,15 @@ async fn accept_terms(app: AppHandle, version: u32) {
             let state: tauri::State<'_, AppState> = app.state();
             crate::pricing::push_terms_acceptance(&state, version);
         });
+    }
+}
+
+fn show_user_window(app: &AppHandle) -> tauri::Result<()> {
+    if onboarding_complete(app) {
+        hide_launcher_window(app)?;
+        show_main_window(app, None)
+    } else {
+        show_launcher_window(app)
     }
 }
 

@@ -7,12 +7,18 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     setupFiles: ["src/test/setup.ts"],
+    exclude: [
+      "**/node_modules/**",
+      "**/dist/**",
+      "**/.git/**",
+      "src-tauri/**/*.test.{ts,tsx}",
+    ],
     coverage: {
       provider: "v8",
       include: ["src/components/**/*.tsx", "src/lib/**/*.ts"],
       exclude: [
         "src/lib/types.ts",
-        "src/**/*.test.{ts,tsx}"
+        "src/**/*.test.{ts,tsx}",
       ],
       reporter: ["text", "json-summary", "html"],
       thresholds: {

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -25,12 +25,20 @@ pub struct CodexBridgeStatus {
     pub running: bool,
     pub port: Option<u16>,
     pub paired: bool,
+    /// Whether the local Codex CLI has an existing ChatGPT OAuth session.
+    /// This is diagnostic only; it never substitutes for ChatGPT connector consent.
+    pub codex_logged_in: bool,
+    pub browser_auth_supported: bool,
     pub message: String,
     pub output: Option<String>,
     /// Non-sensitive workspace identity returned by c2c status.
     pub workspace_name: Option<String>,
     pub workspace_id: Option<String>,
     pub public_url: Option<String>,
+    pub tunnel_mode: Option<String>,
+    pub tunnel_hostname: Option<String>,
+    pub tunnel_stable: bool,
+    pub tunnel_fallback_reason: Option<String>,
     pub token_count: Option<u64>,
     pub pairing_active: Option<bool>,
     /// Pairing code is intentionally kept separate from diagnostic output.
@@ -263,7 +271,110 @@ fn ensure_cloudflared() -> Result<(), String> {
     Err("缺少 cloudflared；请先安装 cloudflared 后重试。".into())
 }
 
-const CHATGPT_CONNECTOR_URL: &str = "https://chatgpt.com/plugins#settings/Connectors?create-connector=true&redirectAfter=%2Fplugins";
+fn browser_auth_supported(port: Option<u16>, running: bool) -> bool {
+    if !running {
+        return false;
+    }
+    let Some(port) = port else {
+        return false;
+    };
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2))
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    if write!(
+        stream,
+        "HEAD /headroom/connect HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .is_err()
+    {
+        return false;
+    }
+    BufReader::new(stream.take(8192))
+        .lines()
+        .take_while(|line| line.as_ref().is_ok_and(|line| !line.is_empty()))
+        .filter_map(Result::ok)
+        .any(|line| line.eq_ignore_ascii_case("x-headroom-browser-auth: 2"))
+}
+
+fn browser_authorization_url(
+    endpoint: Option<&str>,
+    code: Option<&str>,
+    supported: bool,
+) -> Option<String> {
+    if !supported {
+        return None;
+    }
+    let mut url = reqwest::Url::parse(endpoint?).ok()?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let code = code?;
+    if code.is_empty()
+        || !code
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+    {
+        return None;
+    }
+    url.set_path("/headroom/connect");
+    url.set_query(None);
+    // The fragment stays in the browser and is removed before making an HTTP request.
+    url.set_fragment(Some(&format!("pairing_code={code}")));
+    Some(url.to_string())
+}
+
+fn ensure_browser_auth(source_path: &Path) -> Result<bool, String> {
+    const PAYLOAD: &str = include_str!("../bridge/browser-auth.ts");
+    const PATCH: &str = include_str!("../bridge/browser-auth.patch");
+    let oauth_path = source_path.join("src/auth/oauth.ts");
+    let helper_path = source_path.join("src/auth/browser-auth.ts");
+    let oauth = fs::read_to_string(&oauth_path)
+        .map_err(|error| format!("读取 Bridge 授权模块失败：{error}"))?;
+    let current_helper = fs::read_to_string(&helper_path).ok();
+    if current_helper
+        .as_ref()
+        .is_some_and(|text| !text.starts_with("// Headroom browser authorization"))
+    {
+        return Err("Bridge 中存在其他来源的 browser-auth.ts，请先检查文件冲突。".into());
+    }
+    let patched = oauth.contains("import { BrowserAuth } from \"./browser-auth.js\";");
+    let changed = !patched
+        || current_helper.as_deref() != Some(PAYLOAD)
+        || !source_path.join("dist/auth/browser-auth.js").exists();
+    if !patched {
+        let mut patch = tempfile::NamedTempFile::new().map_err(|error| error.to_string())?;
+        patch
+            .write_all(PATCH.as_bytes())
+            .map_err(|error| error.to_string())?;
+        let path = patch.path().to_string_lossy();
+        run_with_timeout(
+            Some(source_path),
+            "git",
+            &["apply", "--check", &path],
+            BRIDGE_COMMAND_TIMEOUT,
+        )
+        .map_err(|_| "当前 Bridge 授权模块与内置适配不兼容，尚未修改授权逻辑。".to_string())?;
+        run_with_timeout(
+            Some(source_path),
+            "git",
+            &["apply", &path],
+            BRIDGE_COMMAND_TIMEOUT,
+        )?;
+    }
+    if current_helper.as_deref() != Some(PAYLOAD) {
+        fs::write(&helper_path, PAYLOAD)
+            .map_err(|error| format!("写入 Bridge 浏览器授权模块失败：{error}"))?;
+    }
+    Ok(changed)
+}
 
 fn now_millis() -> u64 {
     SystemTime::now()
@@ -920,6 +1031,25 @@ pub fn status(workspace: Option<&str>) -> CodexBridgeStatus {
     } else {
         None
     };
+    let tunnel_status = if source_path.join("dist/cli/index.js").exists() {
+        run_with_timeout(
+            Some(&source_path),
+            "node",
+            &[
+                "bin/c2c.js",
+                "tunnel",
+                "status",
+                "--workspace",
+                &workspace_string,
+                "--json",
+            ],
+            BRIDGE_COMMAND_TIMEOUT,
+        )
+        .ok()
+        .and_then(|text| parse_json_output(&text))
+    } else {
+        None
+    };
     let metadata = load_pairing_metadata(&workspace_string);
     let merged_status = merge_status_values(cli_status.as_ref(), runtime.as_ref());
     let status_value = merged_status.as_ref();
@@ -976,6 +1106,23 @@ pub fn status(workspace: Option<&str>) -> CodexBridgeStatus {
             .and_then(|value| value.workspace_id.clone())
     });
     let public_url = value_string_aliases(status_value, &["publicUrl", "public_url"]);
+    let tunnel_mode = tunnel_status.as_ref().and_then(|value| {
+        if value_bool(Some(value), "namedReady") == Some(true) {
+            Some("named".to_string())
+        } else {
+            value_string(Some(value), "preference")
+        }
+    });
+    let tunnel_hostname = tunnel_status
+        .as_ref()
+        .and_then(|value| value_string(Some(value), "hostname"));
+    let tunnel_fallback_reason = tunnel_status
+        .as_ref()
+        .and_then(|value| value_string(Some(value), "fallbackReason"));
+    let tunnel_stable = tunnel_status
+        .as_ref()
+        .and_then(|value| value_bool(Some(value), "namedReady"))
+        == Some(true);
     let mcp_url = value_string_aliases(
         status_value,
         &["mcpUrl", "mcp_url", "connectorUrl", "connector_url"],
@@ -1004,6 +1151,12 @@ pub fn status(workspace: Option<&str>) -> CodexBridgeStatus {
     );
     let endpoint_repair_required = endpoint_changed;
     let port = value_u64(status_value, "port").and_then(|value| u16::try_from(value).ok());
+    let browser_auth_supported = browser_auth_supported(port, running);
+    let authorization_url = browser_authorization_url(
+        mcp_url.as_deref().or(public_url.as_deref()),
+        pairing_code.as_deref(),
+        browser_auth_supported,
+    );
     let installed = source_path.join("dist/cli/index.js").exists();
     let message = if !installed {
         "尚未安装".into()
@@ -1017,19 +1170,25 @@ pub fn status(workspace: Option<&str>) -> CodexBridgeStatus {
         node_available: node.is_some(),
         node_version: node,
         source_path: source_path.display().to_string(),
+        browser_auth_supported,
         running,
         port,
         paired,
+        codex_logged_in: crate::client_adapters::codex_logged_in(),
         message,
         output: None,
         workspace_name,
         workspace_id,
         public_url,
+        tunnel_mode,
+        tunnel_hostname,
+        tunnel_stable,
+        tunnel_fallback_reason,
         token_count,
         pairing_active,
         pairing_code,
         pairing_expires_at,
-        authorization_url: Some(CHATGPT_CONNECTOR_URL.to_string()),
+        authorization_url,
         mcp_url,
         connector_name,
         endpoint_changed,
@@ -1071,6 +1230,7 @@ pub async fn install(workspace: Option<String>) -> Result<CodexBridgeStatus, Str
         &["--yes", PACKAGE_MANAGER, "install", "--frozen-lockfile"],
         BRIDGE_SETUP_TIMEOUT,
     )?;
+    ensure_browser_auth(&source_path)?;
     run_with_timeout(
         Some(&source_path),
         "npx",
@@ -1096,6 +1256,42 @@ mod tests {
         assert!(!node_supported("v18.20.0"));
         assert!(node_supported("v20.0.0"));
         assert!(node_supported("v26.3.0"));
+    }
+
+    #[test]
+    fn browser_verification_credential_stays_in_fragment_and_requires_https() {
+        let url = super::browser_authorization_url(
+            Some("https://bridge.example/mcp?old=1#old"),
+            Some("ABCD-EFGH"),
+            true,
+        )
+        .unwrap();
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        assert_eq!(parsed.path(), "/headroom/connect");
+        assert_eq!(parsed.query(), None);
+        assert_eq!(parsed.fragment(), Some("pairing_code=ABCD-EFGH"));
+        assert!(super::browser_authorization_url(
+            Some("http://bridge.example/mcp"),
+            Some("ABCD-EFGH"),
+            true
+        )
+        .is_none());
+        assert!(super::browser_authorization_url(
+            Some("https://bridge.example/mcp"),
+            Some("ABCD-EFGH&other=1"),
+            true
+        )
+        .is_none());
+        assert!(super::browser_authorization_url(
+            Some("https://bridge.example/mcp"),
+            Some("ABCD-EFGH"),
+            false
+        )
+        .is_none());
+        assert!(
+            super::browser_authorization_url(Some("https://bridge.example/mcp"), None, true)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1394,6 +1590,26 @@ pub async fn action(
     };
     let workspace_path = resolve_workspace(workspace.as_deref());
     let workspace = workspace_path.display().to_string();
+    if matches!(command.as_str(), "setup" | "pair") {
+        if ensure_browser_auth(&source_path)? {
+            run_with_timeout(
+                Some(&source_path),
+                "npx",
+                &["--yes", PACKAGE_MANAGER, "build"],
+                BRIDGE_SETUP_TIMEOUT,
+            )?;
+        }
+        let live = status(Some(&workspace));
+        // Upgrade only the selected workspace's old server; other workspace processes keep running.
+        if live.running && !live.browser_auth_supported {
+            run_with_timeout(
+                Some(&source_path),
+                "node",
+                &["bin/c2c.js", "stop", "--workspace", &workspace],
+                BRIDGE_COMMAND_TIMEOUT,
+            )?;
+        }
+    }
     if command == "ack_endpoint" {
         let mut status = status(Some(&workspace));
         let value = serde_json::json!({
@@ -1493,9 +1709,86 @@ pub async fn action(
         }
     }
     let safe = (!output.is_empty()).then(|| safe_output(&output));
+    status.authorization_url = browser_authorization_url(
+        status.mcp_url.as_deref().or(status.public_url.as_deref()),
+        status.pairing_code.as_deref(),
+        status.browser_auth_supported,
+    );
     status.output = safe.clone();
     status.safe_output = safe;
     Ok(status)
+}
+
+/// Configure the public endpoint without exposing the external Bridge CLI to the UI.
+/// A named tunnel is persisted by c2c and reused by later setup/restarts.
+pub async fn configure_tunnel(
+    mode: String,
+    zone: Option<String>,
+    workspace: Option<String>,
+) -> Result<CodexBridgeStatus, String> {
+    let source_path = source();
+    if !source_path.join("dist/cli/index.js").exists() {
+        return Err("请先安装 Codex with ChatGPT。".into());
+    }
+    let workspace_path = resolve_workspace(workspace.as_deref());
+    let workspace = workspace_path.display().to_string();
+    let mode = mode.trim().to_ascii_lowercase();
+    if mode != "named" && mode != "quick" {
+        return Err("隧道模式必须是 named 或 quick。".into());
+    }
+    let mut args = vec![
+        "bin/c2c.js",
+        "tunnel",
+        "choose",
+        "--mode",
+        mode.as_str(),
+        "--workspace",
+        workspace.as_str(),
+        "--json",
+    ];
+    let zone_value = zone.unwrap_or_default();
+    if mode == "named" && !zone_value.trim().is_empty() {
+        args.extend(["--zone", zone_value.trim()]);
+    }
+    let output = run_with_timeout(Some(&source_path), "node", &args, BRIDGE_SETUP_TIMEOUT)?;
+    let parsed = parse_json_output(&output).unwrap_or_else(|| {
+        serde_json::json!({
+            "ok": false,
+            "userMessage": output,
+        })
+    });
+    if parsed.get("ok").and_then(serde_json::Value::as_bool) == Some(false) && mode == "named" {
+        let message = parsed
+            .get("userMessage")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| parsed.get("error").and_then(serde_json::Value::as_str))
+            .unwrap_or("固定域名配置未完成");
+        return Err(message.to_string());
+    }
+    if mode == "named"
+        && parsed
+            .get("namedReady")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return Err("固定域名尚未就绪，请完成 Cloudflare 登录和域名选择后重试。".into());
+    }
+    if mode == "named" {
+        run_with_timeout(
+            Some(&source_path),
+            "node",
+            &[
+                "bin/c2c.js",
+                "start",
+                "--workspace",
+                workspace.as_str(),
+                "--tunnel",
+                "--json",
+            ],
+            BRIDGE_SETUP_TIMEOUT,
+        )?;
+    }
+    Ok(status(Some(&workspace)))
 }
 
 pub async fn uninstall(workspace: Option<String>) -> Result<CodexBridgeStatus, String> {
