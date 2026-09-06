@@ -6,7 +6,6 @@ import type { ActivityFeedResponse } from "./types";
 export type TrayView =
   | "home"
   | "optimization"
-  | "bridge"
   | "health"
   | "notifications"
   | "addons"

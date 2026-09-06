@@ -3335,6 +3335,13 @@ impl AppState {
         *self.runtime_starting.lock()
     }
 
+    /// True only when the local backend is answering its readiness probe and
+    /// the user has not paused the runtime. Client integrations may safely
+    /// point at Headroom only after this check succeeds.
+    pub fn runtime_ready(&self) -> bool {
+        !self.runtime_is_paused() && is_headroom_proxy_reachable()
+    }
+
     pub fn resume_runtime(&self) -> Result<()> {
         self.set_runtime_paused(false);
         // Any successful resume clears the auto-pause flag so the self-heal

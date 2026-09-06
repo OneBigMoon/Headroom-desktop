@@ -5,7 +5,6 @@ mod backend_port;
 mod bearer;
 mod claude_cli;
 mod client_adapters;
-mod codex_bridge;
 mod device;
 mod edition;
 mod insights;
@@ -240,6 +239,62 @@ static PORT_CONFLICT_CAPTURED: AtomicBool = AtomicBool::new(false);
 // `configured_clients` is already empty, leaving nothing for the next launch's
 // `restore_client_setups()` to bring back.
 static EXIT_CLEAR_DONE: AtomicBool = AtomicBool::new(false);
+
+// Presence means the previous desktop process did not reach a normal exit
+// path. A fresh launch uses this marker to restore client routes away from
+// the dead local proxy before it tries to start Headroom again.
+const RUNTIME_SESSION_MARKER: &str = "runtime-session.active";
+
+fn runtime_session_marker_path() -> std::path::PathBuf {
+    storage::config_file(&storage::app_data_dir(), RUNTIME_SESSION_MARKER)
+}
+
+fn begin_runtime_session() -> bool {
+    let path = runtime_session_marker_path();
+    match begin_runtime_session_at(&path) {
+        Ok(previous_unclean) => previous_unclean,
+        Err(err) => {
+            log::warn!("runtime session: could not write {}: {err}", path.display());
+            path.exists()
+        }
+    }
+}
+
+fn finish_runtime_session() {
+    let path = runtime_session_marker_path();
+    if let Err(err) = finish_runtime_session_at(&path) {
+        log::warn!(
+            "runtime session: could not remove {}: {err}",
+            path.display()
+        );
+    } else {
+        log::info!("runtime session: marked clean exit");
+    }
+}
+
+fn begin_runtime_session_at(path: &Path) -> std::io::Result<bool> {
+    let previous_unclean = path.exists();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(
+        path,
+        format!(
+            "pid={}\nstarted_at={}\n",
+            std::process::id(),
+            Utc::now().to_rfc3339()
+        ),
+    )?;
+    Ok(previous_unclean)
+}
+
+fn finish_runtime_session_at(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
 
 // Set at the start of every exit path (settings/tray quit, Cmd-Q / dock quit,
 // restart_app) BEFORE stop_headroom runs. The proxy watchdog polls every 5s
@@ -770,6 +825,7 @@ async fn check_for_app_update(
             }
             let state: tauri::State<'_, AppState> = teardown.state();
             state.stop_headroom();
+            finish_runtime_session();
         })
         .build()
         .map_err(|err| err.to_string())?;
@@ -938,6 +994,7 @@ async fn restart_app(app: AppHandle) {
         }
         let state: tauri::State<'_, AppState> = app.state();
         state.stop_headroom();
+        finish_runtime_session();
     }
     analytics::shutdown(&app);
 
@@ -4050,74 +4107,6 @@ fn pattern_matches_project(content: &str, entity_refs: &[String], project_path: 
 }
 
 #[tauri::command]
-async fn get_codex_bridge_status(
-    workspace: Option<String>,
-) -> crate::codex_bridge::CodexBridgeStatus {
-    crate::codex_bridge::status(workspace.as_deref())
-}
-
-#[tauri::command]
-async fn install_codex_bridge(
-    workspace: Option<String>,
-) -> Result<crate::codex_bridge::CodexBridgeStatus, String> {
-    crate::codex_bridge::install(workspace).await
-}
-
-#[tauri::command]
-async fn uninstall_codex_bridge(
-    workspace: Option<String>,
-) -> Result<crate::codex_bridge::CodexBridgeStatus, String> {
-    crate::codex_bridge::uninstall(workspace).await
-}
-
-#[tauri::command]
-async fn run_codex_bridge_action(
-    action: String,
-    workspace: Option<String>,
-) -> Result<crate::codex_bridge::CodexBridgeStatus, String> {
-    crate::codex_bridge::action(action, workspace).await
-}
-
-#[tauri::command]
-async fn configure_codex_bridge_tunnel(
-    mode: String,
-    zone: Option<String>,
-    workspace: Option<String>,
-) -> Result<crate::codex_bridge::CodexBridgeStatus, String> {
-    crate::codex_bridge::configure_tunnel(mode, zone, workspace).await
-}
-
-/// Open the native folder picker and return the selected directory as a POSIX path.
-/// Cancellation is a normal empty result.
-#[tauri::command]
-fn pick_workspace_directory() -> Result<Option<String>, String> {
-    #[cfg(target_os = "macos")]
-    {
-        let output = std::process::Command::new("/usr/bin/osascript")
-            .args([
-                "-e",
-                "POSIX path of (choose folder with prompt \"选择工作区文件夹\")",
-            ])
-            .output()
-            .map_err(|error| format!("无法打开文件夹选择器：{error}"))?;
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            return Ok((!path.is_empty()).then_some(path));
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("User canceled") || stderr.contains("用户取消") {
-            return Ok(None);
-        }
-        Err(format!("文件夹选择失败：{}", stderr.trim()))
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        Err("当前平台暂不支持原生文件夹选择。请手动输入工作区路径。".into())
-    }
-}
-
-#[tauri::command]
 async fn start_headroom_learn(
     app: AppHandle,
     agent: String,
@@ -4494,7 +4483,6 @@ async fn pause_headroom(app: AppHandle) -> Result<(), String> {
     // A deliberate user pause is not an auto-pause; clear the flag so the
     // self-heal loop doesn't fight the user by auto-resuming.
     state.set_runtime_auto_paused(false);
-    state.stop_headroom();
     // Users grandfathered in before `setup_wizard_complete` existed satisfy the
     // onboarding gate only via "launch_count > 1 && a client is configured".
     // The clear below empties configured_clients, which flipped that gate false
@@ -4503,7 +4491,13 @@ async fn pause_headroom(app: AppHandle) -> Result<(), String> {
     if state.setup_wizard_satisfied() {
         state.mark_setup_wizard_complete();
     }
-    client_adapters::clear_client_setups().map_err(|err| err.to_string())?;
+    if let Err(err) = client_adapters::clear_client_setups() {
+        // Keep the existing runtime usable if route cleanup fails; stopping
+        // 6867 while clients still point at it would create a dead endpoint.
+        state.set_runtime_paused(false);
+        return Err(err.to_string());
+    }
+    state.stop_headroom();
     analytics::track_event(&app, "runtime_paused", None);
     Ok(())
 }
@@ -4512,9 +4506,7 @@ async fn pause_headroom(app: AppHandle) -> Result<(), String> {
 async fn start_headroom(app: AppHandle) -> Result<(), String> {
     let state: tauri::State<'_, AppState> = app.state();
     state.resume_runtime().map_err(|err| err.to_string())?;
-    std::thread::spawn(|| {
-        client_adapters::restore_client_setups();
-    });
+    restore_clients_when_runtime_ready(app.clone());
     analytics::track_event(&app, "runtime_resumed", None);
     Ok(())
 }
@@ -4528,12 +4520,11 @@ async fn start_headroom(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 async fn force_restart_headroom(app: AppHandle) -> Result<(), String> {
     let state: tauri::State<'_, AppState> = app.state();
+    client_adapters::clear_client_setups().map_err(|err| err.to_string())?;
     state.stop_headroom();
     state.set_runtime_auto_paused(false);
     state.resume_runtime().map_err(|err| err.to_string())?;
-    std::thread::spawn(|| {
-        client_adapters::restore_client_setups();
-    });
+    restore_clients_when_runtime_ready(app.clone());
     analytics::track_event(&app, "runtime_force_restarted", None);
     Ok(())
 }
@@ -4639,6 +4630,11 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
     SHUTTING_DOWN.store(true, Ordering::Release);
     {
         let state: tauri::State<'_, AppState> = app.state();
+        if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
+            if let Err(err) = client_adapters::clear_client_setups() {
+                log::warn!("uninstall: clear_client_setups failed: {err}");
+            }
+        }
         state.stop_headroom();
         // Plugin addons live in the hosts' plugin registries, outside Headroom's
         // own footprint that perform_full_cleanup() wipes, so remove them here
@@ -4703,6 +4699,7 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
     }
 
     let handle = app.clone();
+    finish_runtime_session();
     // Give the frontend a moment to receive the command response before the
     // process exits, so the confirmation toast can render.
     std::thread::spawn(move || {
@@ -4758,7 +4755,6 @@ fn exit_headroom(app: &AppHandle, source: QuitSource) {
     let runtime_paused = {
         let state: tauri::State<'_, AppState> = app.state();
         let runtime_paused = state.runtime_is_paused();
-        state.stop_headroom();
         // Mark the quit-time clear as done so the RunEvent::Exit handler skips
         // its redundant clear_client_setups(). A second call would wipe the
         // remembered_clients snapshot we just saved (configured_clients is now
@@ -4767,6 +4763,9 @@ fn exit_headroom(app: &AppHandle, source: QuitSource) {
         if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
             let _ = client_adapters::clear_client_setups();
         }
+        // Restore native routes before stopping 6867 so an in-flight Codex
+        // request cannot be sent to a backend that has just gone away.
+        state.stop_headroom();
         runtime_paused
     };
 
@@ -4779,6 +4778,7 @@ fn exit_headroom(app: &AppHandle, source: QuitSource) {
     if let Some(client) = sentry::Hub::current().client() {
         client.flush(Some(std::time::Duration::from_secs(2)));
     }
+    finish_runtime_session();
     app.exit(0);
 }
 
@@ -4787,6 +4787,40 @@ fn app_quit_requested_properties(source: QuitSource, runtime_paused: bool) -> Va
         "source": source.label(),
         "runtime_paused": runtime_paused,
     })
+}
+
+fn restore_clients_if_runtime_ready(state: &AppState) {
+    if !state.runtime_ready() {
+        log::warn!(
+            "client restore skipped: Headroom backend is not healthy; keeping native routes"
+        );
+        return;
+    }
+
+    client_adapters::restore_client_setups();
+    // Plain Cmd-Q, dock quit, and updater restart do not populate
+    // `remembered_clients`; mirror the quit retag whenever Codex is already
+    // configured so its history remains available after a clean restart.
+    if client_adapters::is_codex_enabled() {
+        client_adapters::retag_codex_threads_to_headroom();
+    }
+}
+
+/// Resume paths start the proxy asynchronously. Wait for its readiness probe
+/// before restoring client routes so a cold boot never exposes a brief dead
+/// `127.0.0.1:6867` endpoint to Codex.
+fn restore_clients_when_runtime_ready(app: AppHandle) {
+    std::thread::spawn(move || {
+        let state: tauri::State<'_, AppState> = app.state();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while !state.runtime_ready() && std::time::Instant::now() < deadline {
+            if state.runtime_is_paused() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        restore_clients_if_runtime_ready(&state);
+    });
 }
 
 pub fn run() {
@@ -4909,6 +4943,7 @@ pub fn run() {
             }
 
             let launched_from_autostart = launched_from_autostart();
+            let previous_runtime_session_unclean = begin_runtime_session();
             // Autostart is opt-in. Users enable it explicitly from Settings,
             // which avoids triggering macOS's "Background item added" prompt
             // on first launch.
@@ -4917,6 +4952,16 @@ pub fn run() {
                 app.package_info().version.to_string(),
             ));
             app.manage(TraySessionSavings(Mutex::new(0.0)));
+
+            if previous_runtime_session_unclean {
+                log::warn!(
+            "startup: previous Headroom session ended unexpectedly; restoring native client routes"
+        );
+                if let Err(err) = client_adapters::clear_client_setups() {
+                    log::warn!("startup recovery: clear_client_setups failed: {err}");
+                }
+                client_adapters::retag_codex_threads_to_native();
+            }
             setup_tray(app.handle())?;
             spawn_tray_runtime_icon_updater(app.handle().clone());
             spawn_tray_savings_updater(app.handle().clone());
@@ -5102,10 +5147,10 @@ pub fn run() {
             std::thread::spawn(move || {
                 let state: tauri::State<'_, AppState> = app_handle.state();
                 state.warm_runtime_on_launch(&app_handle);
+                restore_clients_if_runtime_ready(&state);
             });
-            // Restore previously connected client integrations in the background.
+            // Retagging is handled by the readiness-gated startup worker above.
             std::thread::spawn(|| {
-                client_adapters::restore_client_setups();
                 // restore_client_setups only retags Codex threads back to the
                 // headroom provider for clients in `remembered_clients`, which a
                 // plain Cmd-Q / dock quit / app-update restart never populates
@@ -5226,12 +5271,6 @@ pub fn run() {
             list_applied_patterns_for_projects,
             delete_applied_pattern,
             get_headroom_learn_status,
-            get_codex_bridge_status,
-            install_codex_bridge,
-            uninstall_codex_bridge,
-            run_codex_bridge_action,
-            configure_codex_bridge_tunnel,
-            pick_workspace_directory,
             get_headroom_learn_prereq_status,
             get_transformations_feed,
             start_headroom_learn,
@@ -5283,9 +5322,7 @@ pub fn run() {
                 // that blocks freezes the app mid-quit and emits nothing (Sentry
                 // only receives warn!/error!). The last marker in the log names
                 // the step that hung.
-                log::info!("exit: stop_headroom");
                 let state: tauri::State<'_, AppState> = app.state();
-                state.stop_headroom();
                 // Gracefully reverse every client's base-URL override (and shell
                 // blocks) on quit so Claude Code / Codex fall back to talking
                 // directly to their native providers while Headroom is not
@@ -5300,6 +5337,8 @@ pub fn run() {
                         log::warn!("exit: clear_client_setups failed: {err}");
                     }
                 }
+                log::info!("exit: stop_headroom");
+                state.stop_headroom();
                 // Hand Codex threads back to the native provider so its history
                 // menu stays whole while Headroom is not running. Cmd-Q / dock
                 // quit / signals skip exit_headroom -> clear_client_setups, so
@@ -5307,6 +5346,7 @@ pub fn run() {
                 // headroom tag via restore_client_setups. Best-effort.
                 log::info!("exit: retag_codex_threads_to_native");
                 client_adapters::retag_codex_threads_to_native();
+                finish_runtime_session();
                 log::info!("exit: teardown complete");
             }
         });
@@ -7921,17 +7961,17 @@ fn compute_tray_window_position(
 mod tests {
     use super::{
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
-        auto_resume_backoff, beta_channel_enabled_from, build_release_updater_config,
-        build_watchdog_give_up_report, check_headroom_learn_prereqs, child_state_fingerprint_key,
-        classify_backend_readyz, classify_bootstrap_failure, classify_update_check,
-        classify_upgrade_error, client_setup_error_kind, compute_panel_corner_position,
-        compute_tray_window_position, count_memories_created_today, cpu_rate_indicates_burn,
-        debounced_tray_runtime_visual, delete_applied_pattern, empty_live_learnings_for_projects,
-        exe_path_resolvable, extract_llm_failure_warnings, fake_override,
-        fetch_transformations_feed_from, first_savings_body, format_token_count,
-        install_pending_update, is_disk_full_signal, is_endpoint_protection_signal,
-        is_network_download_signal, is_port_conflict_failure, is_prerelease_version,
-        learn_run_target, learn_step_label, lifetime_token_milestone_kind,
+        auto_resume_backoff, begin_runtime_session_at, beta_channel_enabled_from,
+        build_release_updater_config, build_watchdog_give_up_report, check_headroom_learn_prereqs,
+        child_state_fingerprint_key, classify_backend_readyz, classify_bootstrap_failure,
+        classify_update_check, classify_upgrade_error, client_setup_error_kind,
+        compute_panel_corner_position, compute_tray_window_position, count_memories_created_today,
+        cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
+        empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
+        fake_override, fetch_transformations_feed_from, finish_runtime_session_at,
+        first_savings_body, format_token_count, install_pending_update, is_disk_full_signal,
+        is_endpoint_protection_signal, is_network_download_signal, is_port_conflict_failure,
+        is_prerelease_version, learn_run_target, learn_step_label, lifetime_token_milestone_kind,
         noop_app_update_progress_emitter, onboarding_recovery_copy, parse_live_learnings,
         parse_magic_link_auth, parse_request_count_from_stats_body, parse_request_counts_by_agent,
         parse_updater_endpoint_list, pattern_matches_project, persistent_zero_spend,
@@ -7949,6 +7989,20 @@ mod tests {
     use serde_json::json;
     use std::sync::Arc;
     use tauri::{LogicalPosition, LogicalSize, PhysicalSize, Position, Rect, Size};
+
+    #[test]
+    fn runtime_session_marker_detects_unclean_and_clears_clean_exit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("config/runtime-session.active");
+
+        assert!(!begin_runtime_session_at(&marker).expect("first begin"));
+        assert!(marker.exists());
+        assert!(begin_runtime_session_at(&marker).expect("second begin"));
+
+        finish_runtime_session_at(&marker).expect("finish");
+        assert!(!marker.exists());
+        finish_runtime_session_at(&marker).expect("finish is idempotent");
+    }
 
     struct FakePendingUpdate {
         metadata: AvailableAppUpdate,
