@@ -20789,6 +20789,182 @@ exit 0
         assert_eq!(token.as_deref(), Some("gho_test_token"));
     }
 
+    /// Live off/on round trip of a plugin's Enable switch on the real machine,
+    /// through the same `set_plugin_enabled` the card calls.
+    /// `HEADROOM_LIVE_PLUGIN=openspec cargo test --lib plugin_toggle_live
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "toggles a real plugin; run with --ignored"]
+    fn plugin_toggle_live() {
+        let manager = ToolManager::new(ManagedRuntime::bootstrap_root(
+            &crate::storage::app_data_dir(),
+        ));
+        let id = std::env::var("HEADROOM_LIVE_PLUGIN").unwrap_or_else(|_| "openspec".into());
+        let plugin = super::plugin_addon(&id).expect("known plugin addon");
+        assert!(manager.tool_enabled(&id), "{id} is not enabled on this machine");
+
+        manager.set_plugin_enabled(&id, false).expect("disable");
+        assert!(!manager.tool_enabled(&id), "switch did not disable {id}");
+        let off = std::fs::read_to_string(crate::client_adapters::codex_home().join("config.toml"))
+            .expect("Codex config");
+        assert_eq!(
+            super::codex_plugin_enabled_from_text(&off, plugin.plugin_ref).expect("parse"),
+            Some(false),
+            "Codex flag stayed on after disabling {id}"
+        );
+
+        manager.set_plugin_enabled(&id, true).expect("enable");
+        assert!(manager.tool_enabled(&id), "switch did not re-enable {id}");
+        let on = std::fs::read_to_string(crate::client_adapters::codex_home().join("config.toml"))
+            .expect("Codex config");
+        assert_eq!(
+            super::codex_plugin_enabled_from_text(&on, plugin.plugin_ref).expect("parse"),
+            Some(true),
+            "Codex flag stayed off after enabling {id}"
+        );
+        eprintln!("{id} disable/enable round trip done");
+    }
+
+    /// Read-only dump of the live connector table the Connections cards render:
+    /// installed / enabled / verified and, for Codex, whose provider owns the
+    /// route. `cargo test --lib connector_status_live -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads the real machine's client configs; run with --ignored"]
+    fn connector_status_live() {
+        let clients = crate::client_adapters::detect_clients();
+        let connectors = crate::client_adapters::list_client_connectors(&clients)
+            .expect("connector table");
+        for connector in connectors {
+            let foreign = connector
+                .verification
+                .as_ref()
+                .and_then(|verification| verification.foreign_provider.clone())
+                .unwrap_or_else(|| "-".into());
+            eprintln!(
+                "{}: installed={} enabled={} verified={} owner={foreign}",
+                connector.client_id, connector.installed, connector.enabled, connector.verified
+            );
+        }
+        for client in clients {
+            eprintln!(
+                "detected {}: installed={} configured={} health={:?} notes={:?}",
+                client.id, client.installed, client.configured, client.health, client.notes
+            );
+        }
+    }
+
+    /// Live round trip of the addon switches that write into the user's own
+    /// shell profiles, Claude config, and Codex AGENTS.md. Each switch is turned
+    /// off and back on; the caller compares file hashes, so a switch that leaves
+    /// a managed block behind (or drops one) shows up as a diff.
+    /// `cargo test --lib addon_switch_round_trip_live -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "toggles the real integrations; run with --ignored"]
+    fn addon_switch_round_trip_live() {
+        let manager = ToolManager::new(ManagedRuntime::bootstrap_root(
+            &crate::storage::app_data_dir(),
+        ));
+
+        // Auto-learn: Headroom's own flag, flipped through the same helper the
+        // Optimize card's switch calls.
+        let auto_learn_before = !crate::client_adapters::is_auto_learn_disabled();
+        crate::client_adapters::set_auto_learn_enabled(!auto_learn_before)
+            .expect("auto-learn flipped");
+        assert_eq!(
+            !crate::client_adapters::is_auto_learn_disabled(),
+            !auto_learn_before,
+            "auto-learn switch did not take"
+        );
+        crate::client_adapters::set_auto_learn_enabled(auto_learn_before)
+            .expect("auto-learn restored");
+        assert_eq!(
+            !crate::client_adapters::is_auto_learn_disabled(),
+            auto_learn_before,
+            "auto-learn switch did not restore"
+        );
+        eprintln!("auto-learn off/on round trip done");
+
+        let rtk = &manager.rtk_entrypoint();
+        let python = &manager.managed_python();
+        crate::client_adapters::set_rtk_enabled(false, rtk, python)
+            .expect("RTK off");
+        crate::client_adapters::set_rtk_enabled(true, rtk, python)
+            .expect("RTK on");
+        eprintln!("rtk off/on round trip done");
+
+        let shim = manager.markitdown_shim_path();
+        manager.set_markitdown_enabled(false).expect("markitdown off");
+        crate::client_adapters::disable_markitdown_integration(&shim)
+            .expect("markitdown integration off");
+        manager.set_markitdown_enabled(true).expect("markitdown on");
+        crate::client_adapters::enable_markitdown_integration(
+            &manager.markitdown_entrypoint(),
+            &shim,
+            &manager.managed_python(),
+        )
+        .expect("markitdown integration on");
+        eprintln!("markitdown off/on round trip done");
+
+        crate::client_adapters::disable_serena_integration().expect("serena off");
+        manager.set_serena_enabled(false).expect("serena receipt off");
+        manager.set_serena_enabled(true).expect("serena receipt on");
+        crate::client_adapters::enable_serena_integration().expect("serena on");
+        eprintln!("serena off/on round trip done");
+
+        // MCP-backed addons: the switch registers and unregisters their MCP
+        // server block in the Codex config.
+        manager.set_context7_enabled(false).expect("context7 off");
+        manager.set_context7_enabled(true).expect("context7 on");
+        assert!(manager.tool_enabled("context7"));
+        eprintln!("context7 off/on round trip done");
+
+        manager
+            .set_codebase_memory_enabled(false)
+            .expect("codebase-memory off");
+        manager
+            .set_codebase_memory_enabled(true)
+            .expect("codebase-memory on");
+        assert!(manager.tool_enabled("codebase-memory"));
+        eprintln!("codebase-memory off/on round trip done");
+    }
+
+    /// Live proof, against the real runtime and the real Codex config, that the
+    /// update path leaves an addon the user switched off switched off: the
+    /// receipt keeps `enabled: false` and the Codex plugin flag is written back
+    /// to `false` after `plugin add`. Pick any disabled plugin:
+    /// `HEADROOM_LIVE_PLUGIN=gstack cargo test --lib disabled_addon_update_live
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "mutates the real managed runtime; run with --ignored"]
+    fn disabled_addon_update_live() {
+        let manager = ToolManager::new(ManagedRuntime::bootstrap_root(
+            &crate::storage::app_data_dir(),
+        ));
+        let id = std::env::var("HEADROOM_LIVE_PLUGIN").unwrap_or_else(|_| "superpowers".into());
+        let plugin = super::plugin_addon(&id).expect("known plugin addon");
+        assert!(
+            !manager.tool_enabled(&id),
+            "{id} is not disabled on this machine; pick another addon"
+        );
+        manager
+            .install_plugin(&id, false)
+            .unwrap_or_else(|err| panic!("updating disabled {id}: {err:#}"));
+        assert!(
+            !manager.tool_enabled(&id),
+            "update switched {id} back on"
+        );
+        let config = std::fs::read_to_string(
+            crate::client_adapters::codex_home().join("config.toml"),
+        )
+        .expect("Codex config");
+        assert_eq!(
+            super::codex_plugin_enabled_from_text(&config, plugin.plugin_ref).expect("parse"),
+            Some(false),
+            "Codex still has {id} enabled after an update"
+        );
+        eprintln!("{id} updated while disabled; enabled flag still false");
+    }
+
     /// Live proof of the whole RTK update the card offers, against the real
     /// managed runtime: the same `install_rtk_version` the Update button calls.
     /// `cargo test --lib rtk_update_live -- --ignored --nocapture`.
