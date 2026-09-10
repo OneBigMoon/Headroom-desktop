@@ -7030,7 +7030,7 @@ impl ToolManager {
             Duration::from_secs(15),
         )
         .context("RTK update failed its smoke test")?;
-        let smoke = Command::new(&staged)
+        let smoke = crate::proc::command(&staged)
             .arg("--version")
             .current_dir(&self.runtime.root_dir)
             .output()
@@ -8519,7 +8519,7 @@ impl ToolManager {
             Duration::from_secs(15),
         )
         .context("codebase-memory update failed its smoke test")?;
-        let reported = Command::new(&staged)
+        let reported = crate::proc::command(&staged)
             .arg("--version")
             .current_dir(&self.runtime.root_dir)
             .output()
