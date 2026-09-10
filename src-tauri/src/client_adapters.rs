@@ -3541,15 +3541,44 @@ fn retag_one_codex_db(path: &Path, from: &str, to: &str) -> rusqlite::Result<Opt
 /// hook in `lib.rs`, which covers exit paths (Cmd-Q, dock quit, signals) that
 /// bypass `clear_client_setups` and therefore the disconnect retag.
 pub fn retag_codex_threads_to_native() {
-    retag_codex_thread_providers(CODEX_HEADROOM_PROVIDER, CODEX_NATIVE_PROVIDER);
+    // Nothing to hand back when the route was never ours.
+    if codex_route_is_ours() {
+        retag_codex_thread_providers(CODEX_HEADROOM_PROVIDER, CODEX_NATIVE_PROVIDER);
+    }
 }
 
-/// Pull Codex threads into the headroom provider menu. Exposed for the
-/// app-launch hook in `lib.rs`, which must undo the quit-time native retag on
-/// the exit paths (Cmd-Q, dock quit, app-update restart) that never populate
-/// `remembered_clients` and are therefore skipped by `restore_client_setups`.
-pub fn retag_codex_threads_to_headroom() {
-    retag_codex_thread_providers(CODEX_NATIVE_PROVIDER, CODEX_HEADROOM_PROVIDER);
+/// Point Codex's thread provider tags at whoever actually routes Codex.
+/// Exposed for the app-launch hook in `lib.rs`, which must undo the quit-time
+/// native retag on the exit paths (Cmd-Q, dock quit, app-update restart) that
+/// never populate `remembered_clients` and are therefore skipped by
+/// `restore_client_setups`.
+///
+/// Ownership decides the direction, because the tag is a claim about where
+/// those threads are served. When another manager owns the route -- Cockpit
+/// Tools writes `model_provider = "codex_local_access"`, the official Headroom
+/// build writes `headroom` -- Headroom is not intercepting, so threads it
+/// relabelled in an earlier run are wrong and go back to native; the tags that
+/// tool wrote for its own threads (`codex_local_access`) are never touched.
+/// Pulling the user's history into a provider menu Headroom does not serve is
+/// exactly the kind of "fix" that breaks the other tool (observed live
+/// 2026-09-10: 45 threads relabelled while Cockpit owned the route).
+pub fn reconcile_codex_thread_providers_on_launch() {
+    if codex_route_is_ours() {
+        retag_codex_thread_providers(CODEX_NATIVE_PROVIDER, CODEX_HEADROOM_PROVIDER);
+    } else {
+        retag_codex_thread_providers(CODEX_HEADROOM_PROVIDER, CODEX_NATIVE_PROVIDER);
+    }
+}
+
+/// Whether the root `model_provider` currently routes Codex through Headroom.
+/// The authority for every thread-tag write: a tag is a claim about where the
+/// thread is served, and Headroom may only make that claim while it is the one
+/// serving it.
+pub fn codex_route_is_ours() -> bool {
+    let Ok(content) = std::fs::read_to_string(codex_config_toml_path()) else {
+        return false;
+    };
+    codex_root_model_provider(&content).as_deref() == Some(CODEX_HEADROOM_PROVIDER)
 }
 
 fn codex_root_keys_body(chatgpt_auth: bool) -> String {
@@ -7865,12 +7894,14 @@ mod tests {
         build_claude_guard_script, build_codex_guard_script, build_headroom_markitdown_hook,
         build_headroom_rtk_hook, build_markitdown_codex_nudge, build_markitdown_office_nudge,
         claude_code_user_state_exists, claude_hook_present_in_value, codex_home,
+        codex_route_is_ours,
         codex_sqlite_store_expected, default_shell_targets_for_family, discover_codex_state_dbs,
         entry_contains_hook, find_on_path_entries, is_no_space, is_permission_denied,
         normalize_setup_state, normalized_setup_id, nvm_binary_candidates, oss_remnant_warnings,
-        parse_json_object, pin_codex_mcp_command, remove_managed_block,
-        remove_pre_tool_use_markers, render_codex_config, retag_codex_thread_providers,
-        retag_codex_threads_to_headroom, retag_one_codex_db, serialize_paths,
+        parse_json_object, pin_codex_mcp_command, reconcile_codex_thread_providers_on_launch,
+        remove_managed_block, remove_pre_tool_use_markers, render_codex_config,
+        retag_codex_thread_providers, retag_codex_threads_to_native, retag_one_codex_db,
+        serialize_paths,
         shell_block_contains_in_files, shell_block_contains_text_in_files, shell_double_quote,
         strip_headroom_hook_from_settings, upsert_managed_block, write_file_if_changed,
         ClientSetupState, ShellFamily, NO_SPACE_OS_ERRORS,
@@ -13217,11 +13248,18 @@ keep rtk\n\
         // Reproduces the app-update restart path: the quit handler left threads
         // tagged `openai`; launch must retag them back to `headroom`.
         let home = TestHome::new();
-        let db = home.path().join(".codex").join("state_5.sqlite");
-        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        // The launch hook only relabels while Headroom owns the route.
+        std::fs::write(
+            codex.join("config.toml"),
+            "model_provider = \"headroom_local_community\"\n",
+        )
+        .unwrap();
+        let db = codex.join("state_5.sqlite");
         seed_codex_threads_db(&db, &[("a", "openai"), ("b", "openai"), ("c", "anthropic")]);
 
-        retag_codex_threads_to_headroom();
+        reconcile_codex_thread_providers_on_launch();
 
         assert_eq!(provider_count(&db, "headroom_local_community"), 2);
         assert_eq!(provider_count(&db, "openai"), 0);
@@ -13392,11 +13430,17 @@ keep rtk\n\
         // Future-proofing: a Codex store-version bump (here state_99) must still
         // retag, not silently no-op for every user at once.
         let home = TestHome::new();
-        let db = home.path().join(".codex").join("state_99.sqlite");
-        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::write(
+            codex.join("config.toml"),
+            "model_provider = \"headroom_local_community\"\n",
+        )
+        .unwrap();
+        let db = codex.join("state_99.sqlite");
         seed_codex_threads_db(&db, &[("a", "openai"), ("b", "openai"), ("c", "anthropic")]);
 
-        retag_codex_threads_to_headroom();
+        reconcile_codex_thread_providers_on_launch();
 
         assert_eq!(provider_count(&db, "headroom_local_community"), 2);
         assert_eq!(provider_count(&db, "openai"), 0);
@@ -13410,19 +13454,100 @@ keep rtk\n\
         // `state_<N>.sqlite` scheme entirely. Content-based discovery must still
         // find and retag it by its `threads` table, not the filename.
         let home = TestHome::new();
-        let db = home
-            .path()
-            .join(".codex")
-            .join("sqlite")
-            .join("threads.sqlite");
-        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(codex.join("sqlite")).unwrap();
+        std::fs::write(
+            codex.join("config.toml"),
+            "model_provider = \"headroom_local_community\"\n",
+        )
+        .unwrap();
+        let db = codex.join("sqlite").join("threads.sqlite");
         seed_codex_threads_db(&db, &[("a", "openai"), ("b", "openai"), ("c", "anthropic")]);
 
-        retag_codex_threads_to_headroom();
+        reconcile_codex_thread_providers_on_launch();
 
         assert_eq!(provider_count(&db, "headroom_local_community"), 2);
         assert_eq!(provider_count(&db, "openai"), 0);
         assert_eq!(provider_count(&db, "anthropic"), 1);
+    }
+
+    /// Live regression, 2026-09-10. Cockpit Tools owned the Codex route
+    /// (`model_provider = "codex_local_access"`) and the launch hook pushed 45
+    /// native threads into Headroom's provider menu anyway, because it keyed on
+    /// "is the connector configured" instead of "does Headroom route Codex".
+    /// A thread tag is a claim about where the thread is served; while another
+    /// tool serves it, that claim is false, and its own tags
+    /// (`codex_local_access`) are none of our business.
+    #[test]
+    #[serial_test::serial]
+    fn launch_reconcile_leaves_a_foreign_routed_history_alone() {
+        let home = TestHome::new();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::write(
+            codex.join("config.toml"),
+            "model_provider = \"codex_local_access\"\n",
+        )
+        .unwrap();
+        let db = codex.join("state_5.sqlite");
+        seed_codex_threads_db(
+            &db,
+            &[
+                ("native-a", "openai"),
+                ("native-b", "openai"),
+                ("ours", "headroom_local_community"),
+                ("cockpit", "codex_local_access"),
+            ],
+        );
+
+        reconcile_codex_thread_providers_on_launch();
+
+        assert_eq!(
+            provider_count(&db, "headroom_local_community"),
+            0,
+            "no thread may claim a provider Headroom is not serving"
+        );
+        assert_eq!(
+            provider_count(&db, "openai"),
+            3,
+            "native threads stay native, and our leftover tag comes back"
+        );
+        assert_eq!(
+            provider_count(&db, "codex_local_access"),
+            1,
+            "the routing tool's own tag is not ours to rewrite"
+        );
+    }
+
+    /// The exit hook follows the same rule: with another tool routing Codex
+    /// there is nothing of ours to hand back.
+    #[test]
+    #[serial_test::serial]
+    fn thread_retag_hooks_are_gated_on_owning_the_codex_route() {
+        let home = TestHome::new();
+        let codex = home.path().join(".codex");
+        std::fs::create_dir_all(&codex).unwrap();
+        let db = codex.join("state_5.sqlite");
+        seed_codex_threads_db(&db, &[("a", "openai")]);
+
+        // No config.toml at all: Headroom is not routing anything.
+        assert!(!codex_route_is_ours());
+        retag_codex_threads_to_native();
+        reconcile_codex_thread_providers_on_launch();
+        assert_eq!(provider_count(&db, "openai"), 1);
+        assert_eq!(provider_count(&db, "headroom_local_community"), 0);
+
+        // Route ours: launch pulls threads in, exit hands them back.
+        std::fs::write(
+            codex.join("config.toml"),
+            "model_provider = \"headroom_local_community\"\n",
+        )
+        .unwrap();
+        assert!(codex_route_is_ours());
+        reconcile_codex_thread_providers_on_launch();
+        assert_eq!(provider_count(&db, "headroom_local_community"), 1);
+        retag_codex_threads_to_native();
+        assert_eq!(provider_count(&db, "openai"), 1);
     }
 
     #[test]

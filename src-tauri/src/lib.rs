@@ -5022,7 +5022,7 @@ fn restore_clients_if_runtime_ready(state: &AppState) {
     // `remembered_clients`; mirror the quit retag whenever Codex is already
     // configured so its history remains available after a clean restart.
     if client_adapters::is_codex_enabled() {
-        client_adapters::retag_codex_threads_to_headroom();
+        client_adapters::reconcile_codex_thread_providers_on_launch();
     }
 }
 
@@ -5418,7 +5418,7 @@ pub fn run() {
                 // Codex history menu stays empty after an update restart. Mirror
                 // the quit retag whenever Codex is still configured.
                 if client_adapters::is_codex_enabled() {
-                    client_adapters::retag_codex_threads_to_headroom();
+                    client_adapters::reconcile_codex_thread_providers_on_launch();
                 }
             });
 
