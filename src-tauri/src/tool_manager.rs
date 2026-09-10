@@ -129,6 +129,7 @@ const MCP_METHOD_COMMUNITY_REGISTRY: &str = "community_registry";
 const COMMUNITY_MCP_INSTALL_HELPER: &str = r#"
 import sys
 from headroom.mcp_registry.base import ServerSpec
+from headroom.mcp_registry.claude import ClaudeRegistrar
 from headroom.mcp_registry.install import get_all_registrars
 
 entrypoint, proxy_url, workspace_dir, config_dir = sys.argv[1:5]
@@ -145,20 +146,66 @@ spec = ServerSpec(
     },
 )
 
+def registrar_call(registrar, label, call, *args, **kwargs):
+    """Run one registrar call, downgrading an unusable agent CLI to a skip.
+
+    A detected CLI that exec() refuses -- Homebrew leaves a `claude` shim
+    behind when its native binary never downloaded, and a wrong-architecture
+    build or a missing interpreter fails the same way -- raises OSError out of
+    subprocess instead of coming back as a non-zero result, so the
+    registrar's own "CLI failed -> write the config file" fallback never
+    runs. Letting it escape aborted the whole registration and the user saw
+    only a cause-free "installation failed". One unusable agent must not
+    block the others.
+    """
+    try:
+        return call(*args, **kwargs)
+    except OSError as exc:
+        print(f"{registrar.name}: {label} skipped, CLI is not runnable ({exc})")
+        return None
+
+def file_backed(registrar):
+    """The same agent's registrar with its CLI disabled, or None.
+
+    Only the CLI-backed registrar can raise (the file-backed ones never
+    spawn a process), and disabling its CLI routes writes to the config file
+    the client reads on start -- exactly the path the registrar takes when no
+    CLI exists at all. Unrunnable is not unconfigurable.
+    """
+    if isinstance(registrar, ClaudeRegistrar):
+        return ClaudeRegistrar(claude_cli=None)
+    return None
+
 attempted = 0
+skipped = []
 failures = []
 for registrar in get_all_registrars():
-    if not registrar.detect():
+    detected = registrar_call(registrar, "detect", registrar.detect)
+    if detected is not True:
+        # None already printed why (unrunnable CLI); False is simply "not
+        # installed", which has never been an error.
+        if detected is None:
+            skipped.append(registrar.name)
+        continue
+    result = registrar_call(registrar, "register", registrar.register_server, spec, force=False)
+    if result is None:
+        fallback = file_backed(registrar)
+        if fallback is not None:
+            result = registrar_call(
+                fallback, "register", fallback.register_server, spec, force=False
+            )
+    if result is None:
+        skipped.append(registrar.name)
         continue
     attempted += 1
-    result = registrar.register_server(spec, force=False)
     if not result.ok:
         failures.append(f"{registrar.name}: {result.status.value}: {result.detail or ''}")
 
 if failures:
     raise SystemExit("; ".join(failures))
 if attempted == 0:
-    raise SystemExit("no supported MCP clients detected")
+    reason = f" (unrunnable CLI: {', '.join(skipped)})" if skipped else ""
+    raise SystemExit(f"no supported MCP clients detected{reason}")
 "#;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -18333,10 +18380,18 @@ after
         // helper died with a traceback, and the whole addon install aborted
         // as "codebase-memory update failed; restored previous installation"
         // with no cause. One unusable agent must not block the others.
-        for (helper, tool) in [
-            (super::SERENA_MCP_HELPER, "serena"),
-            (super::CONTEXT7_MCP_HELPER, "context7"),
-            (super::CODEBASE_MEMORY_MCP_HELPER, "codebase-memory"),
+        // `registers` is the server name the helper's own register call is
+        // expected to touch; `unregisters` is the same for the teardown path
+        // (the community helper has none -- it only ever installs).
+        for (helper, tool, unregisters) in [
+            (super::SERENA_MCP_HELPER, "serena", true),
+            (super::CONTEXT7_MCP_HELPER, "context7", true),
+            (super::CODEBASE_MEMORY_MCP_HELPER, "codebase-memory", true),
+            (
+                super::COMMUNITY_MCP_INSTALL_HELPER,
+                "headroom_local_community",
+                false,
+            ),
         ] {
             assert!(
                 helper.contains("def registrar_call(registrar, label, call, *args, **kwargs):"),
@@ -18360,15 +18415,181 @@ after
                 !helper.contains("result = registrar.register_server(spec, force=True)\n"),
                 "{tool}: the forced re-register must be wrapped too"
             );
-            assert!(
-                !helper.contains(&format!("if registrar.unregister_server(\"{tool}\"):\n")),
-                "{tool}: unregister must be wrapped too"
-            );
-            assert!(
-                helper.contains(&format!("registrar.unregister_server, \"{tool}\"")),
-                "{tool}: unregister must still target {tool}"
-            );
+            if unregisters {
+                assert!(
+                    !helper.contains(&format!("if registrar.unregister_server(\"{tool}\"):\n")),
+                    "{tool}: unregister must be wrapped too"
+                );
+                assert!(
+                    helper.contains(&format!("registrar.unregister_server, \"{tool}\"")),
+                    "{tool}: unregister must still target {tool}"
+                );
+            }
         }
+    }
+
+    /// The registered server name the helper must keep passing through.
+    #[test]
+    fn community_mcp_helper_still_registers_both_agents_when_one_cli_is_unrunnable() {
+        // Homebrew leaves /opt/homebrew/bin/claude as a `sh` shim when the
+        // native binary never downloaded: `shutil.which` finds it, so
+        // detect() says yes and the CLI path is taken, but the file has no
+        // shebang, so subprocess raises `OSError: [Errno 8] Exec format
+        // error` BEFORE ClaudeRegistrar's own CLI->file fallback runs. That
+        // aborted the whole loop -- Codex, next in the list, got nothing --
+        // and the desktop reported a cause-free "installation failed"
+        // (reproduced live 2026-09-10). The guard must skip the unrunnable
+        // CLI, keep configuring everyone else, and still configure the broken
+        // one through the file the client reads on start.
+        let helper = super::COMMUNITY_MCP_INSTALL_HELPER;
+        let script = format!(
+            r#"import sys
+import types
+
+class ServerSpec:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+class _StatusValue:
+    def __init__(self, value):
+        self.value = value
+
+class Status:
+    # Upstream statuses are enum members; the helper formats `.value`.
+    REGISTERED = _StatusValue("registered")
+    ALREADY = _StatusValue("already")
+    FAILED = _StatusValue("failed")
+
+class RegisterResult:
+    def __init__(self, status, detail=None):
+        self.status = status
+        self.detail = detail
+
+    @property
+    def ok(self):
+        return self.status in (Status.REGISTERED, Status.ALREADY)
+
+STATE = {{"calls": [], "claude_file_write_ok": True}}
+
+class ClaudeRegistrar:
+    name = "claude"
+
+    def __init__(self, *, claude_cli=..., home_dir=None, config_dir=None):
+        self.cli = None if claude_cli is None else "claude"
+
+    def detect(self):
+        STATE["calls"].append("claude.detect")
+        return True
+
+    def register_server(self, spec, *, force=False):
+        if self.cli is not None:
+            raise OSError(8, "Exec format error")
+        STATE["calls"].append("claude.register(file)")
+        if not STATE["claude_file_write_ok"]:
+            return RegisterResult(Status.FAILED, "config is not valid JSON")
+        return RegisterResult(Status.REGISTERED, "wrote ~/.claude.json")
+
+class CodexRegistrar:
+    name = "codex"
+
+    def detect(self):
+        STATE["calls"].append("codex.detect")
+        return True
+
+    def register_server(self, spec, *, force=False):
+        STATE["calls"].append("codex.register")
+        return RegisterResult(Status.REGISTERED, "wrote ~/.codex/config.toml")
+
+class CliOnlyRegistrar:
+    """An agent whose only write path is its CLI (no file fallback)."""
+
+    name = "grok"
+
+    def detect(self):
+        STATE["calls"].append("grok.detect")
+        return True
+
+    def register_server(self, spec, *, force=False):
+        raise OSError(8, "Exec format error")
+
+REGISTRARS = [ClaudeRegistrar(), CodexRegistrar()]
+
+pkg = types.ModuleType("headroom.mcp_registry")
+pkg.__path__ = []
+base = types.ModuleType("headroom.mcp_registry.base")
+base.ServerSpec = ServerSpec
+claude = types.ModuleType("headroom.mcp_registry.claude")
+claude.ClaudeRegistrar = ClaudeRegistrar
+install = types.ModuleType("headroom.mcp_registry.install")
+install.get_all_registrars = lambda: list(REGISTRARS)
+headroom = types.ModuleType("headroom")
+headroom.__path__ = []
+sys.modules.update(
+    {{
+        "headroom": headroom,
+        "headroom.mcp_registry": pkg,
+        "headroom.mcp_registry.base": base,
+        "headroom.mcp_registry.claude": claude,
+        "headroom.mcp_registry.install": install,
+    }}
+)
+
+HELPER = r'''{helper}'''
+sys.argv = ["helper", "/tmp/entrypoint", "http://127.0.0.1:6867", "/tmp/ws", "/tmp/cfg"]
+
+def run():
+    STATE["calls"] = []
+    exec(compile(HELPER, "community_mcp_helper", "exec"), {{"__name__": "__main__"}})
+
+# The unrunnable CLI is skipped with a reason, its file fallback still
+# configures it, and the next agent is reached.
+run()
+assert STATE["calls"] == [
+    "claude.detect",
+    "claude.register(file)",
+    "codex.detect",
+    "codex.register",
+], STATE["calls"]
+
+# When nothing can be configured the helper must fail loudly rather than
+# report a successful no-op.
+REGISTRARS[:] = [CliOnlyRegistrar()]
+STATE["claude_file_write_ok"] = False
+try:
+    run()
+except SystemExit as exc:
+    assert "unrunnable CLI: grok" in str(exc), str(exc)
+else:
+    raise AssertionError("helper must fail when no agent could be configured")
+
+# A file fallback that itself fails is a real failure: its reason must reach
+# the user instead of being folded into the skip path.
+REGISTRARS[:] = [ClaudeRegistrar()]
+try:
+    run()
+except SystemExit as exc:
+    assert "config is not valid JSON" in str(exc), str(exc)
+else:
+    raise AssertionError("a failed file fallback must not be reported as success")
+print("ok")
+"#
+        );
+
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let out = match crate::proc::command(python).args(["-c", &script]).output() {
+            Ok(out) => out,
+            Err(e) => panic!("spawn failed: {e}"),
+        };
+        assert!(
+            out.status.success(),
+            "community MCP helper scenario failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("CLI is not runnable"),
+            "the unusable CLI must be reported to the user"
+        );
     }
 
     #[test]
