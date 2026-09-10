@@ -614,7 +614,9 @@ export function clientSetupNotice(clientName: string, result: ClientSetupResult)
 
 export type ConnectorStatusLine = {
   text: string;
-  tone: "reason" | "restart";
+  // `note` is informational: neither a setup failure (`reason`) nor a pending
+  // restart (`restart`, which also unlocks the Restart Codex action).
+  tone: "reason" | "restart" | "note";
 };
 
 export function shouldShowConnectorDetectionWarning(
@@ -634,6 +636,16 @@ export function connectorStatusLine(
 ): ConnectorStatusLine | null {
   if (!connector.enabled) {
     return null;
+  }
+  // Another tool owns Codex routing through its own root `model_provider`.
+  // Headroom stands aside on purpose, so this is a coexist state the user can
+  // resolve by re-enabling the connector, not a setup failure.
+  const foreignProvider = connector.verification?.foreignProvider;
+  if (foreignProvider) {
+    return {
+      text: `Codex routing is currently handled by ${foreignProvider}, so Headroom is not intercepting. Turn this connector off and on to route Codex through Headroom.`,
+      tone: "note"
+    };
   }
   // `verified` attests only that Headroom wrote what it needed to write, so it
   // is a setup failure, never "the client has not restarted yet".

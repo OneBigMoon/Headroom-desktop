@@ -51,7 +51,7 @@ test("stages macOS and Windows assets with one updater manifest", (t) => {
   const result = prepareCommunityRelease({
     version: "1.2.3",
     tag: "v1.2.3",
-      repository: "OneBigMoon/Headroom-desktop-CN",
+      repository: "OneBigMoon/Headroom-desktop",
     pubDate: "2026-08-30T00:00:00.000Z",
     ...fixture(t),
   });
@@ -76,7 +76,7 @@ test("stages macOS and Windows assets with one updater manifest", (t) => {
   ]);
   assert.equal(
     result.manifest.platforms["darwin-aarch64"].url,
-    "https://github.com/OneBigMoon/Headroom-desktop-CN/releases/download/v1.2.3/Headroom.Local.Community_universal.app.tar.gz",
+    "https://github.com/OneBigMoon/Headroom-desktop/releases/download/v1.2.3/Headroom.Local.Community_universal.app.tar.gz",
   );
   assert.equal(
     result.manifest.platforms["darwin-aarch64"].signature,
@@ -84,7 +84,7 @@ test("stages macOS and Windows assets with one updater manifest", (t) => {
   );
   assert.equal(
     result.manifest.platforms["windows-x86_64"].url,
-    "https://github.com/OneBigMoon/Headroom-desktop-CN/releases/download/v1.2.3/Headroom.Local.Community_x64-setup.nsis.zip",
+    "https://github.com/OneBigMoon/Headroom-desktop/releases/download/v1.2.3/Headroom.Local.Community_x64-setup.nsis.zip",
   );
   assert.equal(
     result.manifest.platforms["windows-x86_64"].signature,
@@ -103,7 +103,7 @@ test("rejects prerelease versions and mismatched tags", (t) => {
       prepareCommunityRelease({
         version: "1.2.3-rc.1",
         tag: "v1.2.3-rc.1",
-      repository: "OneBigMoon/Headroom-desktop-CN",
+      repository: "OneBigMoon/Headroom-desktop",
         ...files,
       }),
     /Stable release version required/,
@@ -113,7 +113,7 @@ test("rejects prerelease versions and mismatched tags", (t) => {
       prepareCommunityRelease({
         version: "1.2.3",
         tag: "v1.2.4",
-      repository: "OneBigMoon/Headroom-desktop-CN",
+      repository: "OneBigMoon/Headroom-desktop",
         ...files,
       }),
     /does not match version/,
@@ -129,7 +129,7 @@ test("rejects an empty Windows updater archive", (t) => {
       prepareCommunityRelease({
         version: "1.2.3",
         tag: "v1.2.3",
-      repository: "OneBigMoon/Headroom-desktop-CN",
+      repository: "OneBigMoon/Headroom-desktop",
         ...files,
       }),
     /Windows updater archive/,
@@ -145,7 +145,7 @@ test("rejects an empty Windows installer using file metadata", (t) => {
       prepareCommunityRelease({
         version: "1.2.3",
         tag: "v1.2.3",
-      repository: "OneBigMoon/Headroom-desktop-CN",
+      repository: "OneBigMoon/Headroom-desktop",
         ...files,
       }),
     /Windows NSIS installer is empty/,

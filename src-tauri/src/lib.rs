@@ -5,6 +5,7 @@ mod backend_port;
 mod bearer;
 mod claude_cli;
 mod client_adapters;
+mod codex_router;
 mod device;
 mod edition;
 mod insights;
@@ -82,7 +83,7 @@ const UPDATER_STAGING_ENDPOINTS: Option<&str> = option_env!("HEADROOM_UPDATER_ST
 const SENTRY_DSN: Option<&str> = None;
 const DEFAULT_UPDATER_PUBLIC_KEY: &str = "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYzQjlBMTUwODdBN0UxQ0EKUldUSzRhZUhVS0c1ODRjaWVYSDg1UUdpMlJiREM3SjZBSlE2bnlCVDM3OXdNUnBWMmI0bUY1d3IK";
 const DEFAULT_UPDATER_ENDPOINT: &str =
-    "https://github.com/OneBigMoon/Headroom-desktop-CN/releases/latest/download/latest.json";
+    "https://github.com/OneBigMoon/Headroom-desktop/releases/latest/download/latest.json";
 /// Cadence of the background liveness ping. Long enough to be negligible
 /// backend load (4 calls/day/user), short enough that admin can tell a
 /// running-but-idle app from a quit one within half a day.
@@ -232,12 +233,10 @@ static WATCHDOG_DOWN_CAPTURED: AtomicBool = AtomicBool::new(false);
 // doesn't drown in the sleep/wake / kill -9 race noise.
 static PORT_CONFLICT_CAPTURED: AtomicBool = AtomicBool::new(false);
 
-// Guards the quit-time `clear_client_setups()` so it runs at most once per
+// Guards the quit-time preserving cleanup so it runs at most once per
 // process. The exit handler fires for both `ExitRequested` and `Exit`, and a
-// second `clear_client_setups()` call is destructive: its `disable_client_setup`
-// loop wipes `remembered_clients` and then skips the snapshot re-save because
-// `configured_clients` is already empty, leaving nothing for the next launch's
-// `restore_client_setups()` to bring back.
+// second cleanup call can otherwise overwrite the remembered snapshots while
+// the first one is still restoring client routes.
 static EXIT_CLEAR_DONE: AtomicBool = AtomicBool::new(false);
 
 // Presence means the previous desktop process did not reach a normal exit
@@ -277,14 +276,13 @@ fn begin_runtime_session_at(path: &Path) -> std::io::Result<bool> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(
-        path,
-        format!(
-            "pid={}\nstarted_at={}\n",
-            std::process::id(),
-            Utc::now().to_rfc3339()
-        ),
-    )?;
+    let contents = format!(
+        "pid={}\nstarted_at={}\n",
+        std::process::id(),
+        Utc::now().to_rfc3339()
+    );
+    crate::client_adapters::atomic_write(path, contents.as_bytes())
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
     Ok(previous_unclean)
 }
 
@@ -797,11 +795,15 @@ async fn check_for_app_update(
     // outlives the app and keeps :6868, so the freshly installed build finds
     // its own port "held by unknown process" and falls back to 6869 (RUST-7F)
     // while an old-version backend squats the real one. One orphaned backend
-    // per update, until the user reboots.
+    // per update, until the user reboots. The Codex sidecar is deliberately
+    // switched to Direct before the platform-specific updater hook below.
     //
     // `on_before_exit` is the only hook ahead of that exit, and it is
-    // Windows-only by construction (the unix `install_inner` never calls it),
-    // so macOS/Linux keep tearing down through `restart_app` exactly as before.
+    // Windows-only by construction (the unix `install_inner` never calls it).
+    // Windows must stop the detached sidecar as well: NSIS checks for every
+    // process with the main executable name and cannot replace an image that
+    // the sidecar still has mapped. macOS/Linux keep the sidecar alive through
+    // their existing update/restart flow.
     // The installer does not launch until this returns, so it must be bounded:
     // `stop_headroom` caps itself at ~2s on the lifecycle lock plus ~2s on the
     // child before it force-kills.
@@ -814,12 +816,23 @@ async fn check_for_app_update(
         .on_before_exit(move || {
             log::info!("update: stopping the backend before the installer exits the app");
             SHUTTING_DOWN.store(true, Ordering::Release);
-            // Restore client routes before the updater terminates the process.
-            // Windows exits through `std::process::exit`, which does not deliver
-            // Tauri's RunEvent::Exit; otherwise Codex keeps calling the dead
-            // Headroom port throughout the update.
+            // Restore non-Codex routes before the updater terminates the
+            // process. Windows exits through `std::process::exit`, which does
+            // not deliver Tauri's RunEvent::Exit. `stop_heartbeat` first puts
+            // any existing Codex request on the native/direct path. On Windows
+            // the detached image must then be stopped so NSIS can replace the
+            // main executable; the authenticated request never targets an
+            // unrelated process occupying 6891.
+            codex_router::stop_heartbeat();
+            #[cfg(target_os = "windows")]
+            if let Err(err) = codex_router::shutdown_and_wait() {
+                // An unverified listener is never killed. The installer will
+                // surface its normal "application is running" prompt instead
+                // of allowing us to terminate another local process.
+                log::warn!("update: stopping Codex router before NSIS failed: {err}");
+            }
             if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
-                if let Err(err) = client_adapters::clear_client_setups() {
+                if let Err(err) = client_adapters::clear_client_setups_preserving_codex() {
                     log::warn!("update: clear_client_setups failed: {err}");
                 }
             }
@@ -982,13 +995,15 @@ async fn restart_app(app: AppHandle) {
         }
     }
 
-    // Stop the proxy before relaunching so the new build starts a fresh proxy
-    // with current args (otherwise the orphan keeps serving traffic and the
-    // new desktop reuses it via the reachability check). Without this, any
-    // proxy-arg change shipped by an upgrade silently never takes effect.
+    // Keep the detached Codex router alive across the relaunch.  Its heartbeat
+    // is stopped first, which atomically selects native/direct forwarding while
+    // the in-process intercept is torn down.  The new build can reuse the same
+    // stable listener (and its protocol-compatible state) without making
+    // already-running Codex sessions reconnect or fail on a dead 6891 port.
     {
+        codex_router::stop_heartbeat();
         if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
-            if let Err(err) = client_adapters::clear_client_setups() {
+            if let Err(err) = client_adapters::clear_client_setups_preserving_codex() {
                 log::warn!("restart_app: clear_client_setups failed: {err}");
             }
         }
@@ -1428,9 +1443,10 @@ async fn uninstall_addon(
 ) -> Result<DashboardState, String> {
     match id.as_str() {
         "markitdown" => {
-            let _ = client_adapters::disable_markitdown_integration(
+            client_adapters::disable_markitdown_integration(
                 &state.tool_manager.markitdown_shim_path(),
-            );
+            )
+            .map_err(|err| err.to_string())?;
             state
                 .tool_manager
                 .uninstall_markitdown()
@@ -4323,7 +4339,22 @@ pub(crate) fn client_setup_error_kind(err: &anyhow::Error) -> &'static str {
 async fn apply_client_setup(
     app: AppHandle,
     client_id: String,
+    // Set only after the user explicitly confirms taking Codex routing over from
+    // another provider manager (for example Cockpit Tools). Absent = refuse to
+    // replace an unknown custom `model_provider`.
+    allow_takeover: Option<bool>,
 ) -> Result<ClientSetupResult, String> {
+    let codex_setup = matches!(client_id.as_str(), "codex" | "codex_cli" | "codex_gui");
+    if codex_setup {
+        // The config writer is intentionally kept pure for unit tests; the
+        // application command owns the runtime side effect. Refuse to write a
+        // 6891 provider block when the detached listener cannot be started, as
+        // doing so would leave Codex on an address nobody serves.
+        codex_router::ensure_running()
+            .map_err(|err| format!("Codex routing helper could not start: {err}"))?;
+        codex_router::set_mode(codex_router::RouteMode::Direct)
+            .map_err(|err| format!("Codex routing helper state could not be prepared: {err}"))?;
+    }
     // Two recovery paths land on the tray-banner "Re-enable" button:
     //   1. Watchdog give-up — pauses the runtime and clears client setups.
     //   2. Pricing gate (grace expiry, weekly cap) — sets `proxy_bypass` and
@@ -4341,7 +4372,10 @@ async fn apply_client_setup(
             log::warn!("apply_client_setup: resume_runtime failed: {err:#}");
         }
     }
-    match client_adapters::apply_client_setup(&client_id) {
+    match client_adapters::apply_client_setup_with_options(
+        &client_id,
+        allow_takeover.unwrap_or(false),
+    ) {
         Ok(result) => {
             // Serena registration is independent of proxy routing. A client
             // first detected by this setup action must receive both its MCP
@@ -4399,10 +4433,24 @@ async fn apply_client_setup(
                     },
                 );
             }
+            if codex_setup {
+                // Do not publish Proxy while the Python backend is still
+                // booting.  The waiter flips the detached router only after
+                // 6867/readyz is healthy; until then it remains Direct.
+                arm_codex_router_when_runtime_ready(app.clone());
+            }
             Ok(result)
         }
         Err(err) => {
             let msg = err.to_string();
+            // Preparing a Codex setup temporarily puts the stable router in
+            // Direct mode. If the file transaction fails while the existing
+            // runtime is still healthy, restore its previous automatic proxy
+            // route instead of leaving optimization off until the watchdog's
+            // next reconciliation.
+            if codex_setup {
+                activate_codex_router_if_runtime_ready(&state);
+            }
             // Permission-denied (os error 13) and disk-full (ENOSPC, os error
             // 28) writes are unwritable-file environment issues, not app bugs --
             // surface to the user but keep them out of Sentry.
@@ -4462,7 +4510,23 @@ async fn restart_codex_desktop() -> Result<(), String> {
 
 #[tauri::command]
 async fn disable_client_setup(app: AppHandle, client_id: String) -> Result<(), String> {
-    client_adapters::disable_client_setup(&client_id).map_err(|err| err.to_string())?;
+    let codex_setup = matches!(client_id.as_str(), "codex" | "codex_cli");
+    if codex_setup {
+        // Explicit disconnect removes the managed config, so leave any still
+        // running Codex session on the router's native/direct path first.
+        codex_router::stop_heartbeat();
+    }
+    if let Err(err) = client_adapters::disable_client_setup(&client_id) {
+        // A failed disconnect keeps the connector's ownership state intact.
+        // If Codex is still configured, restore proxy mode for the healthy
+        // runtime so the failed transaction does not silently disable
+        // optimization.
+        if codex_setup {
+            let state: tauri::State<'_, AppState> = app.state();
+            activate_codex_router_if_runtime_ready(&state);
+        }
+        return Err(err.to_string());
+    }
     analytics::track_event(
         &app,
         "client_setup_disabled",
@@ -4473,12 +4537,14 @@ async fn disable_client_setup(app: AppHandle, client_id: String) -> Result<(), S
 
 #[tauri::command]
 async fn clear_client_setups() -> Result<(), String> {
+    codex_router::stop_heartbeat();
     client_adapters::clear_client_setups().map_err(|err| err.to_string())
 }
 
 #[tauri::command]
 async fn pause_headroom(app: AppHandle) -> Result<(), String> {
     let state: tauri::State<'_, AppState> = app.state();
+    codex_router::stop_heartbeat();
     state.set_runtime_paused(true);
     // A deliberate user pause is not an auto-pause; clear the flag so the
     // self-heal loop doesn't fight the user by auto-resuming.
@@ -4491,10 +4557,11 @@ async fn pause_headroom(app: AppHandle) -> Result<(), String> {
     if state.setup_wizard_satisfied() {
         state.mark_setup_wizard_complete();
     }
-    if let Err(err) = client_adapters::clear_client_setups() {
+    if let Err(err) = client_adapters::clear_client_setups_preserving_codex() {
         // Keep the existing runtime usable if route cleanup fails; stopping
         // 6867 while clients still point at it would create a dead endpoint.
         state.set_runtime_paused(false);
+        activate_codex_router_if_runtime_ready(&state);
         return Err(err.to_string());
     }
     state.stop_headroom();
@@ -4520,7 +4587,13 @@ async fn start_headroom(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 async fn force_restart_headroom(app: AppHandle) -> Result<(), String> {
     let state: tauri::State<'_, AppState> = app.state();
-    client_adapters::clear_client_setups().map_err(|err| err.to_string())?;
+    codex_router::stop_heartbeat();
+    if let Err(err) = client_adapters::clear_client_setups_preserving_codex() {
+        // No backend teardown happened, so restore the proxy route that was
+        // active before this failed restart transaction.
+        activate_codex_router_if_runtime_ready(&state);
+        return Err(err.to_string());
+    }
     state.stop_headroom();
     state.set_runtime_auto_paused(false);
     state.resume_runtime().map_err(|err| err.to_string())?;
@@ -4606,17 +4679,13 @@ fn get_auto_learn_enabled() -> bool {
     !client_adapters::is_auto_learn_disabled()
 }
 
-/// Toggle passive traffic learning. The flag is only read when the proxy is
-/// spawned, so restart it here to make the change take effect immediately.
-/// Manual Learn scans are unaffected either way.
+/// Toggle passive traffic learning without interrupting the live proxy. The
+/// flag is read at the next normal proxy start; an active Codex or Claude
+/// request must be allowed to finish. Manual Learn scans are unaffected.
 #[tauri::command]
 async fn set_auto_learn_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
     let state: tauri::State<'_, AppState> = app.state();
     client_adapters::set_auto_learn_enabled(enabled).map_err(|err| err.to_string())?;
-    state.stop_headroom();
-    if let Err(err) = state.ensure_headroom_running() {
-        log::warn!("set_auto_learn_enabled: proxy restart failed: {err:#}");
-    }
     state.invalidate_runtime_status_cache();
     let action = if enabled { "enabled" } else { "disabled" };
     analytics::track_event(&app, &format!("auto_learn_{action}"), None);
@@ -4628,20 +4697,50 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
     // Prevent the launch-time OSS-plugin worker from mutating Claude's hook
     // cache after cleanup has restored it.
     SHUTTING_DOWN.store(true, Ordering::Release);
+    let mut cleanup_errors: Vec<String> = Vec::new();
     {
         let state: tauri::State<'_, AppState> = app.state();
+        codex_router::stop_heartbeat();
+        if let Err(err) = codex_router::shutdown_and_wait() {
+            // Do not delete the router state/config while its detached
+            // listener is still alive: an orphan would keep the old binary on
+            // :6891 and could be reused after reinstall. Preserve the cleanup
+            // transaction so the user can retry once the listener responds.
+            log::warn!("uninstall: stopping Codex router failed: {err}");
+            cleanup_errors.push(format!("Codex router shutdown: {err:#}"));
+        }
         if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
             if let Err(err) = client_adapters::clear_client_setups() {
                 log::warn!("uninstall: clear_client_setups failed: {err}");
+                cleanup_errors.push(format!("client setup rollback: {err:#}"));
             }
         }
+        let runtime_was_running = state.headroom_process.lock().is_some();
         state.stop_headroom();
         // Plugin addons live in the hosts' plugin registries, outside Headroom's
         // own footprint that perform_full_cleanup() wipes, so remove them here
         // while we still have the ToolManager. Best-effort.
-        for plugin_id in ["ponytail", "caveman"] {
+        // Every marketplace addon is owned independently through its
+        // per-plugin Headroom receipt. `uninstall_plugin` serializes each
+        // operation and is a no-op when that receipt is absent, so walking the
+        // complete catalog removes all Community-owned registrations while
+        // leaving user-installed copies untouched. Continue after failures so
+        // one broken host CLI cannot strand the remaining owned addons.
+        for plugin_id in [
+            "ponytail",
+            "caveman",
+            "allinluna",
+            "openspec",
+            "superpowers",
+            "gstack",
+            "ralph-loop",
+            "stop-that-shit",
+            "agent-guard",
+            "grill-me",
+        ] {
             if let Err(err) = state.tool_manager.uninstall_plugin(plugin_id) {
                 log::warn!("uninstall: removing {plugin_id} plugin failed: {err:#}");
+                cleanup_errors.push(format!("{plugin_id}: {err:#}"));
             }
         }
 
@@ -4651,24 +4750,49 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
         // via the Python helpers while the runtime and MCP ledger still
         // exist; perform_full_cleanup() strips whatever a broken runtime
         // leaves behind. All best-effort.
-        let _ = client_adapters::disable_markitdown_integration(
+        if let Err(err) = client_adapters::disable_markitdown_integration(
             &state.tool_manager.markitdown_shim_path(),
-        );
-        let _ = client_adapters::disable_serena_integration();
+        ) {
+            cleanup_errors.push(format!("MarkItDown integration: {err:#}"));
+        }
+        if let Err(err) = client_adapters::disable_serena_integration() {
+            cleanup_errors.push(format!("Serena integration: {err:#}"));
+        }
         if state.tool_manager.serena_installed() {
             if let Err(err) = state.tool_manager.uninstall_serena() {
                 log::warn!("uninstall: removing serena failed: {err:#}");
+                cleanup_errors.push(format!("serena: {err:#}"));
             }
         }
         if state.tool_manager.context7_installed() {
             if let Err(err) = state.tool_manager.uninstall_context7() {
                 log::warn!("uninstall: removing context7 failed: {err:#}");
+                cleanup_errors.push(format!("context7: {err:#}"));
             }
         }
         if state.tool_manager.codebase_memory_installed() {
             if let Err(err) = state.tool_manager.uninstall_codebase_memory() {
                 log::warn!("uninstall: removing codebase-memory failed: {err:#}");
+                cleanup_errors.push(format!("codebase-memory: {err:#}"));
             }
+        }
+
+        if !cleanup_errors.is_empty() {
+            // Keep the receipt, recovery markers, and app data in place so a
+            // later explicit retry can finish the transaction. Restore the
+            // process guards before returning the error; otherwise a failed
+            // uninstall would leave the live app permanently in shutdown mode.
+            SHUTTING_DOWN.store(false, Ordering::Release);
+            EXIT_CLEAR_DONE.store(false, Ordering::Release);
+            if runtime_was_running {
+                if let Err(err) = state.ensure_headroom_running() {
+                    cleanup_errors.push(format!("restoring the Headroom runtime: {err:#}"));
+                }
+            }
+            return Err(format!(
+                "uninstall was not completed; preserved Headroom receipts and configuration for retry: {}",
+                cleanup_errors.join("; ")
+            ));
         }
     }
 
@@ -4732,14 +4856,20 @@ fn launched_from_autostart() -> bool {
 /// directories alone, because a cask's `uninstall` must not destroy user data —
 /// that is what `zap` is for.
 ///
-/// Quitting a *running* instance already reverts the routing layer via
-/// `clear_client_setups`, so this mainly covers the case where the app was
+/// Quitting a *running* instance already reverts the routing layer via the
+/// preserving cleanup, so this mainly covers the case where the app was
 /// force-killed or never launched, plus the pieces quitting does not touch.
 fn handle_uninstall_flag() {
     if !std::env::args().any(|arg| arg == UNINSTALL_LAUNCH_ARG) {
         return;
     }
 
+    // Package-manager uninstall scripts run in a fresh process after the GUI
+    // may have crashed. Stop the detached router before removing its state so
+    // a stale old binary cannot survive a reinstall on :6891.
+    if let Err(err) = codex_router::shutdown_and_wait() {
+        log::warn!("uninstall flag: stopping Codex router failed: {err}");
+    }
     let removed = client_adapters::revert_external_mutations();
     for path in &removed {
         println!("removed {path}");
@@ -4755,16 +4885,16 @@ fn exit_headroom(app: &AppHandle, source: QuitSource) {
     let runtime_paused = {
         let state: tauri::State<'_, AppState> = app.state();
         let runtime_paused = state.runtime_is_paused();
-        // Mark the quit-time clear as done so the RunEvent::Exit handler skips
-        // its redundant clear_client_setups(). A second call would wipe the
-        // remembered_clients snapshot we just saved (configured_clients is now
-        // empty, so the re-save is skipped while the disable loop still removes
-        // remembered entries), leaving connectors disabled on next launch.
+        // Mark the quit-time cleanup as done so the RunEvent::Exit handler does
+        // not repeat it. The preserving variant keeps Codex's stable router
+        // configuration while snapshotting the other connectors.
+        codex_router::stop_heartbeat();
         if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
-            let _ = client_adapters::clear_client_setups();
+            let _ = client_adapters::clear_client_setups_preserving_codex();
         }
-        // Restore native routes before stopping 6867 so an in-flight Codex
-        // request cannot be sent to a backend that has just gone away.
+        // The router is already in Direct mode before stopping 6867, so an
+        // in-flight Codex request cannot be sent to a backend that has gone
+        // away. Other clients were restored by the preserving cleanup above.
         state.stop_headroom();
         runtime_paused
     };
@@ -4789,8 +4919,85 @@ fn app_quit_requested_properties(source: QuitSource, runtime_paused: bool) -> Va
     })
 }
 
+/// Put the detached router into proxy mode only after the in-process intercept
+/// and Python backend answer their readiness probe.  Every caller that starts
+/// or resumes the backend can use this small idempotent reconciliation; a
+/// failed probe leaves the router Direct, which is the safe state for Codex.
+fn activate_codex_router_if_runtime_ready(state: &AppState) {
+    if SHUTTING_DOWN.load(Ordering::Acquire)
+        || state.runtime_is_paused()
+        || !state.runtime_ready()
+        || !client_adapters::is_codex_enabled()
+    {
+        codex_router::stop_heartbeat();
+        return;
+    }
+    if let Err(err) = codex_router::ensure_running() {
+        log::warn!("Codex router unavailable while backend is ready: {err}");
+        codex_router::stop_heartbeat();
+        return;
+    }
+    // Publish proxy mode only after proving that :6867 is Headroom's own
+    // intercept. A generic /health response is not enough: a foreign local
+    // listener must never receive Codex credentials through the sidecar.
+    if !codex_router::intercept_is_headroom() {
+        log::warn!(
+            "Codex router kept in direct mode: 127.0.0.1:{}/{} did not return the Headroom identity marker",
+            codex_router::INTERCEPT_PORT,
+            codex_router::INTERCEPT_IDENTITY_PATH
+        );
+        codex_router::stop_heartbeat();
+        return;
+    }
+    if codex_router::route_mode() == codex_router::RouteMode::Proxy {
+        return;
+    }
+    if let Err(err) = codex_router::start_heartbeat() {
+        log::warn!("Codex router heartbeat failed: {err}");
+    }
+}
+
+/// Wait for a backend that is still booting, then reconcile the stable Codex
+/// route.  This is deliberately detached from the UI and from request handling
+/// so a slow model download never exposes Codex to a dead 6867 endpoint.
+fn arm_codex_router_when_runtime_ready(app: AppHandle) {
+    std::thread::spawn(move || {
+        let state: tauri::State<'_, AppState> = app.state();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+        loop {
+            if SHUTTING_DOWN.load(Ordering::Acquire)
+                || state.runtime_is_paused()
+                || !client_adapters::is_codex_enabled()
+            {
+                codex_router::stop_heartbeat();
+                return;
+            }
+            if state.runtime_ready() {
+                activate_codex_router_if_runtime_ready(&state);
+                // `runtime_ready` can win the race with the 6867 bind (or a
+                // foreign listener can temporarily occupy the port). Keep
+                // probing until the identity marker is present instead of
+                // permanently leaving Codex in Direct mode after one miss.
+                if codex_router::route_mode() == codex_router::RouteMode::Proxy {
+                    return;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                log::warn!("Codex router activation timed out while Headroom was booting");
+                codex_router::stop_heartbeat();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+    });
+}
+
 fn restore_clients_if_runtime_ready(state: &AppState) {
     if !state.runtime_ready() {
+        // A failed startup/recovery must never leave the previous proxy marker
+        // alive.  The sidecar will therefore fail open while the UI offers a
+        // retry instead of sending Codex into a dead intercept.
+        codex_router::stop_heartbeat();
         log::warn!(
             "client restore skipped: Headroom backend is not healthy; keeping native routes"
         );
@@ -4798,6 +5005,7 @@ fn restore_clients_if_runtime_ready(state: &AppState) {
     }
 
     client_adapters::restore_client_setups();
+    activate_codex_router_if_runtime_ready(state);
     // Plain Cmd-Q, dock quit, and updater restart do not populate
     // `remembered_clients`; mirror the quit retag whenever Codex is already
     // configured so its history remains available after a clean restart.
@@ -4814,7 +5022,8 @@ fn restore_clients_when_runtime_ready(app: AppHandle) {
         let state: tauri::State<'_, AppState> = app.state();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !state.runtime_ready() && std::time::Instant::now() < deadline {
-            if state.runtime_is_paused() {
+            if state.runtime_is_paused() || SHUTTING_DOWN.load(Ordering::Acquire) {
+                codex_router::stop_heartbeat();
                 return;
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
@@ -4838,6 +5047,13 @@ pub fn run() {
     // Initialize the panic-safe file logger after Sentry so warn!/error!
     // records flow into Sentry too. Failure here cannot abort startup.
     let _ = logging::init();
+
+    // The Codex router is a detached child of the desktop process. It must
+    // handle its command-line mode before Tauri initialises, otherwise the
+    // child would recursively build a GUI and never open the listener.
+    if codex_router::run_if_requested() {
+        return;
+    }
 
     // Must come before any Tauri/state setup: this path never shows a window and
     // never starts the proxy, it just undoes our edits to other tools and exits.
@@ -4867,6 +5083,28 @@ pub fn run() {
             );
             std::process::exit(1);
         }
+    }
+
+    // Keep one stable loopback endpoint available for Codex for the lifetime
+    // of the installation. The endpoint is deliberately put in Direct mode
+    // until the in-process intercept has been started below; a stale marker from
+    // an earlier crash must never make a fresh launch relay into a dead 6867.
+    let router_ready = match codex_router::ensure_running() {
+        Ok(()) => true,
+        Err(err) => {
+            log::warn!("Codex router unavailable at startup: {err}");
+            false
+        }
+    };
+    // A second launch is routed to the existing Tauri instance by the
+    // single-instance plugin below. Do not briefly flip its live proxy route
+    // to Direct while that hand-off happens; only force Direct when this is a
+    // genuine cold/crashed start (or the existing listener is not Headroom).
+    let preserve_existing_proxy = router_ready
+        && codex_router::route_mode() == codex_router::RouteMode::Proxy
+        && codex_router::intercept_is_headroom();
+    if !preserve_existing_proxy {
+        codex_router::stop_heartbeat();
     }
 
     let state = AppState::new().expect("failed to create app state");
@@ -4957,7 +5195,7 @@ pub fn run() {
                 log::warn!(
             "startup: previous Headroom session ended unexpectedly; restoring native client routes"
         );
-                if let Err(err) = client_adapters::clear_client_setups() {
+                if let Err(err) = client_adapters::clear_client_setups_preserving_codex() {
                     log::warn!("startup recovery: clear_client_setups failed: {err}");
                 }
                 client_adapters::retag_codex_threads_to_native();
@@ -5133,6 +5371,15 @@ pub fn run() {
                 fresh_bearer_tx,
                 std::sync::Arc::clone(&state.intercept_bind_error),
             );
+            // The intercept is now being brought up. Keep the detached router
+            // in Direct mode until the readiness-gated startup worker confirms
+            // that 6867 and the Python backend are healthy.
+            if let Err(err) = codex_router::ensure_running() {
+                log::warn!("Codex router unavailable after intercept start: {err}");
+                codex_router::stop_heartbeat();
+            } else if client_adapters::is_codex_enabled() {
+                arm_codex_router_when_runtime_ready(app.handle().clone());
+            }
             if state.should_present_on_launch() && !launched_from_autostart {
                 let _ = show_user_window(app.handle());
             }
@@ -5318,22 +5565,20 @@ pub fn run() {
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
             ) {
                 SHUTTING_DOWN.store(true, Ordering::Release);
+                codex_router::stop_heartbeat();
                 // Step markers: this teardown runs on the UI thread, so a step
                 // that blocks freezes the app mid-quit and emits nothing (Sentry
                 // only receives warn!/error!). The last marker in the log names
                 // the step that hung.
                 let state: tauri::State<'_, AppState> = app.state();
-                // Gracefully reverse every client's base-URL override (and shell
-                // blocks) on quit so Claude Code / Codex fall back to talking
-                // directly to their native providers while Headroom is not
-                // running, instead of pointing at a now-dead proxy on 6867. The
-                // snapshot is remembered so the next launch's
-                // restore_client_setups re-applies it. Guarded to run once: the
-                // exit handler fires for both ExitRequested and Exit, and a
-                // second clear_client_setups wipes the remembered snapshot.
+                // Gracefully reverse non-Codex routes on quit. Codex keeps its
+                // stable 6891 provider block; the detached router is already in
+                // Direct mode, and the other clients are snapshotted for the
+                // next launch. Guarded to run once because Tauri emits both
+                // ExitRequested and Exit.
                 if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
                     log::info!("exit: clear_client_setups");
-                    if let Err(err) = client_adapters::clear_client_setups() {
+                    if let Err(err) = client_adapters::clear_client_setups_preserving_codex() {
                         log::warn!("exit: clear_client_setups failed: {err}");
                     }
                 }
@@ -5945,7 +6190,7 @@ fi\n\
 exec \"$HEADROOM_REAL_CODEX\" \"$@\"\n",
     );
 
-    std::fs::write(&wrapper_path, contents)
+    crate::client_adapters::atomic_write(&wrapper_path, contents.as_bytes())
         .map_err(|err| format!("Could not write Codex Learn wrapper: {err}"))?;
 
     #[cfg(unix)]
@@ -6070,9 +6315,10 @@ fn execute_headroom_learn_run(
         }
         LearnAgent::Codex => {
             // Codex scans all of ~/.codex/sessions (no --project) and writes
-            // ~/.codex/AGENTS.md + instructions.md. Force --model codex-cli so
-            // analysis runs through `codex exec` on the user's ChatGPT
-            // subscription rather than auto-detecting an API key or the claude CLI.
+            // ~/.codex/AGENTS.md + instructions.md. `codex-cli` is an explicit
+            // analyzer backend selector, not a version-pinned model ID: it
+            // keeps analysis on the user's ChatGPT subscription rather than
+            // auto-detecting an API key or the Claude CLI.
             command
                 .arg("--agent")
                 .arg("codex")
@@ -6090,6 +6336,8 @@ fn execute_headroom_learn_run(
             if claude_cli::detect_claude_cli().is_some() {
                 command.env("HEADROOM_LEARN_CLI", "claude");
             } else {
+                // `codex-cli` selects the Codex analyzer backend; it does not
+                // pin a historical model version.
                 command
                     .arg("--model")
                     .arg("codex-cli")
@@ -6388,7 +6636,14 @@ fn execute_headroom_learn_run(
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(log_path, log_content);
+    // Publish the latest-run snapshot atomically so readers never observe a
+    // truncated transcript if the app exits during the write.
+    if let Err(err) = crate::client_adapters::atomic_write(&log_path, log_content.as_bytes()) {
+        log::warn!(
+            "could not persist Headroom Learn log {}: {err:#}",
+            log_path.display()
+        );
+    }
 
     HeadroomLearnRunResult {
         success,
@@ -7044,6 +7299,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                     // `ensure_headroom_running` no-ops on an alive-but-hung
                     // process (try_wait says running), so a plain resume can't
                     // fix it. stop_headroom SIGKILLs the group and reaps orphans.
+                    codex_router::stop_heartbeat();
                     state.stop_headroom();
                     consecutive_failures = 0;
                     hung_kill_attempted = false;
@@ -7052,6 +7308,9 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                         // the normal path will re-give-up and reschedule.
                         log::info!("watchdog: auto-resume resume_runtime failed: {err:#}");
                     }
+                    // The backend may still be loading models.  Keep Codex on
+                    // the direct path until the readiness probe succeeds.
+                    arm_codex_router_when_runtime_ready(app.clone());
                     auto_pause_next_retry = None;
                 }
                 continue;
@@ -7074,7 +7333,13 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                         if marker.exists() {
                             log::info!("tiktoken prefetch failed (repeat): {err:#}");
                         } else {
-                            let _ = std::fs::write(&marker, b"1");
+                            if let Err(write_err) =
+                                crate::client_adapters::atomic_write(&marker, b"1")
+                            {
+                                log::debug!(
+                                    "tiktoken prefetch warning marker could not be written: {write_err:#}"
+                                );
+                            }
                             log::warn!("tiktoken prefetch failed: {err:#}");
                         }
                     }
@@ -7114,6 +7379,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
             }
 
             if runtime.proxy_reachable {
+                activate_codex_router_if_runtime_ready(&state);
                 consecutive_failures = 0;
                 hung_kill_attempted = false;
                 // Healthy again — reset the self-heal backoff so a future
@@ -7133,6 +7399,12 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                 }
                 continue;
             }
+
+            // A failed readiness probe marks the beginning of a down/restart
+            // window.  Stop the router heartbeat immediately so a stale proxy
+            // marker cannot relay ChatGPT OAuth traffic into the 503 branch of
+            // the intercept while the backend is being repaired.
+            codex_router::stop_heartbeat();
 
             // System resumed from sleep/throttle — give Python one POLL to
             // catch up before counting failures. Without this, the watchdog
@@ -7163,6 +7435,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                     "watchdog: backend /readyz answered on tolerant 5s re-probe; not counting failure"
                 );
                 consecutive_failures = 0;
+                activate_codex_router_if_runtime_ready(&state);
                 continue;
             }
             // A 503 whose only failing check is upstream connectivity means the
@@ -7174,6 +7447,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                     "watchdog: backend /readyz 503 with only upstream unhealthy (transient connectivity); not counting failure"
                 );
                 consecutive_failures = 0;
+                activate_codex_router_if_runtime_ready(&state);
                 continue;
             }
 
@@ -7222,6 +7496,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                         "watchdog: backend /readyz answers ok after {consecutive_failures} intercept failures; skipping auto-pause and resetting counter"
                     );
                     consecutive_failures = 0;
+                    activate_codex_router_if_runtime_ready(&state);
                     continue;
                 }
                 // Upstream-only 503: process alive and answering, only the
@@ -7235,6 +7510,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                     "watchdog: backend /readyz 503 (non-routing checks only) after {consecutive_failures} failures; process healthy, skipping auto-pause"
                     );
                     consecutive_failures = 0;
+                    activate_codex_router_if_runtime_ready(&state);
                     continue;
                 }
                 // Wedged backend: /readyz never responds ("timeout", the event
@@ -7304,6 +7580,7 @@ fn spawn_proxy_watchdog(app: AppHandle) {
                         consecutive_failures = 0;
                         hung_kill_attempted = false;
                         WATCHDOG_DOWN_CAPTURED.store(false, Ordering::Release);
+                        activate_codex_router_if_runtime_ready(&state);
                         continue;
                     }
                     log::info!(
@@ -7658,7 +7935,12 @@ fn ensure_runtime_ready_for_tray(app: &AppHandle) {
         return;
     }
     match state.ensure_headroom_running() {
-        Ok(()) => port_conflict::note_proxy_started(app),
+        Ok(()) => {
+            port_conflict::note_proxy_started(app);
+            if client_adapters::is_codex_enabled() {
+                arm_codex_router_when_runtime_ready(app.clone());
+            }
+        }
         Err(err) => {
             // The managed runtime can disappear out from under a running app
             // (disk cleanup, AV quarantine, a wiped Application Support dir), or
@@ -8570,7 +8852,7 @@ mod tests {
 
     #[test]
     fn community_release_uses_independent_default_updater_feed() {
-        assert!(DEFAULT_UPDATER_ENDPOINT.contains("OneBigMoon/Headroom-desktop-CN"));
+        assert!(DEFAULT_UPDATER_ENDPOINT.contains("OneBigMoon/Headroom-desktop"));
         assert!(!DEFAULT_UPDATER_ENDPOINT.contains("gglucass/headroom-desktop"));
     }
 

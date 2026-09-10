@@ -545,6 +545,10 @@ pub struct AppState {
     launch_profile_path: std::path::PathBuf,
     last_known_good_plan: Mutex<Option<LastKnownGoodPlan>>,
     last_known_good_plan_path: std::path::PathBuf,
+    /// Set when the last-known-good plan file could not be quarantined. The
+    /// in-memory classifier may continue, but no new plan may replace the
+    /// unreadable source until it is removed or repaired.
+    last_known_good_plan_persistence_blocked: AtomicBool,
     savings_tracker: Mutex<SavingsTracker>,
     /// `(last_reported_total, reported_at)` for the cumulative-savings
     /// heartbeat. In-memory, so it resets on restart. See
@@ -671,7 +675,11 @@ impl AppState {
                 current_step: None,
             });
         let (launch_profile, launch_profile_path) = LaunchProfile::load_or_create(&base_dir)?;
-        let (last_known_good_plan, last_known_good_plan_path) = LastKnownGoodPlan::load(&base_dir);
+        let (
+            last_known_good_plan,
+            last_known_good_plan_path,
+            last_known_good_plan_persistence_blocked,
+        ) = LastKnownGoodPlan::load(&base_dir);
         let savings_tracker = SavingsTracker::load_or_create(&base_dir)?;
         let activity_facts = ActivityFacts::load_or_create(&base_dir)?;
 
@@ -723,6 +731,9 @@ impl AppState {
             launch_profile_path,
             last_known_good_plan: Mutex::new(last_known_good_plan),
             last_known_good_plan_path,
+            last_known_good_plan_persistence_blocked: AtomicBool::new(
+                last_known_good_plan_persistence_blocked,
+            ),
             savings_tracker: Mutex::new(savings_tracker),
             cumulative_report_throttle: Mutex::new(None),
             activity_facts: Mutex::new(activity_facts),
@@ -1563,7 +1574,7 @@ impl AppState {
         {
             let mut profile = self.launch_profile.lock();
             profile.last_launched_app_version = None;
-            persist_launch_profile(&self.launch_profile_path, &profile);
+            persist_launch_profile(&self.launch_profile_path, &mut profile);
         }
         let app_version = app.package_info().version.to_string();
         let plan =
@@ -1588,7 +1599,7 @@ impl AppState {
             if let Some(failure) = profile.last_runtime_upgrade_failure.as_mut() {
                 failure.attempts = 0;
             }
-            persist_launch_profile(&self.launch_profile_path, &profile);
+            persist_launch_profile(&self.launch_profile_path, &mut profile);
         }
         self.run_upgrade_with_ui(app, force_rebuild, target_version.as_deref());
     }
@@ -1837,7 +1848,7 @@ impl AppState {
     fn stamp_app_version(&self, version: &str) {
         let mut profile = self.launch_profile.lock();
         profile.last_launched_app_version = Some(version.to_string());
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(&self.launch_profile_path, &mut profile);
     }
 
     /// True when the launch-profile stamp can be safely advanced to
@@ -1864,7 +1875,7 @@ impl AppState {
     fn clear_upgrade_failure(&self) {
         let mut profile = self.launch_profile.lock();
         profile.last_runtime_upgrade_failure = None;
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(&self.launch_profile_path, &mut profile);
     }
 
     pub fn dismiss_upgrade_failure(&self) {
@@ -1887,7 +1898,7 @@ impl AppState {
             }
         }
         profile.last_runtime_upgrade_failure = Some(failure);
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(&self.launch_profile_path, &mut profile);
     }
 
     fn upgrade_failure_attempts(&self, app_version: &str) -> u32 {
@@ -1930,7 +1941,7 @@ impl AppState {
             return;
         }
         profile.setup_wizard_complete = true;
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(&self.launch_profile_path, &mut profile);
     }
 
     /// One-shot gate for the "setup finished but no traffic ever" recovery
@@ -1942,7 +1953,7 @@ impl AppState {
             return false;
         }
         profile.onboarding_recovery_notified = true;
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(&self.launch_profile_path, &mut profile);
         true
     }
 
@@ -1954,7 +1965,7 @@ impl AppState {
             return false;
         }
         profile.first_savings_notified = true;
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(&self.launch_profile_path, &mut profile);
         true
     }
 
@@ -1968,7 +1979,7 @@ impl AppState {
             return;
         }
         profile.accepted_terms_version = version;
-        persist_launch_profile(&self.launch_profile_path, &profile);
+        persist_launch_profile(&self.launch_profile_path, &mut profile);
     }
 
     pub fn cached_clients(&self) -> Vec<ClientStatus> {
@@ -2160,13 +2171,21 @@ impl AppState {
                         crate::models::ClaudePlanTier::Max20x,
                         crate::models::ClaudePlanTier::Max20x
                     )
-                ) {
+                ) && !(self
+                    .last_known_good_plan_persistence_blocked
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    && !self.last_known_good_plan_path.exists())
+                {
                     return;
                 }
             }
             *cache = Some(entry.clone());
         }
-        persist_last_known_good_plan(&self.last_known_good_plan_path, &entry);
+        persist_last_known_good_plan_guarded(
+            &self.last_known_good_plan_path,
+            &entry,
+            Some(&self.last_known_good_plan_persistence_blocked),
+        );
     }
 
     fn cached_headroom_stats(&self) -> Option<HeadroomDashboardStats> {
@@ -3028,10 +3047,12 @@ impl AppState {
         // exits moments later, holding the port against the next launch.
         // Unconditional — even mid-upgrade-validation, quit wins.
         if crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire) {
+            crate::codex_router::stop_heartbeat();
             log::info!("ensure_headroom_running: app is shutting down; not starting proxy");
             return Ok(());
         }
         if !self.tool_manager.python_runtime_installed() {
+            crate::codex_router::stop_heartbeat();
             return Ok(());
         }
 
@@ -3056,6 +3077,7 @@ impl AppState {
             // gate and (via the watchdog's failure path) eventually auto-pause
             // the runtime.
             if self.proxy_bypass.load(std::sync::atomic::Ordering::Acquire) {
+                crate::codex_router::stop_heartbeat();
                 log::debug!("ensure_headroom_running: short-circuit (proxy_bypass active)");
                 return Ok(());
             }
@@ -3071,11 +3093,13 @@ impl AppState {
                 // self-heal loop re-declined forever). Mirrors
                 // `stop_python_if_gated`'s codex carve-out.
                 if !crate::client_adapters::any_gate_exempt_client_enabled() {
+                    crate::codex_router::stop_heartbeat();
                     return Ok(());
                 }
             }
 
             if self.runtime_is_paused() {
+                crate::codex_router::stop_heartbeat();
                 return Ok(());
             }
         }
@@ -3101,6 +3125,7 @@ impl AppState {
 
         // Another caller may have brought the runtime up while we waited.
         if !self.tool_manager.python_runtime_installed() {
+            crate::codex_router::stop_heartbeat();
             return Ok(());
         }
         // Same upgrade-validation suppression as above. Re-read the flag
@@ -3120,10 +3145,12 @@ impl AppState {
                     // first.
                     drop(_lifecycle_guard);
                     self.stop_python_if_gated();
+                    crate::codex_router::stop_heartbeat();
                     return Ok(());
                 }
             }
             if self.runtime_is_paused() {
+                crate::codex_router::stop_heartbeat();
                 return Ok(());
             }
         }
@@ -3133,6 +3160,7 @@ impl AppState {
         // forcing another launcher.
         if is_headroom_proxy_reachable() {
             *self.last_startup_error.lock() = None;
+            crate::activate_codex_router_if_runtime_ready(self);
             return Ok(());
         }
 
@@ -3141,7 +3169,13 @@ impl AppState {
 
             if let Some(existing) = process.as_mut() {
                 match existing.try_wait() {
-                    Ok(None) => return Ok(()),
+                    Ok(None) => {
+                        // The tracked child may still be in its cold-boot
+                        // window; do not let a fresh heartbeat publish Proxy
+                        // until /readyz confirms that it is serving.
+                        crate::codex_router::stop_heartbeat();
+                        return Ok(());
+                    }
                     Ok(Some(status)) => {
                         *self.last_child_natural_exit.lock() = Some(format!("{status}"));
                         *process = None;
@@ -3170,10 +3204,14 @@ impl AppState {
                 // Fresh child: a death recorded for its predecessor is no
                 // longer diagnostic of the current episode.
                 *self.last_child_natural_exit.lock() = None;
+                // The child has only been spawned; keep the stable Codex route
+                // Direct until a readiness-gated caller observes /readyz.
+                crate::codex_router::stop_heartbeat();
                 Ok(())
             }
             Err(err) => {
                 *self.last_startup_error.lock() = Some(format!("{err:#}"));
+                crate::codex_router::stop_heartbeat();
                 Err(err)
             }
         }
@@ -3357,7 +3395,11 @@ impl AppState {
             .store(false, std::sync::atomic::Ordering::Release);
         self.claude_only_bypass
             .store(false, std::sync::atomic::Ordering::Release);
-        self.ensure_headroom_running()
+        let result = self.ensure_headroom_running();
+        if result.is_ok() && self.runtime_ready() {
+            crate::activate_codex_router_if_runtime_ready(self);
+        }
+        result
     }
 
     /// Ask the backend to dump all Python thread stacks into its own log
@@ -3378,6 +3420,11 @@ impl AppState {
     }
 
     pub fn stop_headroom(&self) {
+        // The detached Codex router is the stable endpoint for already-running
+        // Codex sessions.  Put it on its native/direct path before stopping
+        // 6867 so a backend restart, pricing gate, watchdog rescue, or quit
+        // cannot leave a live heartbeat relaying into a dead intercept.
+        crate::codex_router::stop_heartbeat();
         // `ensure_headroom_running` holds this lock across a blocking backend
         // start, so a launch racing this stop can hold it for the length of that
         // spawn. Quit must not wait on it: `restart_app` calls us before it can
@@ -3621,11 +3668,13 @@ impl AppState {
                 } else {
                     self.proxy_bypass.store(true, Release);
                     self.claude_only_bypass.store(false, Release);
+                    crate::codex_router::stop_heartbeat();
                 }
             }
             Ok(_) => {
                 self.proxy_bypass.store(false, Release);
                 self.claude_only_bypass.store(false, Release);
+                crate::activate_codex_router_if_runtime_ready(self);
             }
             // Leave the flags on their last known value: a pricing lookup that
             // failed is not evidence the user became gated, and flipping
@@ -3750,6 +3799,7 @@ impl AppState {
                     log::warn!("enter_claude_gate: ensure_headroom_running failed: {err:#}");
                 }
             }
+            crate::activate_codex_router_if_runtime_ready(self);
         } else {
             self.claude_only_bypass.store(false, Release);
             // Flip bypass FIRST so the intercept passes new requests straight
@@ -3758,6 +3808,7 @@ impl AppState {
             if !self.proxy_bypass.swap(true, AcqRel) {
                 self.stop_headroom();
             }
+            crate::codex_router::stop_heartbeat();
         }
     }
 
@@ -3772,6 +3823,7 @@ impl AppState {
                 log::warn!("exit_claude_gate: ensure_headroom_running failed: {err:#}");
             }
         }
+        crate::activate_codex_router_if_runtime_ready(self);
     }
 
     pub fn codex_plan_tier(&self) -> crate::models::CodexPlanTier {
@@ -4146,11 +4198,38 @@ struct LaunchProfile {
     /// returning user could be re-congratulated on "first" savings.
     #[serde(default)]
     first_savings_notified: bool,
+    /// Set when a corrupt profile could not be quarantined. Keep the source
+    /// intact until it is removed or repaired instead of overwriting it with
+    /// a fresh profile during a later telemetry update.
+    #[serde(skip)]
+    persistence_blocked: bool,
 }
 
-fn persist_launch_profile(path: &std::path::Path, profile: &LaunchProfile) {
-    if let Ok(bytes) = serde_json::to_vec_pretty(profile) {
-        let _ = crate::client_adapters::atomic_write(path, &bytes);
+fn persist_launch_profile(path: &std::path::Path, profile: &mut LaunchProfile) {
+    if profile.persistence_blocked && path.exists() {
+        log::warn!(
+            "refusing to replace launch profile {} because its recovery copy could not be created",
+            path.display()
+        );
+        return;
+    }
+    let bytes = match serde_json::to_vec_pretty(profile) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            log::warn!(
+                "could not serialize launch profile {}: {err}",
+                path.display()
+            );
+            return;
+        }
+    };
+    if let Err(err) = crate::client_adapters::atomic_write(path, &bytes) {
+        log::warn!(
+            "could not persist launch profile {}: {err:#}",
+            path.display()
+        );
+    } else {
+        profile.persistence_blocked = false;
     }
 }
 
@@ -4174,6 +4253,7 @@ impl LaunchProfile {
             accepted_terms_version: 0,
             onboarding_recovery_notified: false,
             first_savings_notified: false,
+            persistence_blocked: false,
         }
     }
 
@@ -4184,6 +4264,7 @@ impl LaunchProfile {
         // RUST-1P) must not crash startup — that's an unrecoverable launch
         // loop until the user manually deletes the file. Degrade to a fresh
         // profile; the warn still reaches Sentry for visibility.
+        let mut persistence_blocked = false;
         let previous = if path.exists() {
             std::fs::read(&path)
                 .map_err(anyhow::Error::from)
@@ -4195,7 +4276,11 @@ impl LaunchProfile {
                         "launch profile at {} unreadable ({err}); backing up and starting fresh",
                         path.display()
                     );
-                    let _ = std::fs::rename(&path, path.with_extension("json.corrupt"));
+                    persistence_blocked = path.exists()
+                        && !crate::client_adapters::quarantine_unparsable(
+                            &path,
+                            &format!("launch profile: {err}"),
+                        );
                     Self::fresh()
                 })
         } else {
@@ -4203,6 +4288,7 @@ impl LaunchProfile {
         };
 
         let mut current = previous;
+        current.persistence_blocked = persistence_blocked;
         current.launch_count += 1;
 
         // Migrate legacy seeded demo totals to true zero-based tracking.
@@ -4221,14 +4307,10 @@ impl LaunchProfile {
             current.launch_experience = LaunchExperience::Resume;
         }
 
-        // Best-effort persist: a failed write here (e.g. EPERM from locked-down
-        // Application Support perms, RUST-1P) must not crash startup. The profile
-        // is telemetry; degrade to the in-memory copy and continue.
-        if let Ok(bytes) = serde_json::to_vec_pretty(&current) {
-            if let Err(e) = crate::client_adapters::atomic_write(&path, &bytes) {
-                log::warn!("could not persist {}: {e:#}", path.display());
-            }
-        }
+        // Best-effort persist: the helper also enforces the recovery barrier
+        // when the malformed source could not be quarantined. Never let this
+        // startup bookkeeping write a fresh profile over the only damaged copy.
+        persist_launch_profile(&path, &mut current);
 
         Ok((current, path))
     }
@@ -4266,22 +4348,91 @@ struct LastKnownGoodPlan {
 }
 
 impl LastKnownGoodPlan {
-    fn load(base_dir: &std::path::Path) -> (Option<Self>, std::path::PathBuf) {
+    fn load(base_dir: &std::path::Path) -> (Option<Self>, std::path::PathBuf, bool) {
         let path = config_file(base_dir, "last-known-good-plan.json");
-        let value = if path.exists() {
-            std::fs::read(&path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Self>(&bytes).ok())
-        } else {
+        let mut persistence_blocked = false;
+        let value = if !path.exists() {
             None
+        } else {
+            match std::fs::read(&path) {
+                Ok(bytes) => match serde_json::from_slice::<Self>(&bytes) {
+                    Ok(value) => Some(value),
+                    Err(err) => {
+                        // Preserve a malformed snapshot before a later known
+                        // tier is persisted. Otherwise a transient truncation
+                        // would silently erase the last good pricing signal.
+                        log::warn!(
+                            "last-known-good-plan at {} is unreadable ({err}); quarantining before reset",
+                            path.display()
+                        );
+                        persistence_blocked = path.exists()
+                            && !crate::client_adapters::quarantine_unparsable(
+                                &path,
+                                &format!("last-known-good-plan: {err}"),
+                            );
+                        None
+                    }
+                },
+                Err(err) => {
+                    // A read failure (for example, a locked or permission
+                    // denied file) must not be treated as an empty snapshot
+                    // that can be overwritten silently.
+                    log::warn!(
+                        "could not read last-known-good-plan {} ({err}); leaving it in place",
+                        path.display()
+                    );
+                    persistence_blocked = path.exists();
+                    None
+                }
+            }
         };
-        (value, path)
+        (value, path, persistence_blocked)
     }
 }
 
 fn persist_last_known_good_plan(path: &std::path::Path, plan: &LastKnownGoodPlan) {
+    persist_last_known_good_plan_guarded(path, plan, None);
+}
+
+fn persist_last_known_good_plan_guarded(
+    path: &std::path::Path,
+    plan: &LastKnownGoodPlan,
+    persistence_blocked: Option<&AtomicBool>,
+) {
+    if persistence_blocked
+        .is_some_and(|blocked| blocked.load(std::sync::atomic::Ordering::Acquire) && path.exists())
+    {
+        log::warn!(
+            "refusing to replace last-known-good-plan {} because its recovery copy could not be created",
+            path.display()
+        );
+        return;
+    }
+    // The standalone helper is used by migration/tests without the runtime
+    // latch. Re-validate an existing source before replacing it so a failed
+    // quarantine cannot be bypassed by a later caller.
+    if persistence_blocked.is_none() && path.exists() {
+        let existing_is_valid = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<LastKnownGoodPlan>(&bytes).ok())
+            .is_some();
+        if !existing_is_valid {
+            log::warn!(
+                "refusing to replace unreadable last-known-good-plan {} without a recovery copy",
+                path.display()
+            );
+            return;
+        }
+    }
     if let Ok(bytes) = serde_json::to_vec_pretty(plan) {
-        let _ = crate::client_adapters::atomic_write(path, &bytes);
+        if let Err(err) = crate::client_adapters::atomic_write(path, &bytes) {
+            log::warn!(
+                "could not persist last-known-good-plan {}: {err:#}",
+                path.display()
+            );
+        } else if let Some(blocked) = persistence_blocked {
+            blocked.store(false, std::sync::atomic::Ordering::Release);
+        }
     }
 }
 
@@ -4484,6 +4635,10 @@ struct SavingsTracker {
     last_output_estimator_tokens_saved: Option<u64>,
     /// See `PersistedSavingsState::last_output_estimator_baseline_tokens`.
     last_output_estimator_baseline_tokens: Option<u64>,
+    /// Set when the persisted state could not be quarantined. Keep the source
+    /// untouched until it is removed or repaired; in-memory savings continue
+    /// to work while writes are blocked.
+    persistence_blocked: bool,
     // Write throttle — only flush to disk at most once per minute
     last_written_at: Option<std::time::Instant>,
 }
@@ -4509,11 +4664,16 @@ impl SavingsTracker {
 
         // A corrupt file must not brick launch, but it must also not be
         // silently replaced: back it up for recovery and say so in the log.
+        let mut persistence_blocked = false;
         let persisted_state = match load_persisted_savings_state(&state_path) {
             Ok(state) => state,
             Err(err) => {
                 log::warn!("savings-state.json unreadable ({err}); backing up");
-                let _ = std::fs::rename(&state_path, state_path.with_extension("json.corrupt"));
+                persistence_blocked = state_path.exists()
+                    && !crate::client_adapters::quarantine_unparsable(
+                        &state_path,
+                        &format!("savings state: {err}"),
+                    );
                 None
             }
         }
@@ -4636,6 +4796,7 @@ impl SavingsTracker {
                 .as_ref()
                 .filter(|_| output_series_current)
                 .and_then(|state| state.last_output_estimator_baseline_tokens),
+            persistence_blocked,
             last_written_at: None,
         };
         // Best-effort: persistence failing (ENOSPC/EACCES) degrades to
@@ -5460,6 +5621,15 @@ impl SavingsTracker {
     }
 
     fn persist_state(&mut self) -> Result<()> {
+        if self.persistence_blocked && self.state_path.exists() {
+            return Err(anyhow!(
+                "refusing to replace {} because its recovery copy could not be created",
+                self.state_path.display()
+            ));
+        }
+        if self.persistence_blocked && !self.state_path.exists() {
+            self.persistence_blocked = false;
+        }
         self.prune_hourly_savings();
         // Compact (not pretty) JSON: this is a machine-read file rewritten on
         // every observe tick; pretty-printing roughly doubled the write.
@@ -5469,6 +5639,7 @@ impl SavingsTracker {
         // JSON that the next launch silently replaced with a fresh tracker.
         crate::client_adapters::atomic_write(&self.state_path, &serialized)
             .with_context(|| format!("writing {}", self.state_path.display()))?;
+        self.persistence_blocked = false;
         Ok(())
     }
 }
@@ -5601,8 +5772,10 @@ fn load_persisted_savings_state(path: &Path) -> Result<Option<PersistedSavingsSt
     }
 
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
-    let persisted = serde_json::from_slice::<PersistedSavingsState>(&bytes)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let persisted = match serde_json::from_slice::<PersistedSavingsState>(&bytes) {
+        Ok(persisted) => persisted,
+        Err(err) => return Err(anyhow::anyhow!("parsing {}: {err}", path.display())),
+    };
     if persisted.schema_version == 3 {
         Ok(Some(persisted))
     } else {
@@ -5614,8 +5787,11 @@ fn load_persisted_savings_state(path: &Path) -> Result<Option<PersistedSavingsSt
             path.display(),
             persisted.schema_version
         );
-        let _ = std::fs::rename(path, path.with_extension("json.schema-mismatch"));
-        Ok(None)
+        Err(anyhow::anyhow!(
+            "{} has schema {} (expected 3)",
+            path.display(),
+            persisted.schema_version
+        ))
     }
 }
 
@@ -7818,16 +7994,16 @@ mod tests {
         hf_cache_grew, intercept_bind_hint, lifetime_output_savings_usd,
         lifetime_token_milestones_crossed, log_mtime_advanced, merge_daily_savings,
         merge_hourly_savings, most_recent_monday, parse_headroom_stats_from_json,
-        parse_headroom_stats_history_from_json, parse_ps_cpu_time,
+        parse_headroom_stats_history_from_json, parse_ps_cpu_time, persist_last_known_good_plan,
         proxy_readyz_503_body_is_nonrouting_only, proxy_readyz_status_is_reachable,
         rebuild_persisted_savings_from_records, savings_rate_implausible,
         stats_fetch_warn_interval, support_tier_for_platform, tcp_port_accepts_connection,
         tool_schema_savings_usd, total_dir_size_bytes, warn_stats_fetch_failed, AppState,
         BootValidationOutcome, ClaudeProjectScan, DailySavingsBucket, Duration,
-        HeadroomDashboardStats, HeadroomSavingsHistoryPoint, Instant, OutputSampleBucket,
-        PersistedSavingsState, SavingsObservation, SavingsRecord, SavingsTracker,
-        OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_WARNED_AT, STATS_FETCH_WARN_INTERVAL,
-        STATS_FETCH_WARN_MAX_INTERVAL,
+        HeadroomDashboardStats, HeadroomSavingsHistoryPoint, Instant, LastKnownGoodPlan,
+        OutputSampleBucket, PersistedSavingsState, SavingsObservation, SavingsRecord,
+        SavingsTracker, OUTPUT_SAMPLE_SERIES_VERSION, STATS_FETCH_WARNED_AT,
+        STATS_FETCH_WARN_INTERVAL, STATS_FETCH_WARN_MAX_INTERVAL,
     };
 
     #[test]
@@ -8530,6 +8706,7 @@ mod tests {
             accepted_terms_version: 0,
             onboarding_recovery_notified: false,
             first_savings_notified: false,
+            persistence_blocked: false,
         };
 
         assert!(!super::setup_wizard_satisfied_for_profile(&profile, false));
@@ -8556,6 +8733,7 @@ mod tests {
             accepted_terms_version: 0,
             onboarding_recovery_notified: false,
             first_savings_notified: false,
+            persistence_blocked: false,
         };
         assert!(super::onboarding_recovery_nudge_due(&profile));
 
@@ -8578,7 +8756,7 @@ mod tests {
     fn persist_launch_profile_round_trips_new_fields() {
         let id = uuid::Uuid::new_v4();
         let path = std::env::temp_dir().join(format!("headroom-launch-profile-test-{}.json", id));
-        let profile = super::LaunchProfile {
+        let mut profile = super::LaunchProfile {
             launch_count: 1,
             launch_experience: crate::models::LaunchExperience::Resume,
             lifetime_requests: 0,
@@ -8601,8 +8779,9 @@ mod tests {
             accepted_terms_version: 3,
             onboarding_recovery_notified: true,
             first_savings_notified: true,
+            persistence_blocked: false,
         };
-        super::persist_launch_profile(&path, &profile);
+        super::persist_launch_profile(&path, &mut profile);
 
         let bytes = std::fs::read(&path).expect("persisted");
         let round_tripped: super::LaunchProfile =
@@ -8924,6 +9103,7 @@ mod tests {
             output_sample_watermark: None,
             last_output_estimator_tokens_saved: None,
             last_output_estimator_baseline_tokens: None,
+            persistence_blocked: false,
             last_written_at: None,
         }
     }
@@ -9573,6 +9753,47 @@ LLM analysis failed: `codex exec` did not respond within 300s.
         let base_dir = temp_test_dir("headroom-last-known-good-fresh");
         let state = AppState::new_in(base_dir.clone()).expect("app state");
         assert!(state.last_known_good_plan_tier().is_none());
+        fs::remove_dir_all(base_dir).ok();
+    }
+
+    #[test]
+    fn last_known_good_plan_corrupt_file_is_quarantined_before_replacement() {
+        let base_dir = temp_test_dir("headroom-last-known-good-corrupt");
+        let path = config_file(&base_dir, "last-known-good-plan.json");
+        fs::create_dir_all(path.parent().unwrap()).expect("config directory");
+        let original = br#"{"planTier":"pro","recordedAt": "truncated""#;
+        fs::write(&path, original).expect("corrupt snapshot");
+
+        let (loaded, _, blocked) = LastKnownGoodPlan::load(&base_dir);
+        assert!(loaded.is_none(), "corrupt snapshot must be ignored");
+        assert!(!blocked, "successful quarantine clears the write barrier");
+        let corrupts: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .expect("config directory entries")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("last-known-good-plan.json.corrupt-"))
+            })
+            .collect();
+        assert_eq!(corrupts.len(), 1, "one quarantine copy must be created");
+        let corrupt = &corrupts[0];
+        assert_eq!(fs::read(corrupt).expect("quarantined snapshot"), original);
+        assert!(!path.exists(), "the malformed source is moved aside");
+
+        let replacement = LastKnownGoodPlan {
+            plan_tier: crate::models::ClaudePlanTier::Pro,
+            recorded_at: Utc::now(),
+        };
+        persist_last_known_good_plan(&path, &replacement);
+        assert!(
+            path.is_file(),
+            "a later good snapshot may be written separately"
+        );
+        assert_eq!(fs::read(corrupt).expect("quarantined snapshot"), original);
+
         fs::remove_dir_all(base_dir).ok();
     }
 

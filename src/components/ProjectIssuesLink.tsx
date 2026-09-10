@@ -3,7 +3,7 @@ import { ArrowSquareOut } from "@phosphor-icons/react";
 import { useI18n } from "../lib/i18n";
 
 export const PROJECT_ISSUES_URL =
-  "https://github.com/OneBigMoon/Headroom-desktop-CN/issues/new";
+  "https://github.com/OneBigMoon/Headroom-desktop/issues/new";
 
 export interface ProjectIssuesLinkProps {
   children: ReactNode;

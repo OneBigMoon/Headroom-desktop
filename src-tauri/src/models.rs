@@ -400,6 +400,12 @@ pub struct ClientSetupVerification {
     pub proxy_reachable: bool,
     pub checks: Vec<String>,
     pub failures: Vec<String>,
+    /// Set when Codex routing is owned by a different tool's provider rather
+    /// than by Headroom (for example `codex_local_access` from Cockpit Tools).
+    /// The UI must present this as an informational "not intercepting" state
+    /// and offer an explicit takeover, never as a broken setup.
+    #[serde(default)]
+    pub foreign_provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

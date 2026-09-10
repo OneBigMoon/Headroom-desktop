@@ -517,9 +517,24 @@ export function CommunityApp() {
       return;
     }
 
+    // Another tool may own the Codex route right now. Taking it over replaces
+    // that tool's provider, so ask first; Headroom records the displaced
+    // provider and restores it when the connector is disabled again.
+    const foreignProvider = connector.verification?.foreignProvider ?? null;
+    if (
+      foreignProvider &&
+      !window.confirm(t("connections.setup.takeoverConfirm", { provider: foreignProvider }))
+    ) {
+      return;
+    }
+
     void runAction(
       key,
-      () => invoke<ClientSetupResult>("apply_client_setup", { clientId: connector.clientId }),
+      () =>
+        invoke<ClientSetupResult>("apply_client_setup", {
+          clientId: connector.clientId,
+          allowTakeover: Boolean(foreignProvider),
+        }),
       () => t("messages.connectorConfigured", { name: connector.name }),
     );
   };

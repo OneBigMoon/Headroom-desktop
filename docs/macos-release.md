@@ -15,7 +15,7 @@
 7. 只有远端 digest 全部匹配时才公开 Release；仓库必须预先启用 release immutability，该设置只保护启用后创建的 Release。
 8. 公开后，工作流从 tag 下载地址重新下载全部资产，再从 `releases/latest/download/latest.json` 校验两个平台的 URL 与签名。
 
-发布仓库是 [`OneBigMoon/Headroom-desktop-CN`](https://github.com/OneBigMoon/Headroom-desktop-CN)。
+发布仓库是 [`OneBigMoon/Headroom-desktop`](https://github.com/OneBigMoon/Headroom-desktop)。
 
 ## 发布资产
 
@@ -34,7 +34,7 @@ latest.json
 原始 `.app` 仅用于构建阶段验签，不作为 Release 下载资产。DMG 和 NSIS `.exe` 面向手动安装；两个压缩 updater 资产由同一个 `latest.json` 按平台选择。updater endpoint 为：
 
 ```text
-https://github.com/OneBigMoon/Headroom-desktop-CN/releases/latest/download/latest.json
+https://github.com/OneBigMoon/Headroom-desktop/releases/latest/download/latest.json
 ```
 
 ## 发布前不可变设置
@@ -50,7 +50,7 @@ https://github.com/OneBigMoon/Headroom-desktop-CN/releases/latest/download/lates
 ```bash
 set -euo pipefail
 
-REPO="OneBigMoon/Headroom-desktop-CN"
+REPO="OneBigMoon/Headroom-desktop"
 BAD_TAG="vX.Y.Z"
 GOOD_TAG="vA.B.C"
 GOOD_VERSION="${GOOD_TAG#v}"
@@ -103,7 +103,7 @@ cargo run --quiet --manifest-path src-tauri/Cargo.toml \
 
 ## 下载
 
-从 [GitHub Releases](https://github.com/OneBigMoon/Headroom-desktop-CN/releases/latest) 下载稳定版 macOS universal DMG，或同一 Release 中的 Windows 11 x64 预览版 NSIS `.exe`。
+从 [GitHub Releases](https://github.com/OneBigMoon/Headroom-desktop/releases/latest) 下载稳定版 macOS universal DMG，或同一 Release 中的 Windows 11 x64 预览版 NSIS `.exe`。
 
 ## 签名与密钥
 
@@ -112,8 +112,8 @@ Community 使用 ad-hoc macOS 代码签名，以及供 macOS/Windows updater 共
 ## 本机构建
 
 ```bash
-git clone https://github.com/OneBigMoon/Headroom-desktop-CN.git
-cd Headroom-desktop-CN
+git clone https://github.com/OneBigMoon/Headroom-desktop.git
+cd Headroom-desktop
 npm ci
 npm run build:mac:local
 ```

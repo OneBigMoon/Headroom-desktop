@@ -3853,6 +3853,16 @@ details[open] .optimize-minimal__details summary::after {
   line-height: 1.3;
 }
 
+/* Informational line for states where Headroom deliberately stands aside, for
+   example another tool owning the Codex route. Deliberately not `restart`,
+   which would also surface the Restart Codex action. */
+.connector-item__note {
+  margin-top: 4px !important;
+  font-size: var(--text-xs) !important;
+  color: var(--text-secondary) !important;
+  line-height: 1.3;
+}
+
 .callout-banner__connectors {
   display: flex;
   flex-direction: row;
@@ -4087,6 +4097,12 @@ details[open] .optimize-minimal__details summary::after {
 
 .connector-diagnostics .is-waiting {
   color: var(--warning);
+}
+
+/* Neutral note for states where Headroom deliberately stands aside (for
+   example another tool owning the Codex route). Neither a pass nor a failure. */
+.connector-diagnostics .is-note {
+  color: var(--text-secondary);
 }
 
 .connector-diagnostics__refresh {

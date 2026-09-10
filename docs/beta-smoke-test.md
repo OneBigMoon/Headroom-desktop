@@ -54,7 +54,7 @@ grep -c 'headroom:claude_code' ~/.zprofile ~/.zshrc
 ```
 Expect: after Pause both files print `0`; after Resume both print `2` (the `# >>> headroom:claude_code >>>` and `# <<< headroom:claude_code <<<` marker lines). Do *not* grep `~/.claude/settings.json` for `headroom-rtk-rewrite` — that hook only exists when the RTK addon is installed, so on an install with RTK off (check 3) it reads `0` in both states and the check looks like a FAIL on a healthy build. The managed shell block is the RTK-independent marker. If RTK *is* installed, `grep -c headroom-rtk-rewrite ~/.claude/settings.json` is a valid extra signal: `0` after Pause, `1` after Resume.
 
-This verifies the Claude Code config only — Pause clears *all* clients, so check C4 in the Codex pass confirms Codex's config is stripped and restored too.
+This verifies the Claude Code config only. Codex deliberately keeps its stable `6891` route during Pause; check C4 confirms that its detached router switches to direct mode and back instead.
 
 ### 7. Proxy is actively optimizing this conversation (not just a heartbeat)
 The proxy always runs in `token` mode now (`HEADROOM_MODE=token`, hardcoded — cache mode and the old auth-based mode auto-switch were removed; see `tool_manager.rs`). So `.summary.mode` reports `token` for *every* session, including a Claude Code subscription/OAuth one — don't branch on it. What actually differs per request is the **compression policy**, chosen by the auth-mode classifier (`classify_auth_mode` in the proxy) from the client `User-Agent`:
@@ -272,18 +272,18 @@ Note what this check does **not** cover: the CLAUDE.md damage users reported in 
 
 ## Codex checks (Codex pass)
 
-Run these from a Codex CLI session (or with Codex configured and at least one Codex prompt sent this session). Codex routes through Headroom via an `OPENAI_BASE_URL` shell export plus a managed provider block in `~/.codex/config.toml` — not `~/.claude/settings.json` and not RTK — and its traffic is pay-per-token, so the proxy runs it in `token` mode.
+Run these from a Codex CLI session (or with Codex configured and at least one Codex prompt sent this session). Codex uses a stable local router at `127.0.0.1:6891`; while Headroom is healthy the router relays to the Rust intercept on `6867`, and when Headroom is paused, closed, or crashed it forwards to Codex's native OpenAI or ChatGPT endpoint. The router is configured by an `OPENAI_BASE_URL` shell export plus a managed provider block in `~/.codex/config.toml` — not `~/.claude/settings.json` and not RTK — and its traffic is pay-per-token, so the proxy runs it in `token` mode.
 
 ### C1. Codex is configured to route through Headroom
 ```bash
-grep -q 'model_provider = "headroom"' ~/.codex/config.toml && \
-  grep -q 'openai_base_url = "http://127.0.0.1:6867/v1"' ~/.codex/config.toml && \
-  grep -qF '[model_providers.headroom]' ~/.codex/config.toml && \
+grep -q 'model_provider = "headroom_local_community"' ~/.codex/config.toml && \
+  grep -Eq 'openai_base_url = "http://127.0.0.1:6891/(v1|backend-api/codex)"' ~/.codex/config.toml && \
+  grep -qF '[model_providers.headroom_local_community]' ~/.codex/config.toml && \
   grep -q 'supports_websockets = false' ~/.codex/config.toml && \
-  grep -q 'export OPENAI_BASE_URL=http://127.0.0.1:6867/v1' ~/.zshrc ~/.zprofile 2>/dev/null && \
+  grep -Eq 'export OPENAI_BASE_URL=http://127.0.0.1:6891/(v1|backend-api/codex)' ~/.zshrc ~/.zprofile 2>/dev/null && \
   echo PASS || echo FAIL
 ```
-Expect: `PASS`. `~/.codex/config.toml` carries both managed marker blocks — `# >>> headroom:codex_cli >>>` with the root `model_provider`/`openai_base_url` keys, and `# >>> headroom:codex_cli_provider >>>` with the `[model_providers.headroom]` table — and a managed shell block exports `OPENAI_BASE_URL`. Headroom deliberately keeps `supports_websockets = false` so Codex uses the reliable HTTP Responses stream instead of failing the whole turn when an upstream WebSocket closes before `response.completed`. A `FAIL` means setup didn't write one of them (see `configure_codex_provider_block` / `configure_shell_block` in `client_adapters.rs`).
+Expect: `PASS`. `~/.codex/config.toml` carries both managed marker blocks — `# >>> headroom-local-community:codex_cli >>>` with the root `model_provider`/`openai_base_url` keys, and `# >>> headroom-local-community:codex_cli_provider >>>` with the `[model_providers.headroom_local_community]` table — and a managed shell block exports `OPENAI_BASE_URL`. An OpenAI API-key profile uses the `/v1` URL; a ChatGPT OAuth profile uses `/backend-api/codex` so Codex's account/search routes keep their native path. Headroom deliberately keeps `supports_websockets = false` so Codex uses the reliable HTTP Responses stream instead of failing the whole turn when an upstream WebSocket closes before `response.completed`. A `FAIL` means setup didn't write one of them (see `configure_codex_provider_block` / `configure_shell_block` in `client_adapters.rs`).
 
 ### C2. Codex traffic is actively optimized (token mode)
 Codex is billed per token, so unlike a Claude Code subscription it runs in `token` mode and `requests_compressed` *does* move. Run this from inside Codex.
@@ -299,13 +299,14 @@ Expect: `mode` is `token`, `primary_model` is a `gpt-*` model (confirms Codex �
 ### C3. Codex savings are attributed on the dashboard
 Open the dashboard and confirm a **Codex** group appears in the per-provider savings with non-zero values. Provider `openai` maps to the Codex group (`mergeProviderSavingsForDisplay` in `dashboardHelpers.ts`); a missing Codex group after Codex traffic means per-provider attribution isn't tagging OpenAI requests.
 
-### C4. Pause / resume cleanly strips and restores Codex routing
-The Claude equivalent is check 6; Pause clears *all* client setups, so it must remove Codex's config too. In Settings, toggle Pause then Resume (restore runs on a background thread, so give it a second), checking after each:
+### C4. Pause / resume keeps the stable Codex route and switches its mode
+The Codex provider block and shell export stay in place so an existing Codex session keeps using `127.0.0.1:6891`. The URL is `/v1` for an API-key profile and `/backend-api/codex` for ChatGPT OAuth. Only the detached router mode changes. In Settings, toggle Pause then Resume (restore runs on a background thread, so give it a second), checking after each:
 ```bash
-grep -c 'headroom:codex_cli' ~/.codex/config.toml
-cat ~/.zshrc ~/.zprofile 2>/dev/null | grep -c 'OPENAI_BASE_URL=http://127.0.0.1:6867'
+grep -c 'headroom-local-community:codex_cli' ~/.codex/config.toml
+grep -nE 'openai_base_url = "http://127.0.0.1:6891/(v1|backend-api/codex)"' ~/.codex/config.toml
+curl -s http://127.0.0.1:6891/__headroom_codex_router_health
 ```
-Expect: after Pause both print `0`; after Resume both are non-zero (config.toml back to `4` marker lines, shell back to one export per managed profile). Pause routes through `disable_codex_cli` — strips both TOML blocks, the `openai_base_url` root key, and the shell blocks; Resume re-applies them via `restore_client_setups`.
+Expect: after Pause the marker count and `6891` URL remain present, and the health endpoint prints `direct`; after Resume it prints `proxy` once 6867/readyz is healthy. An explicit Disconnect Codex action still removes the managed config and shell block.
 
 ## Inspecting the proxy directly
 

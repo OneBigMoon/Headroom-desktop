@@ -461,6 +461,10 @@ pub type FreshBearerNotifier = mpsc::Sender<()>;
 
 pub const ANTHROPIC_DIRECT_BASE: &str = "https://api.anthropic.com";
 pub const OPENAI_DIRECT_BASE: &str = "https://api.openai.com";
+/// Native endpoint used by Codex when the user signs in with ChatGPT.  The
+/// ChatGPT OAuth bearer is scoped to this host and is rejected by the public
+/// OpenAI API, so a fail-open route must preserve the provider-specific target.
+pub const CHATGPT_CODEX_DIRECT_BASE: &str = "https://chatgpt.com/backend-api/codex";
 
 /// Locale-invariant identity for an OS error.
 ///
@@ -790,11 +794,58 @@ async fn handle(
         return;
     }
 
+    // The detached Codex router uses this side-effect-free endpoint as an
+    // exact ownership probe before it relays credentials to :6867. Keep it
+    // ahead of path normalization/classification so the probe never reaches
+    // the Python backend or increments client counters.
+    if is_intercept_identity_request(&buf) {
+        let body = crate::codex_router::INTERCEPT_IDENTITY_BODY;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n{}: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            crate::codex_router::INTERCEPT_IDENTITY_HEADER_NAME,
+            crate::codex_router::INTERCEPT_IDENTITY_HEADER_VALUE,
+            body
+        );
+        let _ = client.write_all(response.as_bytes()).await;
+        return;
+    }
+
+    // Codex's ChatGPT OAuth provider uses a base URL ending in
+    // `/backend-api/codex`, so the request target arrives as
+    // `/backend-api/codex/responses` (or, with older clients, bare
+    // `/responses`). The Python backend and the rest of this interceptor use
+    // the OpenAI-compatible `/v1/*` shape. Normalize before classification and
+    // forwarding so both auth modes share the same optimization path. The
+    // rewrite touches only the request line; any body bytes already read with
+    // the header remain byte-for-byte unchanged.
+    // Preserve the provider-shaped path before normalizing it to `/v1`. This
+    // is needed for host integrations that send an opaque OAuth bearer with no
+    // account header or decodable JWT.
+    let chatgpt_path_hint = find_header_end(&buf)
+        .and_then(|end| parse_request_head(&buf[..end + 4]))
+        .is_some_and(|head| is_chatgpt_codex_path(&head.path));
+    if let Some(end) = find_header_end(&buf) {
+        if let Some(head) = parse_request_head(&buf[..end + 4]) {
+            if crate::codex_router::is_codex_path_compat(&head.path) {
+                let normalized =
+                    crate::codex_router::normalize_codex_path_for_intercept(&head.path);
+                if normalized != head.path {
+                    if let Some(rewritten) =
+                        crate::codex_router::rewrite_request_target(&buf, &normalized)
+                    {
+                        buf = rewritten;
+                    }
+                }
+            }
+        }
+    }
+
     // Whether this is a Codex request. Parsed once here and reused for the
     // Codex plan capture, Codex-only bypass, counters, and response handling.
     let parsed_head = find_header_end(&buf).and_then(|end| parse_request_head(&buf[..end + 4]));
     let is_codex = parsed_head.as_ref().is_some_and(is_codex_request_head);
-    let is_chatgpt_codex = is_codex && request_uses_chatgpt_auth(&buf);
+    let is_chatgpt_codex = is_codex && request_uses_chatgpt_auth(&buf, chatgpt_path_hint);
     let is_local_backend_path = parsed_head
         .as_ref()
         .is_some_and(|head| is_local_proxy_path(&head.path));
@@ -942,7 +993,7 @@ async fn handle(
             }
             write_retryable_service_unavailable(&mut client).await;
         } else {
-            forward_direct_to_anthropic(client, buf, &upstream_base).await;
+            forward_direct_to_anthropic(client, buf, &upstream_base, chatgpt_path_hint).await;
         }
         return;
     }
@@ -966,7 +1017,7 @@ async fn handle(
         && !is_local_backend_path
         && claude_only_bypass.load(Ordering::Acquire)
     {
-        forward_direct_to_anthropic(client, buf, &upstream_base).await;
+        forward_direct_to_anthropic(client, buf, &upstream_base, chatgpt_path_hint).await;
         return;
     }
 
@@ -1031,7 +1082,7 @@ async fn handle(
                 write_retryable_service_unavailable(&mut client).await;
                 return;
             } else {
-                forward_direct_to_anthropic(client, buf, &upstream_base).await;
+                forward_direct_to_anthropic(client, buf, &upstream_base, chatgpt_path_hint).await;
                 return;
             }
         }
@@ -1829,12 +1880,33 @@ fn decode_codex_plan_tier(token: &str) -> Option<CodexPlanTier> {
 }
 
 /// ChatGPT subscription OAuth and Platform API keys use different upstreams.
-/// The account header is authoritative; the JWT claim covers clients that omit
-/// it on a particular request.
-fn request_uses_chatgpt_auth(buf: &[u8]) -> bool {
-    extract_header_value(buf, "chatgpt-account-id").is_some()
-        || extract_bearer(buf)
+/// Explicit API-key evidence wins over a stale account header; the account
+/// header and JWT claim cover OAuth clients that do not send a platform key.
+fn request_uses_chatgpt_auth(buf: &[u8], chatgpt_path_hint: bool) -> bool {
+    let has_api_key_header = ["x-api-key", "api-key"]
+        .iter()
+        .any(|name| extract_header_value(buf, name).is_some_and(|value| !value.trim().is_empty()));
+    let bearer = extract_bearer(buf);
+    if has_api_key_header
+        || bearer
+            .as_deref()
+            .is_some_and(|token| token.starts_with("sk-") || token.starts_with("sk-proj-"))
+    {
+        return false;
+    }
+    extract_header_value(buf, "chatgpt-account-id").is_some_and(|value| !value.trim().is_empty())
+        || bearer
             .is_some_and(|token| decode_codex_auth_claim(&token, "chatgpt_account_id").is_some())
+        || chatgpt_path_hint
+}
+
+fn is_chatgpt_codex_path(path: &str) -> bool {
+    path == crate::codex_router::CHATGPT_CODEX_PATH_PREFIX
+        || path.starts_with(crate::codex_router::CHATGPT_CODEX_PATH_PREFIX)
+            && path
+                .as_bytes()
+                .get(crate::codex_router::CHATGPT_CODEX_PATH_PREFIX.len())
+                .is_some_and(|byte| matches!(*byte, b'/' | b'?'))
 }
 
 /// Window label derived from a minute count, matching upstream's
@@ -1885,12 +1957,13 @@ async fn write_retryable_service_unavailable(client: &mut TcpStream) {
 /// session keeps speaking HTTP/1.1 to 127.0.0.1:6867; we re-issue the same
 /// request to the real Anthropic endpoint over TLS with `reqwest`, then stream
 /// the response back as HTTP/1.1 chunked transfer.
-async fn forward_direct_to_anthropic(
+pub(crate) async fn forward_direct_to_anthropic(
     mut client: TcpStream,
-    header_buf: Vec<u8>,
+    mut header_buf: Vec<u8>,
     upstream_base: &str,
+    chatgpt_path_hint: bool,
 ) {
-    let header_end = match find_header_end(&header_buf) {
+    let mut header_end = match find_header_end(&header_buf) {
         Some(pos) => pos + 4,
         None => {
             let _ = client
@@ -1899,14 +1972,38 @@ async fn forward_direct_to_anthropic(
             return;
         }
     };
-    let leftover_body = &header_buf[header_end..];
-
-    let Some(parsed) = parse_request_head(&header_buf[..header_end]) else {
+    let Some(mut parsed) = parse_request_head(&header_buf[..header_end]) else {
         let _ = client
             .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
             .await;
         return;
     };
+
+    let is_codex = is_codex_request_head(&parsed);
+    let chatgpt_auth = is_codex && request_uses_chatgpt_auth(&header_buf, chatgpt_path_hint);
+
+    // The models catalog can advertise the responses-lite transport.  That
+    // transport is rejected when the request is re-originated by a proxy, and
+    // the same header is unsafe on a native fallback path.  The in-process
+    // intercept strips it before its own bypass branch; the stable Codex
+    // sidecar calls this helper directly, so keep both paths equivalent.
+    if is_codex {
+        strip_request_header(&mut header_buf, "X-OpenAI-Internal-Codex-Responses-Lite");
+        // Removing a header shifts the body boundary. Recompute it before
+        // borrowing the bytes that were already read from the client.
+        header_end = match find_header_end(&header_buf) {
+            Some(pos) => pos + 4,
+            None => return,
+        };
+        // Keep the parsed header view in sync with the bytes after the strip;
+        // forwarding the old view would silently re-add the responses-lite
+        // header we just removed.
+        parsed = match parse_request_head(&header_buf[..header_end]) {
+            Some(parsed) => parsed,
+            None => return,
+        };
+    }
+    let leftover_body = &header_buf[header_end..];
 
     // These paths are served by the local Python proxy, not Anthropic. In
     // bypass mode the proxy is intentionally down, so reply 503 instead of
@@ -1926,8 +2023,12 @@ async fn forward_direct_to_anthropic(
     // OpenAI's, separate from Headroom's Claude account gate, so don't break
     // Codex when the gate trips — forward Codex requests to OpenAI directly
     // rather than (wrongly) to api.anthropic.com.
-    let effective_base: &str = if is_codex_request_head(&parsed) {
-        OPENAI_DIRECT_BASE
+    let effective_base: &str = if is_codex {
+        if chatgpt_auth {
+            CHATGPT_CODEX_DIRECT_BASE
+        } else {
+            OPENAI_DIRECT_BASE
+        }
     } else {
         upstream_base
     };
@@ -1945,8 +2046,14 @@ async fn forward_direct_to_anthropic(
     // WS on /v1/responses — a 501 here would hard-break Codex in exactly the
     // bypass modes meant to keep it alive. Tunnel the upgrade via hyper's
     // connection takeover instead.
+    let upstream_path = if chatgpt_auth {
+        crate::codex_router::normalize_chatgpt_path(&parsed.path)
+    } else {
+        crate::codex_router::normalize_codex_path_for_intercept(&parsed.path)
+    };
+
     if header_value("upgrade").is_some() {
-        let url = format!("{}{}", effective_base, parsed.path);
+        let url = format!("{}{}", effective_base, upstream_path);
         tunnel_upgrade_direct(client, &parsed, leftover_body, &url).await;
         return;
     }
@@ -2020,7 +2127,12 @@ async fn forward_direct_to_anthropic(
         sanitize_stale_tool_references(body, &parsed.path)
     };
 
-    let url = format!("{}{}", effective_base, parsed.path);
+    // The local Codex provider exposes an OpenAI-compatible `/v1/*` surface,
+    // while the native ChatGPT service exposes the same resources directly
+    // below `/backend-api/codex` (`/responses`, `/models`, ...).  Strip only
+    // that compatibility prefix for OAuth traffic; API-key requests retain
+    // the public OpenAI `/v1` path exactly as sent by Codex.
+    let url = format!("{}{}", effective_base, upstream_path);
     let method = match reqwest::Method::from_bytes(parsed.method.as_bytes()) {
         Ok(m) => m,
         Err(_) => {
@@ -2543,11 +2655,30 @@ fn is_local_proxy_path(path: &str) -> bool {
 /// counterpart (Claude uses `/v1/messages` / `/v1/complete`), so matching by
 /// path is unambiguous and lets bypass-mode forward Codex traffic to OpenAI.
 fn is_openai_path(path: &str) -> bool {
+    // Keep classification in lockstep with the stable Codex router. It accepts
+    // both the native ChatGPT `/backend-api/codex/*` shape and bare endpoint
+    // paths, then canonicalizes them to `/v1/*` for the allowlist below.
+    let path = crate::codex_router::normalize_codex_path_for_intercept(path);
     const OPENAI_PREFIXES: &[&str] = &[
         "/v1/responses",
         "/v1/chat/completions",
         "/v1/completions",
         "/v1/embeddings",
+        "/v1/images",
+        "/v1/audio",
+        "/v1/files",
+        "/v1/batches",
+        "/v1/fine_tuning",
+        "/v1/vector_stores",
+        "/v1/threads",
+        "/v1/assistants",
+        "/v1/realtime",
+        "/v1/live",
+        "/v1/memories",
+        "/v1/guardian",
+        "/v1/guardian-classifier",
+        "/v1/alpha/search",
+        "/v1/connectors",
     ];
     OPENAI_PREFIXES.iter().any(|prefix| {
         path.strip_prefix(prefix)
@@ -2570,10 +2701,14 @@ const PROMPT_REQUEST_MIN_BODY_BYTES: usize = 8 * 1024;
 /// next prompt fires the once-per-process beacon instead.
 fn is_prompt_request_head(head: &ParsedRequestHead) -> bool {
     const PROMPT_PATHS: &[&str] = &["/v1/messages", "/v1/responses", "/v1/chat/completions"];
+    let path = if crate::codex_router::is_codex_path_compat(&head.path) {
+        crate::codex_router::normalize_codex_path_for_intercept(&head.path)
+    } else {
+        head.path.clone()
+    };
     head.method.eq_ignore_ascii_case("POST")
         && PROMPT_PATHS.iter().any(|prefix| {
-            head.path
-                .strip_prefix(prefix)
+            path.strip_prefix(prefix)
                 .is_some_and(|rest| rest.is_empty() || rest.starts_with('?'))
         })
         && head
@@ -2588,8 +2723,9 @@ fn request_head_has_header(head: &ParsedRequestHead, name: &str) -> bool {
 }
 
 fn is_codex_models_fetch(head: &ParsedRequestHead) -> bool {
+    let path = crate::codex_router::normalize_codex_path_for_intercept(&head.path);
     head.method.eq_ignore_ascii_case("GET")
-        && (head.path == "/v1/models" || head.path.starts_with("/v1/models?"))
+        && (path == "/v1/models" || path.starts_with("/v1/models?"))
         // `/v1/models` exists on both providers. Claude Code sends Anthropic
         // markers; Codex does not.
         && !request_head_has_header(head, "anthropic-version")
@@ -2624,6 +2760,17 @@ fn request_is_loopback_safe(buf: &[u8]) -> bool {
         Some(value) => host_is_loopback(value),
         None => false,
     }
+}
+
+fn is_intercept_identity_request(buf: &[u8]) -> bool {
+    let Some(end) = find_header_end(buf) else {
+        return false;
+    };
+    let Some(head) = parse_request_head(&buf[..end + 4]) else {
+        return false;
+    };
+    head.method.eq_ignore_ascii_case("GET")
+        && head.path == crate::codex_router::INTERCEPT_IDENTITY_PATH
 }
 
 fn host_is_loopback(host: &str) -> bool {
@@ -2664,9 +2811,9 @@ mod tests {
         bearer_value_changed, codex_error_summary, codex_snapshot_from_usage_payload,
         codex_window_label, decode_codex_plan_tier, extract_bearer, extract_header_value,
         find_header_end, intercept_request_counts, is_codex_request_head, is_codex_sse_response,
-        is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_local_proxy_path,
-        is_openai_path, is_prompt_request_head, is_reportable_codex_error, os_error_key,
-        parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
+        is_hop_by_hop_request_header, is_hop_by_hop_response_header, is_intercept_identity_request,
+        is_local_proxy_path, is_openai_path, is_prompt_request_head, is_reportable_codex_error,
+        os_error_key, parse_codex_rate_limit_headers, parse_request_head, parse_response_status,
         read_http_headers, request_has_header, request_is_loopback_safe, request_uses_chatgpt_auth,
         rewrite_use_responses_lite, run, sanitize_stale_tool_references,
         set_response_content_length, should_report_throttled, stamp_client_header,
@@ -2777,6 +2924,22 @@ mod tests {
     }
 
     #[test]
+    fn identity_probe_request_is_exact_and_side_effect_free() {
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: 127.0.0.1:6867\r\nConnection: close\r\n\r\n",
+            crate::codex_router::INTERCEPT_IDENTITY_PATH
+        );
+        assert!(is_intercept_identity_request(request.as_bytes()));
+        let wrong_method = request.replacen("GET ", "POST ", 1);
+        assert!(!is_intercept_identity_request(wrong_method.as_bytes()));
+        let wrong_path = request.replace(
+            crate::codex_router::INTERCEPT_IDENTITY_PATH,
+            "/__headroom_intercept_identity-ish",
+        );
+        assert!(!is_intercept_identity_request(wrong_path.as_bytes()));
+    }
+
+    #[test]
     fn openai_paths_route_to_openai_in_bypass() {
         // Codex's Responses API and the OpenAI chat/completions family must be
         // recognized as OpenAI traffic so bypass mode forwards them to OpenAI,
@@ -2786,6 +2949,12 @@ mod tests {
         assert!(is_openai_path("/v1/chat/completions"));
         assert!(is_openai_path("/v1/completions"));
         assert!(is_openai_path("/v1/embeddings"));
+        assert!(is_openai_path("/v1/guardian-classifier"));
+        assert!(is_openai_path("/v1/alpha/search"));
+        assert!(is_openai_path("/v1/live"));
+        assert!(is_openai_path("/responses"));
+        assert!(is_openai_path("/backend-api/codex/responses"));
+        assert!(is_openai_path("/backend-api/codex/alpha/search"));
         // Anthropic paths must NOT be misrouted to OpenAI.
         assert!(!is_openai_path("/v1/messages"));
         assert!(!is_openai_path("/v1/complete"));
@@ -2806,6 +2975,12 @@ mod tests {
     )
     .unwrap();
         assert!(!is_codex_request_head(&anthropic));
+
+        let chatgpt = parse_request_head(
+            b"GET /backend-api/codex/models HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        )
+        .unwrap();
+        assert!(is_codex_request_head(&chatgpt));
     }
 
     #[test]
@@ -2817,15 +2992,45 @@ mod tests {
     #[test]
     fn detects_chatgpt_codex_auth_from_header_or_jwt() {
         assert!(request_uses_chatgpt_auth(
-            b"POST /v1/responses HTTP/1.1\r\nChatGPT-Account-Id: acct_1\r\n\r\n"
+            b"POST /v1/responses HTTP/1.1\r\nChatGPT-Account-Id: acct_1\r\n\r\n",
+            false
         ));
 
         let jwt = jwt_with_plan("plus");
         let request = format!("POST /v1/responses HTTP/1.1\r\nAuthorization: Bearer {jwt}\r\n\r\n");
-        assert!(request_uses_chatgpt_auth(request.as_bytes()));
+        assert!(request_uses_chatgpt_auth(request.as_bytes(), false));
 
         assert!(!request_uses_chatgpt_auth(
-            b"POST /v1/responses HTTP/1.1\r\nAuthorization: Bearer sk-platform-key\r\n\r\n"
+            b"POST /v1/responses HTTP/1.1\r\nAuthorization: Bearer sk-platform-key\r\n\r\n",
+            false
+        ));
+        assert!(request_uses_chatgpt_auth(
+            b"POST /backend-api/codex/responses HTTP/1.1\r\nAuthorization: Bearer opaque-token\r\n\r\n",
+            true
+        ));
+    }
+
+    #[test]
+    fn explicit_api_key_evidence_overrides_account_header() {
+        assert!(!request_uses_chatgpt_auth(
+            b"POST /v1/responses HTTP/1.1\r\nChatGPT-Account-Id: acct_1\r\nx-api-key: sk-platform-key\r\n\r\n",
+            false
+        ));
+        assert!(!request_uses_chatgpt_auth(
+            b"POST /v1/responses HTTP/1.1\r\nChatGPT-Account-Id: acct_1\r\napi-key: sk-platform-key\r\n\r\n",
+            false
+        ));
+        assert!(!request_uses_chatgpt_auth(
+            b"POST /v1/responses HTTP/1.1\r\nChatGPT-Account-Id: acct_1\r\nAuthorization: Bearer sk-proj-platform-key\r\n\r\n",
+            false
+        ));
+    }
+
+    #[test]
+    fn empty_account_header_is_not_chatgpt_auth() {
+        assert!(!request_uses_chatgpt_auth(
+            b"POST /v1/responses HTTP/1.1\r\nChatGPT-Account-Id:   \r\n\r\n",
+            false
         ));
     }
 

@@ -14,5 +14,10 @@ headroom_memory.db
 # Local git worktrees (isolated feature branches)
 .worktrees/
 
+# Local app bundle + sandboxed HOME used for manual desktop smoke tests. Holds
+# machine-local state (client setup, router state, downloaded runtimes), never
+# shared.
+.local-test/
+
 # Personal learn output, never shared
 CLAUDE.local.md

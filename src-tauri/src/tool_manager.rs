@@ -1109,6 +1109,18 @@ pub(crate) fn stable_package_version(version: &str) -> Result<&str> {
 const CONTEXT7_INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
 const CODEBASE_MEMORY_VERSION: &str = "0.10.8";
 static CODEBASE_MEMORY_INSTALL_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Durable phase metadata for a codebase-memory replacement. The marker is a
+/// rollback boundary, so a valid JSON object with missing flags must not be
+/// interpreted as `false`: doing so could delete a live binary or receipt that
+/// the interrupted transaction never backed up.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct CodebaseMemoryPending {
+    had_destination: Option<bool>,
+    had_receipt: Option<bool>,
+}
+
 const CODEBASE_MEMORY_SHA256_MACOS_AARCH64: &str =
     "9bd840dfb3ec7eaef4f310382057adaa5b0e904df883104d03ffcf39836afd07";
 const CODEBASE_MEMORY_SHA256_MACOS_X86_64: &str =
@@ -1721,6 +1733,39 @@ fn plugin_addon(id: &str) -> Option<&'static PluginAddon> {
 
 fn plugin_uses_existing_marketplace(plugin: &PluginAddon) -> bool {
     plugin.id == "superpowers"
+}
+
+/// True when a host CLI reported that the plugin is missing from a marketplace
+/// it was asked to install from. Codex says this both when our own marketplace
+/// registration did not take and when Codex has not yet materialized its
+/// built-in marketplace.
+fn is_marketplace_plugin_missing(err: &anyhow::Error) -> bool {
+    format!("{err:#}")
+        .to_ascii_lowercase()
+        .contains("not found in marketplace")
+}
+
+/// Add the cause and the fix to a failure that carries neither.
+///
+/// Superpowers lives in Codex's own `openai-curated` marketplace, which Codex
+/// creates itself the first time the app starts. An update that runs before
+/// that first sync fails with the bare CLI line "plugin `x` was not found in
+/// marketplace `y`" -- which reads as a permanent failure, offers no action,
+/// and repeats on every retry (the user's report: "I clicked update and it
+/// still errors"). Keep the CLI text because it is what
+/// [`plugin_install_failure_category`] matches on, but lead with the cause and
+/// the one step that resolves it.
+fn explain_host_marketplace_missing_plugin(
+    plugin: &PluginAddon,
+    err: anyhow::Error,
+) -> anyhow::Error {
+    if !plugin_uses_existing_marketplace(plugin) || !is_marketplace_plugin_missing(&err) {
+        return err;
+    }
+    err.context(format!(
+        "Codex has not finished preparing its built-in `{}` marketplace, so `{}` is not available from it yet. Open the Codex app once, wait for it to finish loading, then retry.",
+        plugin.marketplace_name, plugin.id
+    ))
 }
 
 pub(crate) fn is_plugin_addon(id: &str) -> bool {
@@ -2696,8 +2741,9 @@ impl ToolManager {
 
     fn allinluna_runtime_path(&self) -> Option<PathBuf> {
         let home = crate::client_adapters::home_dir();
+        let codex_home = crate::client_adapters::codex_home();
         [
-            home.join(".codex/.tmp/marketplaces/allinluna/plugins/allinluna/runtime"),
+            codex_home.join(".tmp/marketplaces/allinluna/plugins/allinluna/runtime"),
             home.join(".claude/plugins/marketplaces/allinluna/plugins/allinluna/runtime"),
         ]
         .into_iter()
@@ -2710,12 +2756,12 @@ impl ToolManager {
 
         #[cfg(windows)]
     let body = format!(
-        "@echo off\r\nset \"PLUGIN_RUNTIME=%USERPROFILE%\\.codex\\.tmp\\marketplaces\\allinluna\\plugins\\allinluna\\runtime\"\r\nif not exist \"%PLUGIN_RUNTIME%\\allinluna_runtime\\__main__.py\" set \"PLUGIN_RUNTIME=%USERPROFILE%\\.claude\\plugins\\marketplaces\\allinluna\\plugins\\allinluna\\runtime\"\r\nif not exist \"%PLUGIN_RUNTIME%\\allinluna_runtime\\__main__.py\" (\r\n echo All in Luna requires installed marketplace runtime Headroom-managed Python ^>= 3.11. Install or enable All in Luna again. 1>&2\r\n exit /b 1\r\n)\r\nif defined PYTHONPATH (\r\n set \"PYTHONPATH=%PLUGIN_RUNTIME%;%PYTHONPATH%\"\r\n) else (\r\n set \"PYTHONPATH=%PLUGIN_RUNTIME%\"\r\n)\r\nset \"PYTHONNOUSERSITE=1\"\r\n\"{}\" -m allinluna_runtime %*\r\n",
+        "@echo off\r\nif defined CODEX_HOME (set \"CODEX_ROOT=%CODEX_HOME%\") else (set \"CODEX_ROOT=%USERPROFILE%\\.codex\")\r\nset \"PLUGIN_RUNTIME=%CODEX_ROOT%\\.tmp\\marketplaces\\allinluna\\plugins\\allinluna\\runtime\"\r\nif not exist \"%PLUGIN_RUNTIME%\\allinluna_runtime\\__main__.py\" set \"PLUGIN_RUNTIME=%USERPROFILE%\\.claude\\plugins\\marketplaces\\allinluna\\plugins\\allinluna\\runtime\"\r\nif not exist \"%PLUGIN_RUNTIME%\\allinluna_runtime\\__main__.py\" (\r\n echo All in Luna requires installed marketplace runtime Headroom-managed Python ^>= 3.11. Install or enable All in Luna again. 1>&2\r\n exit /b 1\r\n)\r\nif defined PYTHONPATH (\r\n set \"PYTHONPATH=%PLUGIN_RUNTIME%;%PYTHONPATH%\"\r\n) else (\r\n set \"PYTHONPATH=%PLUGIN_RUNTIME%\"\r\n)\r\nset \"PYTHONNOUSERSITE=1\"\r\n\"{}\" -m allinluna_runtime %*\r\n",
         managed_python.display()
     );
         #[cfg(not(windows))]
     let body = format!(
-        "#!/bin/sh\nset -eu\nfor plugin_runtime in \\\n \"$HOME/.codex/.tmp/marketplaces/allinluna/plugins/allinluna/runtime\" \\\n \"$HOME/.claude/plugins/marketplaces/allinluna/plugins/allinluna/runtime\"; do\n if [ -f \"$plugin_runtime/allinluna_runtime/__main__.py\" ]; then\n  PYTHONPATH=\"$plugin_runtime${{PYTHONPATH:+:$PYTHONPATH}}\"\n  export PYTHONPATH\n  export PYTHONNOUSERSITE=1\n  exec '{}' -m allinluna_runtime \"$@\"\n fi\ndone\necho 'All in Luna requires installed marketplace runtime Headroom-managed Python >= 3.11.' >&2\nexit 1\n",
+        "#!/bin/sh\nset -eu\ncodex_root=\"${{CODEX_HOME:-$HOME/.codex}}\"\nfor plugin_runtime in \\\n \"$codex_root/.tmp/marketplaces/allinluna/plugins/allinluna/runtime\" \\\n \"$HOME/.claude/plugins/marketplaces/allinluna/plugins/allinluna/runtime\"; do\n if [ -f \"$plugin_runtime/allinluna_runtime/__main__.py\" ]; then\n  PYTHONPATH=\"$plugin_runtime${{PYTHONPATH:+:$PYTHONPATH}}\"\n  export PYTHONPATH\n  export PYTHONNOUSERSITE=1\n  exec '{}' -m allinluna_runtime \"$@\"\n fi\ndone\necho 'All in Luna requires installed marketplace runtime Headroom-managed Python >= 3.11.' >&2\nexit 1\n",
         managed_python.display().to_string().replace('\'', "'\\''")
     );
 
@@ -2758,8 +2804,7 @@ impl ToolManager {
     }
 
     fn marketplace_package_root(&self, plugin: &PluginAddon) -> PathBuf {
-        crate::client_adapters::home_dir()
-            .join(".codex")
+        crate::client_adapters::codex_home()
             .join(".tmp")
             .join("marketplaces")
             .join(plugin.marketplace_name)
@@ -3191,7 +3236,11 @@ impl ToolManager {
                 // Best-effort: a failed write only costs the wedge diagnostics.
                 let inject_dir = self.runtime.root_dir.join("pyinject");
                 if let Err(err) = std::fs::create_dir_all(&inject_dir).and_then(|_| {
-                    std::fs::write(inject_dir.join("sitecustomize.py"), SITECUSTOMIZE_PY)
+                    crate::client_adapters::atomic_write(
+                        &inject_dir.join("sitecustomize.py"),
+                        SITECUSTOMIZE_PY.as_bytes(),
+                    )
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))
                 }) {
                     log::warn!("[tool_manager] writing pyinject/sitecustomize.py failed: {err}");
                 }
@@ -5029,13 +5078,19 @@ impl ToolManager {
     /// Plugin addons are host plugins, not binaries we own, so "smoke test"
     /// means confirming the plugin is still registered with a host's plugin
     /// registry. No-op when our receipt says it was never installed, or when
-    /// it says the user disabled it — hosts without a disable verb (Codex)
-    /// drop the registration entirely on disable, so absence is expected
-    /// there, not a failure (RUST-22 false positive).
+    /// it says the user disabled it. A disabled Codex plugin intentionally
+    /// remains registered with `enabled = false`, so it can be re-enabled
+    /// without reinstalling its marketplace checkout.
     pub fn smoke_test_plugin(&self, id: &str) -> Result<()> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
-        let Some(receipt) = self.read_tool_receipt(plugin.id) else {
-            let registered = plugin.hosts.iter().any(|host| host.plugin_present(plugin));
+        let Some(receipt) = self.read_plugin_receipt(plugin)? else {
+            let registered = plugin
+                .hosts
+                .iter()
+                .map(|host| host.plugin_present_checked(plugin))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .any(|present| present);
             let runtime_residue = match plugin.id {
                 "allinluna" => self.allinluna_runtime_path().is_some(),
                 "openspec" => self.openspec_entrypoint().exists(),
@@ -5054,7 +5109,14 @@ impl ToolManager {
         if !enabled {
             return Ok(());
         }
-        if !plugin.hosts.iter().any(|host| host.plugin_present(plugin)) {
+        let registered = plugin
+            .hosts
+            .iter()
+            .map(|host| host.plugin_present_checked(plugin))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .any(|present| present);
+        if !registered {
             // The plugin was removed behind our back (host-native `/plugin`
             // uninstall or a host registry migration). Drop the stale receipt
             // so this warns once instead of on every future upgrade;
@@ -5189,22 +5251,77 @@ impl ToolManager {
         Ok(())
     }
 
-    /// Read the in-progress upgrade marker and, if it records an in-place
-    /// upgrade, return (previous_version, target_version, previous_lock_backup).
-    /// Returns None for missing markers and for full-venv-rebuild markers.
-    fn read_in_place_marker(&self) -> Option<(String, String, Option<PathBuf>)> {
-        let bytes = std::fs::read(self.upgrade_marker_path()).ok()?;
-        let body: Value = serde_json::from_slice(&bytes).ok()?;
-        if body.get("in_place").and_then(|v| v.as_bool()) != Some(true) {
-            return None;
+    /// Strictly parse the in-progress upgrade marker and, if it records an
+    /// in-place upgrade, return (previous_version, target_version,
+    /// previous_lock_backup). A malformed marker is an unresolved recovery
+    /// boundary, so callers must preserve it instead of falling through to the
+    /// full-rebuild path and clearing it.
+    fn read_in_place_marker_checked(&self) -> Result<Option<(String, String, Option<PathBuf>)>> {
+        let path = self.upgrade_marker_path();
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        };
+        let body: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing upgrade marker {}", path.display()))?;
+        let object = body
+            .as_object()
+            .ok_or_else(|| anyhow!("upgrade marker {} must be a JSON object", path.display()))?;
+        let Some(in_place) = object.get("in_place") else {
+            return Ok(None);
+        };
+        if !in_place.is_boolean() {
+            bail!(
+                "upgrade marker {} has a non-boolean in_place field",
+                path.display()
+            );
         }
-        let previous = body.get("previous_version")?.as_str()?.to_string();
-        let target = body.get("target_version")?.as_str()?.to_string();
-        let lock_backup = body
-            .get("previous_lock_backup")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from);
-        Some((previous, target, lock_backup))
+        if !in_place.as_bool().unwrap_or(false) {
+            return Ok(None);
+        }
+        let previous = object
+            .get("previous_version")
+            .and_then(Value::as_str)
+            .filter(|version| !version.trim().is_empty())
+            .ok_or_else(|| anyhow!("upgrade marker {} has no previous_version", path.display()))?
+            .to_string();
+        let target = object
+            .get("target_version")
+            .and_then(Value::as_str)
+            .filter(|version| !version.trim().is_empty())
+            .ok_or_else(|| anyhow!("upgrade marker {} has no target_version", path.display()))?
+            .to_string();
+        let lock_backup = match object.get("previous_lock_backup") {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .filter(|path| !path.trim().is_empty())
+                    .map(PathBuf::from)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "upgrade marker {} has an invalid previous_lock_backup",
+                            path.display()
+                        )
+                    })?,
+            ),
+        };
+        Ok(Some((previous, target, lock_backup)))
+    }
+
+    /// Compatibility wrapper retained for focused tests and non-recovery
+    /// callers. It logs malformed markers and returns `None`; recovery entry
+    /// points use `read_in_place_marker_checked` so they can stop without
+    /// clearing an unresolved marker.
+    fn read_in_place_marker(&self) -> Option<(String, String, Option<PathBuf>)> {
+        match self.read_in_place_marker_checked() {
+            Ok(marker) => marker,
+            Err(err) => {
+                log::warn!("read_in_place_marker: malformed marker preserved for retry: {err:#}");
+                None
+            }
+        }
     }
 
     fn clear_upgrade_marker(&self) {
@@ -5231,8 +5348,16 @@ impl ToolManager {
         // interrupted upgrade took that path) and force-reinstall the prior
         // headroom-ai so the next launch starts from a known-good state.
         // `check_headroom_upgrade` will then retry the swap fresh.
-        if let Some((previous_version, _target, previous_lock_backup)) = self.read_in_place_marker()
-        {
+        let in_place_marker = match self.read_in_place_marker_checked() {
+            Ok(marker) => marker,
+            Err(err) => {
+                log::error!(
+                    "recover_from_interrupted_upgrade: malformed marker preserved for manual/retry recovery: {err:#}"
+                );
+                return false;
+            }
+        };
+        if let Some((previous_version, _target, previous_lock_backup)) = in_place_marker {
             log::info!(
                 "recover_from_interrupted_upgrade: in-place upgrade was in progress; \
                  reinstalling previous headroom-ai {previous_version}"
@@ -5261,14 +5386,38 @@ impl ToolManager {
                 return false;
             }
             if let Some(ref backup) = previous_lock_backup {
-                let _ = std::fs::copy(backup, self.active_lock_path());
-                let _ = std::fs::remove_file(backup);
+                if let Err(err) = std::fs::copy(backup, self.active_lock_path()) {
+                    log::error!(
+                        "recover_from_interrupted_upgrade: restoring lock snapshot {} failed: {err}",
+                        backup.display()
+                    );
+                    return false;
+                }
+                if let Err(err) = std::fs::remove_file(backup) {
+                    log::error!(
+                        "recover_from_interrupted_upgrade: removing consumed lock snapshot {} failed: {err}",
+                        backup.display()
+                    );
+                    return false;
+                }
             }
             let receipt_backup = self.headroom_receipt_backup_path();
             let receipt_path = self.headroom_receipt_path();
             if receipt_backup.exists() {
-                let _ = std::fs::copy(&receipt_backup, &receipt_path);
-                let _ = std::fs::remove_file(&receipt_backup);
+                if let Err(err) = std::fs::copy(&receipt_backup, &receipt_path) {
+                    log::error!(
+                        "recover_from_interrupted_upgrade: restoring receipt {} failed: {err}",
+                        receipt_backup.display()
+                    );
+                    return false;
+                }
+                if let Err(err) = std::fs::remove_file(&receipt_backup) {
+                    log::error!(
+                        "recover_from_interrupted_upgrade: removing consumed receipt backup {} failed: {err}",
+                        receipt_backup.display()
+                    );
+                    return false;
+                }
             }
             self.clear_upgrade_marker();
             return true;
@@ -5306,17 +5455,30 @@ impl ToolManager {
                 return false;
             }
             if receipt_backup.exists() {
-                let _ = std::fs::copy(&receipt_backup, &receipt_path);
-                let _ = std::fs::remove_file(&receipt_backup);
+                if let Err(err) = std::fs::copy(&receipt_backup, &receipt_path) {
+                    log::error!(
+                        "recover_from_interrupted_upgrade: restoring receipt {} failed: {err}",
+                        receipt_backup.display()
+                    );
+                    return false;
+                }
+                if let Err(err) = std::fs::remove_file(&receipt_backup) {
+                    log::error!(
+                        "recover_from_interrupted_upgrade: removing consumed receipt backup {} failed: {err}",
+                        receipt_backup.display()
+                    );
+                    return false;
+                }
             }
         } else {
             // No backup to restore from. Rare — the user (or a script) deleted
             // the backup dir while the marker was still live. Best we can do
             // is clear the marker so we don't loop on this state.
             log::warn!(
-                "recover_from_interrupted_upgrade: no backup at {}; clearing marker",
+                "recover_from_interrupted_upgrade: no backup at {}; keeping marker for manual/retry recovery",
                 backup_dir.display()
             );
+            return false;
         }
         self.clear_upgrade_marker();
         true
@@ -5519,8 +5681,10 @@ impl ToolManager {
         // In-place rollback: no venv backup. Restore deps from the lock
         // snapshot (if the upgrade touched the lock), then pip-reinstall the
         // previous headroom-ai and restore the receipt.
-        if let Some((previous_version, _target, previous_lock_backup)) = self.read_in_place_marker()
-        {
+        let in_place_marker = self
+            .read_in_place_marker_checked()
+            .context("reading in-place upgrade marker during rollback")?;
+        if let Some((previous_version, _target, previous_lock_backup)) = in_place_marker {
             if let Some(ref backup) = previous_lock_backup {
                 self.pip_restore_deps_from_backup(backup).with_context(|| {
                     format!(
@@ -5528,8 +5692,11 @@ impl ToolManager {
                         backup.display()
                     )
                 })?;
-                let _ = std::fs::copy(backup, self.active_lock_path());
-                let _ = std::fs::remove_file(backup);
+                std::fs::copy(backup, self.active_lock_path())
+                    .with_context(|| format!("restoring active lock from {}", backup.display()))?;
+                std::fs::remove_file(backup).with_context(|| {
+                    format!("removing consumed lock snapshot {}", backup.display())
+                })?;
             }
             self.pip_force_reinstall_headroom_version(&previous_version)
                 .with_context(|| {
@@ -5615,8 +5782,23 @@ impl ToolManager {
                 return None;
             }
             let backup = self.lock_backup_path();
-            let _ = std::fs::remove_file(&backup);
-            std::fs::copy(&active, &backup).ok()?;
+            if let Err(err) = std::fs::remove_file(&backup) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!(
+                        "prepare_in_place_upgrade: could not remove stale lock backup {}: {err}",
+                        backup.display()
+                    );
+                    return None;
+                }
+            }
+            if let Err(err) = std::fs::copy(&active, &backup) {
+                log::warn!(
+                    "prepare_in_place_upgrade: could not snapshot lock {} to {}: {err}",
+                    active.display(),
+                    backup.display()
+                );
+                return None;
+            }
             Some(backup)
         } else {
             None
@@ -6027,10 +6209,39 @@ impl ToolManager {
         // Restore deps first so headroom-ai lands on a consistent dep set.
         let deps_ok = match ctx.previous_lock_backup.as_deref() {
             Some(backup) => {
-                let ok = self.pip_restore_deps_from_backup(backup).is_ok();
+                let pip_ok = match self.pip_restore_deps_from_backup(backup) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        log::error!(
+                            "rollback_in_place_upgrade: restoring dependencies from {} failed: {err:#}",
+                            backup.display()
+                        );
+                        false
+                    }
+                };
+                let mut ok = pip_ok;
                 let active = self.active_lock_path();
-                let _ = std::fs::copy(backup, &active);
-                let _ = std::fs::remove_file(backup);
+                if let Err(err) = std::fs::copy(backup, &active) {
+                    log::error!(
+                        "rollback_in_place_upgrade: restoring lock snapshot {} failed: {err}",
+                        backup.display()
+                    );
+                    ok = false;
+                } else if pip_ok {
+                    if let Err(err) = std::fs::remove_file(backup) {
+                        log::error!(
+                            "rollback_in_place_upgrade: removing consumed lock snapshot {} failed: {err}",
+                            backup.display()
+                        );
+                        ok = false;
+                    }
+                }
+                if !pip_ok {
+                    log::error!(
+                        "rollback_in_place_upgrade: retaining lock snapshot {} because dependency restore failed",
+                        backup.display()
+                    );
+                }
                 ok
             }
             None => true,
@@ -6041,14 +6252,37 @@ impl ToolManager {
         let receipt_backup = self.headroom_receipt_backup_path();
         let receipt_path = self.headroom_receipt_path();
         let receipt_ok = if receipt_backup.exists() {
-            let copy_ok = std::fs::copy(&receipt_backup, &receipt_path).is_ok();
-            let _ = std::fs::remove_file(&receipt_backup);
-            copy_ok
+            match std::fs::copy(&receipt_backup, &receipt_path) {
+                Ok(_) => match std::fs::remove_file(&receipt_backup) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        log::error!(
+                            "rollback_in_place_upgrade: removing consumed receipt backup {} failed: {err}",
+                            receipt_backup.display()
+                        );
+                        false
+                    }
+                },
+                Err(err) => {
+                    log::error!(
+                        "rollback_in_place_upgrade: restoring receipt {} failed: {err}",
+                        receipt_backup.display()
+                    );
+                    false
+                }
+            }
         } else {
             true
         };
-        self.clear_upgrade_marker();
-        deps_ok && wheel_ok && receipt_ok
+        let restored = deps_ok && wheel_ok && receipt_ok;
+        if restored {
+            self.clear_upgrade_marker();
+        } else {
+            log::error!(
+                "rollback_in_place_upgrade: recovery incomplete; retaining marker and any backups for retry"
+            );
+        }
+        restored
     }
 
     fn update_headroom_receipt_after_in_place_upgrade(
@@ -6127,7 +6361,13 @@ impl ToolManager {
                 );
                 return false;
             }
-            let _ = std::fs::remove_file(&receipt_backup);
+            if let Err(err) = std::fs::remove_file(&receipt_backup) {
+                log::error!(
+                    "rollback: failed to remove consumed receipt backup {}: {err}",
+                    receipt_backup.display()
+                );
+                return false;
+            }
         }
         // Rollback complete — clear the marker so we don't trigger recovery
         // on the next launch.
@@ -6197,19 +6437,26 @@ impl ToolManager {
             Err(err) => return Err(err),
         };
         let receipt_path = self.runtime.tools_dir.join("headroom.json");
-        if let Ok(bytes) = std::fs::read(&receipt_path) {
-            if let Ok(mut receipt) = serde_json::from_slice::<Value>(&bytes) {
-                receipt["mcp"] = json!({
-                    "configured": true,
-                    "proxyUrl": HEADROOM_PROXY_URL,
-                    "installMethod": method.as_str(),
-                });
-                let _ = crate::client_adapters::atomic_write(
-                    &receipt_path,
-                    &serde_json::to_vec(&receipt)?,
-                );
+        let bytes = match std::fs::read(&receipt_path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("reading {} after MCP install", receipt_path.display())
+                })
             }
-        }
+        };
+        let mut receipt: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing {} after MCP install", receipt_path.display()))?;
+        receipt["mcp"] = json!({
+            "configured": true,
+            "proxyUrl": HEADROOM_PROXY_URL,
+            "installMethod": method.as_str(),
+        });
+        crate::client_adapters::atomic_write(&receipt_path, &serde_json::to_vec(&receipt)?)
+            .with_context(|| {
+                format!("recording MCP configuration in {}", receipt_path.display())
+            })?;
         Ok(())
     }
 
@@ -6707,6 +6954,449 @@ impl ToolManager {
             &serde_json::to_vec_pretty(&payload).context("serializing managed tool receipt")?,
         )
         .with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+
+    fn plugin_receipt_path(&self, plugin: &PluginAddon) -> PathBuf {
+        self.runtime.tools_dir.join(format!("{}.json", plugin.id))
+    }
+
+    /// Read and validate a plugin receipt before using it as an ownership
+    /// boundary. The dashboard's best-effort status reader intentionally keeps
+    /// its `Option` API, but destructive plugin operations must never interpret
+    /// malformed JSON (or a wrong-shaped value) as proof that Headroom owns a
+    /// host registration.
+    fn read_plugin_receipt(&self, plugin: &PluginAddon) -> Result<Option<Value>> {
+        let path = self.plugin_receipt_path(plugin);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        };
+        let value: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing managed plugin receipt {}", path.display()))?;
+        let object = value.as_object().ok_or_else(|| {
+            anyhow!(
+                "managed plugin receipt {} must be a JSON object",
+                path.display()
+            )
+        })?;
+        if object
+            .get("version")
+            .and_then(Value::as_str)
+            .is_none_or(|version| version.trim().is_empty())
+        {
+            bail!(
+                "managed plugin receipt {} has no non-empty string version",
+                path.display()
+            );
+        }
+        if let Some(enabled) = object.get("enabled") {
+            if !enabled.is_boolean() {
+                bail!(
+                    "managed plugin receipt {} has a non-boolean enabled field",
+                    path.display()
+                );
+            }
+        }
+        if let Some(managed_by) = object.get("managedBy") {
+            if managed_by.as_str() != Some("Headroom") {
+                bail!(
+                    "managed plugin receipt {} has unexpected managedBy value",
+                    path.display()
+                );
+            }
+        }
+        if let Some(plugin_id) = object.get("pluginId") {
+            if plugin_id.as_str() != Some(plugin.id) {
+                bail!(
+                    "managed plugin receipt {} belongs to a different plugin",
+                    path.display()
+                );
+            }
+        }
+        Ok(Some(value))
+    }
+
+    fn require_plugin_receipt(&self, plugin: &PluginAddon) -> Result<Value> {
+        self.read_plugin_receipt(plugin)?.ok_or_else(|| {
+            anyhow!(
+                "{} is not installed (Headroom ownership receipt is missing)",
+                plugin.id
+            )
+        })
+    }
+
+    /// Legacy receipts written before ownership metadata was introduced are
+    /// still readable for dashboard/status purposes, but they are not enough
+    /// evidence for a destructive host mutation. A version string alone can
+    /// be copied into the runtime directory by a user or another installer.
+    fn receipt_proves_plugin_ownership(plugin: &PluginAddon, receipt: &Value) -> bool {
+        receipt.as_object().is_some_and(|object| {
+            object.get("managedBy").and_then(Value::as_str) == Some("Headroom")
+                && object.get("pluginId").and_then(Value::as_str) == Some(plugin.id)
+        })
+    }
+
+    fn require_owned_plugin_receipt(&self, plugin: &PluginAddon) -> Result<Value> {
+        let receipt = self.require_plugin_receipt(plugin)?;
+        if !Self::receipt_proves_plugin_ownership(plugin, &receipt) {
+            bail!(
+                "refusing to mutate {} because its legacy receipt lacks explicit Headroom ownership metadata; reinstall it from Headroom to create a managed receipt",
+                plugin.id
+            );
+        }
+        Ok(receipt)
+    }
+
+    fn plugin_receipt_payload(plugin: &PluginAddon, version: &str, enabled: bool) -> Value {
+        json!({
+            "managedBy": "Headroom",
+            "pluginId": plugin.id,
+            "version": version,
+            "enabled": enabled
+        })
+    }
+
+    fn codex_marketplace_recovery_path(&self, plugin: &PluginAddon) -> PathBuf {
+        self.runtime
+            .tools_dir
+            .join(format!("{}-codex-marketplace-recovery.json", plugin.id))
+    }
+
+    /// The only checkout path that Headroom may move aside while preparing a
+    /// Codex adapter. Keeping the expected sibling deterministic lets recovery
+    /// reject a hand-edited marker that points at an unrelated user path.
+    fn codex_marketplace_recovery_backup_path(&self, plugin: &PluginAddon) -> PathBuf {
+        self.marketplace_package_root(plugin)
+            .with_file_name(format!("{}.headroom-legacy", plugin.marketplace_name))
+    }
+
+    fn write_codex_marketplace_recovery(
+        &self,
+        plugin: &PluginAddon,
+        recovery: &CodexMarketplaceRecovery,
+    ) -> Result<()> {
+        let path = self.codex_marketplace_recovery_path(plugin);
+        let bytes = serde_json::to_vec_pretty(recovery)
+            .context("serializing Codex marketplace recovery metadata")?;
+        crate::client_adapters::atomic_write(&path, &bytes)
+            .with_context(|| format!("writing {}", path.display()))
+    }
+
+    fn read_codex_marketplace_recovery(
+        &self,
+        plugin: &PluginAddon,
+    ) -> Result<Option<CodexMarketplaceRecovery>> {
+        let path = self.codex_marketplace_recovery_path(plugin);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        let recovery = serde_json::from_slice::<CodexMarketplaceRecovery>(&bytes)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        if recovery.backup_path.as_os_str().is_empty() {
+            bail!("{} has no Codex marketplace backup path", path.display());
+        }
+        let expected_backup = self.codex_marketplace_recovery_backup_path(plugin);
+        if !paths_refer_to_same_location(&recovery.backup_path, &expected_backup) {
+            bail!(
+                "{} points outside the expected Codex marketplace recovery path {}",
+                path.display(),
+                expected_backup.display()
+            );
+        }
+        Ok(Some(recovery))
+    }
+
+    fn clear_codex_marketplace_recovery(&self, plugin: &PluginAddon) -> Result<()> {
+        let path = self.codex_marketplace_recovery_path(plugin);
+        if path.exists() {
+            std::fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    /// Clear a recovery marker that was published for a migration which then
+    /// returned `Ok(None)` because another process changed the checkout. This
+    /// is deliberately conservative: only an unchanged, unmarked checkout
+    /// whose Git remote still matches the recorded host registration proves
+    /// that no move occurred. Ambiguous states retain the marker so the next
+    /// recovery attempt can inspect them instead of deleting user data.
+    fn clear_unmoved_codex_marketplace_recovery_if_safe(
+        &self,
+        plugin: &PluginAddon,
+        registration: &CodexMarketplaceRegistration,
+    ) -> Result<bool> {
+        if self.codex_marketplace_recovery_backup_path(plugin).exists() {
+            return Ok(false);
+        }
+        let CodexMarketplaceRegistration::Git(expected_source) = registration else {
+            return Ok(false);
+        };
+        let destination = self.marketplace_package_root(plugin);
+        if !destination.join(".git").is_dir()
+            || destination
+                .join(".headroom-local-community-adapter.json")
+                .exists()
+            || expected_source.trim().is_empty()
+            || !git_checkout_matches_source(&destination, expected_source)
+        {
+            return Ok(false);
+        }
+        self.clear_codex_marketplace_recovery(plugin)?;
+        Ok(true)
+    }
+
+    /// Restore a user Git marketplace moved aside for the Codex adapter. The
+    /// marker is removed only after both the checkout and the original CLI
+    /// registration are back, so a failed recovery remains retryable.
+    fn restore_codex_marketplace_recovery(&self, plugin: &PluginAddon, cli: &Path) -> Result<()> {
+        let Some(recovery) = self.read_codex_marketplace_recovery(plugin)? else {
+            return Ok(());
+        };
+        let destination = self.marketplace_package_root(plugin);
+
+        let registration =
+            codex_marketplace_registration(cli, &self.runtime.root_dir, plugin.marketplace_name)?;
+        let original_source = recovery
+            .original_git_source
+            .as_deref()
+            .filter(|source| !source.trim().is_empty());
+        let backup_exists = recovery.backup_path.exists();
+
+        // A moved checkout can be restored safely only if its original Git
+        // source is known. Without it, a missing host registration would be
+        // silently left absent after consuming the backup and clearing the
+        // marker. Keep both artifacts intact so a later retry (or manual
+        // repair) can supply the missing registration metadata.
+        if matches!(registration, CodexMarketplaceRegistration::Missing)
+            && original_source.is_none()
+        {
+            bail!(
+                "Codex marketplace recovery for {} has no original Git source; refusing to consume the backup without registration metadata",
+                plugin.marketplace_name
+            );
+        }
+
+        // If the backup has already been consumed, the only safe recovery
+        // candidate is an unmarked Git checkout whose remote still matches the
+        // recorded source. This covers both a crash before the rename
+        // (`moved=false`) and a crash after restoring the checkout but before
+        // re-registering it (`moved=true`). Never delete a registration before
+        // establishing this identity proof.
+        let destination_is_original_checkout = !backup_exists
+            && destination.join(".git").is_dir()
+            && !destination
+                .join(".headroom-local-community-adapter.json")
+                .exists()
+            && original_source
+                .is_some_and(|source| git_checkout_matches_source(&destination, source));
+        if !backup_exists && !destination_is_original_checkout {
+            bail!(
+                "Codex marketplace recovery backup {} is missing; refusing to infer recovery from {}",
+                recovery.backup_path.display(),
+                destination.display()
+            );
+        }
+
+        if destination_is_original_checkout {
+            match registration {
+                CodexMarketplaceRegistration::Missing => {
+                    let source = original_source.ok_or_else(|| {
+                        anyhow!(
+                            "Codex marketplace {} has no original Git source to re-register",
+                            plugin.marketplace_name
+                        )
+                    })?;
+                    self.run_plugin_cmd(
+                        plugin,
+                        cli,
+                        PluginHost::Codex,
+                        &["plugin", "marketplace", "add", source],
+                    )?;
+                    ensure_codex_git_registration(
+                        cli,
+                        &self.runtime.root_dir,
+                        plugin.marketplace_name,
+                        source,
+                    )?;
+                }
+                CodexMarketplaceRegistration::Git(source)
+                    if original_source == Some(source.as_str()) => {}
+                CodexMarketplaceRegistration::Git(_) => {
+                    bail!(
+                        "refusing to replace user-managed Codex marketplace {} during recovery",
+                        plugin.marketplace_name
+                    );
+                }
+                CodexMarketplaceRegistration::Local(path) => {
+                    bail!(
+                        "refusing to replace user-managed Codex marketplace {} at {} during recovery",
+                        plugin.marketplace_name,
+                        path.display()
+                    );
+                }
+                CodexMarketplaceRegistration::Other(_) => {
+                    bail!(
+                        "refusing to replace user-managed Codex marketplace {} during recovery",
+                        plugin.marketplace_name
+                    );
+                }
+            }
+            return self.clear_codex_marketplace_recovery(plugin);
+        }
+
+        // Current Codex disables keep the plugin registration and only flip its
+        // `enabled` field. This legacy recovery path can still encounter an
+        // older install that removed the registration, so handle both shapes:
+        // remove only the exact local adapter we created; any other source is
+        // user-managed and must remain intact.
+        // Validate the ownership marker before this destructive host mutation.
+        if destination.exists() && !self.codex_adapter_marketplace_is_owned(plugin)? {
+            bail!(
+                "refusing to remove unmarked Codex marketplace replacement {} during recovery",
+                destination.display()
+            );
+        }
+        let mut original_registration_preserved = false;
+        match registration {
+            CodexMarketplaceRegistration::Missing => {}
+            CodexMarketplaceRegistration::Local(path)
+                if paths_refer_to_same_location(&path, &destination) =>
+            {
+                self.run_plugin_cmd(
+                    plugin,
+                    cli,
+                    PluginHost::Codex,
+                    &PluginHost::Codex.marketplace_remove_args(plugin),
+                )?;
+            }
+            CodexMarketplaceRegistration::Local(path) => {
+                bail!(
+                    "refusing to replace user-managed Codex marketplace {} at {} during recovery",
+                    plugin.marketplace_name,
+                    path.display()
+                );
+            }
+            CodexMarketplaceRegistration::Git(source) => {
+                // A crash can occur after the backup is moved and the marker
+                // is written but before the original registration is removed.
+                // Preserve that registration only when it is the exact source
+                // recorded in the marker; any other Git checkout remains
+                // user-managed and is never replaced.
+                if original_source == Some(source.as_str()) {
+                    original_registration_preserved = true;
+                } else {
+                    bail!(
+                        "refusing to replace user-managed Codex marketplace {} during recovery",
+                        plugin.marketplace_name
+                    );
+                }
+            }
+            CodexMarketplaceRegistration::Other(_) => {
+                bail!(
+                    "refusing to replace user-managed Codex marketplace {} during recovery",
+                    plugin.marketplace_name
+                );
+            }
+        }
+        restore_codex_marketplace_backup(&recovery.backup_path, &destination)?;
+        if !original_registration_preserved {
+            let source = original_source.ok_or_else(|| {
+                anyhow!(
+                    "Codex marketplace {} has no original Git source to re-register",
+                    plugin.marketplace_name
+                )
+            })?;
+            self.run_plugin_cmd(
+                plugin,
+                cli,
+                PluginHost::Codex,
+                &["plugin", "marketplace", "add", source],
+            )?;
+            ensure_codex_git_registration(
+                cli,
+                &self.runtime.root_dir,
+                plugin.marketplace_name,
+                source,
+            )?;
+        }
+        self.clear_codex_marketplace_recovery(plugin)
+    }
+
+    /// Validate the marker written at the root of a Codex adapter checkout.
+    /// Only a marker with the exact addon id and source URL proves that the
+    /// directory is ours; a merely present or hand-edited marker must never
+    /// authorize deleting a user's marketplace.
+    fn codex_adapter_marketplace_is_owned(&self, plugin: &PluginAddon) -> Result<bool> {
+        if !uses_codex_plugin_adapter(plugin, PluginHost::Codex) {
+            return Ok(false);
+        }
+        codex_adapter_marker_is_owned(&self.marketplace_package_root(plugin), plugin)
+    }
+
+    /// A marketplace may contain another plugin that the user installed. In
+    /// that case removing the marketplace while uninstalling one addon would
+    /// delete unrelated capability and registry state, so keep the checkout.
+    fn codex_marketplace_has_other_plugin_registrations(
+        &self,
+        plugin: &PluginAddon,
+    ) -> Result<bool> {
+        let path = crate::client_adapters::codex_home().join("config.toml");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        };
+        let root: toml::Value = toml::from_str(&text)
+            .with_context(|| format!("parsing Codex config {}", path.display()))?;
+        let Some(plugins) = root.get("plugins") else {
+            return Ok(false);
+        };
+        let plugins = plugins.as_table().ok_or_else(|| {
+            anyhow!(
+                "Codex config {} has a non-table plugins value",
+                path.display()
+            )
+        })?;
+        let suffix = format!("@{}", plugin.marketplace_name);
+        Ok(plugins
+            .keys()
+            .any(|key| key.ends_with(&suffix) && key != plugin.plugin_ref))
+    }
+
+    fn marketplace_removal_allowed(&self, plugin: &PluginAddon, host: PluginHost) -> Result<bool> {
+        if !matches!(host, PluginHost::Codex) {
+            // Claude marketplace ownership is not exposed consistently across
+            // supported CLI versions. Keep it registered unless a future
+            // receipt records explicit ownership; removing it heuristically
+            // could delete another Claude plugin's source.
+            return Ok(false);
+        }
+        if !self.codex_adapter_marketplace_is_owned(plugin)? {
+            return Ok(false);
+        }
+        Ok(!self.codex_marketplace_has_other_plugin_registrations(plugin)?)
+    }
+
+    fn remove_owned_codex_adapter_marketplace(&self, plugin: &PluginAddon) -> Result<()> {
+        if !self.codex_adapter_marketplace_is_owned(plugin)? {
+            return Ok(());
+        }
+        if self.codex_marketplace_has_other_plugin_registrations(plugin)? {
+            log::info!(
+                "keeping Codex marketplace {} because another plugin is still registered",
+                plugin.marketplace_name
+            );
+            return Ok(());
+        }
+        let root = self.marketplace_package_root(plugin);
+        if root.exists() {
+            std::fs::remove_dir_all(&root).with_context(|| {
+                format!("removing managed Codex marketplace {}", root.display())
+            })?;
+        }
         Ok(())
     }
 
@@ -7398,18 +8088,22 @@ impl ToolManager {
         if !marker.exists() {
             return Ok(());
         }
-        let pending: Value = serde_json::from_slice(
+        let pending: CodebaseMemoryPending = serde_json::from_slice(
             &std::fs::read(&marker).with_context(|| format!("reading {}", marker.display()))?,
         )
         .with_context(|| format!("parsing {}", marker.display()))?;
-        let had_destination = pending
-            .get("hadDestination")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let had_receipt = pending
-            .get("hadReceipt")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let had_destination = pending.had_destination.ok_or_else(|| {
+            anyhow!(
+                "{} is missing required hadDestination rollback flag; refusing to guess",
+                marker.display()
+            )
+        })?;
+        let had_receipt = pending.had_receipt.ok_or_else(|| {
+            anyhow!(
+                "{} is missing required hadReceipt rollback flag; refusing to guess",
+                marker.display()
+            )
+        })?;
         let backup = self.runtime.bin_dir.join("codebase-memory-mcp.backup");
         let destination = self.codebase_memory_entrypoint();
         let receipt = self.runtime.tools_dir.join("codebase-memory.json");
@@ -7827,10 +8521,7 @@ impl ToolManager {
     }
 
     fn plugin_receipt_exists(&self, plugin: &PluginAddon) -> bool {
-        self.runtime
-            .tools_dir
-            .join(format!("{}.json", plugin.id))
-            .exists()
+        self.read_plugin_receipt(plugin).ok().flatten().is_some()
     }
 
     fn conflicting_plugin_ids(&self, id: &str) -> Vec<String> {
@@ -7899,13 +8590,26 @@ impl ToolManager {
             log::info!("{id} [{label}]: {line}")
         });
         if result.is_ok() && matches!(host, PluginHost::Codex) {
-            normalize_codex_plugin_cache(plugin)?;
+            // The host command has already committed its registry change. A
+            // cache normalization failure is a post-action maintenance issue,
+            // not evidence that the CLI command failed. Returning it as the
+            // command error makes callers roll back a successful install or
+            // uninstall and can leave an orphaned Codex registration. Keep
+            // the successful host result, log the degraded cache state, and
+            // retry normalization on the next plugin operation.
+            if let Err(err) = normalize_codex_plugin_cache(plugin) {
+                log::warn!(
+                    "{id} Codex command succeeded but plugin-cache normalization was deferred: {err:#}"
+                );
+            }
         }
         result
     }
 
     /// Registers the marketplace (best-effort) and installs the plugin into a
-    /// single host. Used for first install, re-enable, and Update.
+    /// single host. Used for first install, recovery of a missing registration,
+    /// and Update. Codex enable/disable normally edits its persistent `enabled`
+    /// flag without refreshing or removing the installation.
     ///
     /// Already present on this host means this is an Update: both hosts install
     /// from a local marketplace checkout, so the snapshot has to be refreshed
@@ -7915,49 +8619,59 @@ impl ToolManager {
     fn install_plugin_into(&self, plugin: &'static PluginAddon, host: PluginHost) -> Result<()> {
         let cli = host.cli().context("CLI not found on PATH")?;
         if uses_codex_plugin_adapter(plugin, host) {
-            return self.install_codex_adapter_plugin(plugin, &cli);
+            self.install_codex_adapter_plugin(plugin, &cli)?;
+            set_codex_plugin_enabled(plugin, true)?;
+            return Ok(());
         }
-        if host.plugin_present(plugin) {
+        let plugin_present = host.plugin_present_checked(plugin)?;
+        if plugin_present {
             if !plugin_uses_existing_marketplace(plugin) {
-                let _ =
-                    self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_update_args(plugin));
+                self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_update_args(plugin))
+                    .with_context(|| {
+                        format!(
+                            "refreshing {} marketplace before update",
+                            plugin.marketplace_name
+                        )
+                    })?;
                 host.prepare_marketplace_snapshot(plugin)?;
             }
-            self.run_plugin_cmd(plugin, &cli, host, &host.update_args(plugin))?;
+            self.run_plugin_cmd(plugin, &cli, host, &host.update_args(plugin))
+                .map_err(|err| explain_host_marketplace_missing_plugin(plugin, err))?;
         } else {
-            // Re-adding an already-known marketplace is a benign error, so its
-            // failure is not fatal on its own -- but it must not be discarded
-            // either. When `marketplace add` fails for a real reason (offline,
-            // git failure, unwritable snapshot dir) the install that follows
-            // reports only "plugin <x> was not found in marketplace <y>", which
-            // names a consequence and hides every cause (Sentry RUST-6K). Carry
-            // the add error and attach it if the install then fails.
-            let marketplace_err = if plugin_uses_existing_marketplace(plugin) {
-                None
-            } else {
-                let error = self
-                    .run_plugin_cmd(plugin, &cli, host, &host.marketplace_add_args(plugin))
-                    .err();
+            // Superpowers ships in the host's own openai-curated marketplace,
+            // which Codex materializes the first time the app starts, so there
+            // is no add step for it. Every other addon
+            // must successfully add/refresh its marketplace before install;
+            // continuing after an add failure would let the host resolve a
+            // stale or user-managed checkout and silently install the wrong
+            // source.
+            if !plugin_uses_existing_marketplace(plugin) {
+                self.run_plugin_cmd(plugin, &cli, host, &host.marketplace_add_args(plugin))
+                    .with_context(|| {
+                        format!(
+                            "adding {} marketplace before installing {}",
+                            plugin.marketplace_name, plugin.id
+                        )
+                    })?;
                 host.prepare_marketplace_snapshot(plugin)?;
-                error
-            };
+            }
             self.run_plugin_cmd(plugin, &cli, host, &host.install_args(plugin))
-                .map_err(|err| match marketplace_err {
-                    Some(add_err) => {
-                        err.context(format!("marketplace add failed first: {add_err:#}"))
-                    }
-                    None => err,
-                })?;
+                .map_err(|err| explain_host_marketplace_missing_plugin(plugin, err))?;
         }
-        if !host.plugin_present(plugin) {
+        if !host.plugin_present_checked(plugin)? {
             bail!("install completed but the plugin was not registered");
+        }
+        if matches!(host, PluginHost::Codex) {
+            // `plugin add` may preserve an existing disabled flag. Install and
+            // Update are explicit enable actions in Headroom, so make the
+            // resulting Codex state unambiguous without another CLI refresh.
+            set_codex_plugin_enabled(plugin, true)?;
         }
         Ok(())
     }
 
     fn install_codex_adapter_plugin(&self, plugin: &'static PluginAddon, cli: &Path) -> Result<()> {
-        let adapter_source = crate::client_adapters::home_dir()
-            .join(".codex")
+        let adapter_source = crate::client_adapters::codex_home()
             .join(".tmp")
             .join("marketplaces")
             .join(plugin.marketplace_name);
@@ -7978,11 +8692,97 @@ impl ToolManager {
             );
         }
 
-        let migrated_backup = migrate_unmanaged_codex_marketplace(plugin)?;
         let original_git_source = match &registration {
             CodexMarketplaceRegistration::Git(source) if !source.is_empty() => Some(source.clone()),
             _ => None,
         };
+        let recovery_marker_preexisting = self.read_codex_marketplace_recovery(plugin)?.is_some();
+        let migration_decision = codex_adapter_source_decision(
+            &adapter_source,
+            &adapter_source.join(".headroom-local-community-adapter.json"),
+        );
+        let mut pending_marker_created = false;
+        if let CodexAdapterSourceDecision::MigrateGit { backup } = &migration_decision {
+            if !matches!(registration, CodexMarketplaceRegistration::Git(_)) {
+                bail!(
+                    "{} is an unregistered Git checkout; refusing to move user-managed Codex marketplace",
+                    adapter_source.display()
+                );
+            }
+            if backup.exists() {
+                bail!(
+                    "refusing to overwrite recoverable Codex marketplace backup {}",
+                    backup.display()
+                );
+            }
+            if recovery_marker_preexisting {
+                bail!(
+                    "{} has a recovery marker but no managed adapter marker; refusing to migrate it again",
+                    adapter_source.display()
+                );
+            }
+            // Publish the recovery boundary before moving the checkout. If the
+            // process dies between the rename and the phase update, the
+            // marker still points at the deterministic backup and recovery can
+            // restore it safely.
+            self.write_codex_marketplace_recovery(
+                plugin,
+                &CodexMarketplaceRecovery {
+                    backup_path: backup.clone(),
+                    original_git_source: original_git_source.clone(),
+                    moved: false,
+                },
+            )?;
+            pending_marker_created = true;
+        }
+        let migrated_backup = match migrate_unmanaged_codex_marketplace(plugin, &registration) {
+            Ok(backup) => backup,
+            Err(err) => {
+                if pending_marker_created {
+                    match self.clear_unmoved_codex_marketplace_recovery_if_safe(
+                        plugin,
+                        &registration,
+                    ) {
+                        Ok(true) => log::warn!(
+                            "Codex marketplace migration failed before moving the checkout; cleared the pending recovery marker"
+                        ),
+                        Ok(false) => log::warn!(
+                            "Codex marketplace migration failed after its recovery marker was published; retaining the marker because the checkout state is ambiguous"
+                        ),
+                        Err(clear_err) => {
+                            return Err(merge_codex_marketplace_recovery_error(
+                                err,
+                                Err(clear_err),
+                            ));
+                        }
+                    }
+                }
+                return Err(err);
+            }
+        };
+        if pending_marker_created && migrated_backup.is_none() {
+            // The preflight saw an unmanaged Git checkout, but the migration
+            // helper no longer did. Another process changed the marketplace
+            // between those two observations. Never continue with a
+            // moved=false marker that has no backup: it would make a later
+            // uninstall infer a recovery that did not happen. Clear the
+            // marker only when the original checkout is still present,
+            // unmarked, and proves the same registered Git source. If the
+            // path disappeared or changed shape, retain the marker as an
+            // unresolved recovery boundary for a safe retry.
+            let marker_cleared =
+                self.clear_unmoved_codex_marketplace_recovery_if_safe(plugin, &registration)?;
+            if marker_cleared {
+                bail!(
+                    "Codex marketplace {} changed while its recovery marker was being created; migration did not occur and the pending marker was cleared",
+                    plugin.marketplace_name
+                );
+            }
+            bail!(
+                "Codex marketplace {} changed while its recovery marker was being created; refusing to continue with no migration backup (pending marker retained for recovery)",
+                plugin.marketplace_name
+            );
+        }
         let registration_removed = matches!(registration, CodexMarketplaceRegistration::Git(_));
         let replacement_registration_attempted = std::cell::Cell::new(false);
         let restore_migrated = || -> Result<()> {
@@ -8024,12 +8824,40 @@ impl ToolManager {
                     }
                 }
             }
+            // If this invocation created the recovery marker, remove it only
+            // after the original checkout and registration are both restored.
+            // A pre-existing marker belongs to an already-installed adapter and
+            // must survive an update failure for a later uninstall retry.
+            if failures.is_empty() && migrated_backup.is_some() && !recovery_marker_preexisting {
+                if let Err(err) = self.clear_codex_marketplace_recovery(plugin) {
+                    failures.push(format!(
+                        "clearing Codex marketplace recovery marker: {err:#}"
+                    ));
+                }
+            }
             if failures.is_empty() {
                 Ok(())
             } else {
                 bail!(failures.join("; "))
             }
         };
+        if let Some(backup) = migrated_backup.as_ref() {
+            let recovery = CodexMarketplaceRecovery {
+                backup_path: backup.clone(),
+                original_git_source: original_git_source.clone(),
+                moved: true,
+            };
+            if let Err(err) = self.write_codex_marketplace_recovery(plugin, &recovery) {
+                // The checkout has already moved. Try to put it back before
+                // returning; if that fails, the marker (when it was written)
+                // remains as the explicit retry boundary.
+                let recovery_err = restore_migrated();
+                return Err(merge_codex_marketplace_recovery_error(
+                    err.context("recording Codex marketplace recovery metadata"),
+                    recovery_err,
+                ));
+            }
+        }
         if registration_removed {
             if let Err(err) = self.run_plugin_cmd(
                 plugin,
@@ -8113,7 +8941,16 @@ impl ToolManager {
                 restore_migrated(),
             ));
         }
-        if !PluginHost::Codex.plugin_present(plugin) {
+        let codex_registered = match PluginHost::Codex.plugin_present_checked(plugin) {
+            Ok(registered) => registered,
+            Err(err) => {
+                return Err(merge_codex_marketplace_recovery_error(
+                    err.context("checking Codex plugin registration after install"),
+                    restore_migrated(),
+                ));
+            }
+        };
+        if !codex_registered {
             return Err(merge_codex_marketplace_recovery_error(
                 anyhow!("install completed but the Codex adapter plugin was not registered"),
                 restore_migrated(),
@@ -8128,31 +8965,88 @@ impl ToolManager {
     /// update Codex. A too-old Codex is not a real error (no Sentry warning); it
     /// is a version skew the user can only fix by updating Codex.
     pub fn install_plugin(&self, id: &str) -> Result<bool> {
+        // Serialize plugin registry, marketplace, receipt, and runtime
+        // mutations so concurrent addon operations cannot lose updates.
+        let _guard = PACKAGE_UPDATE_LOCK.get_or_init(|| Mutex::new(())).lock();
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
-        let hosts: Vec<PluginHost> = plugin
+        // A host registration without a valid Headroom receipt is user-owned
+        // state. Refuse to update or adopt it before invoking any host CLI so a
+        // failed multi-host install cannot mutate one existing host and leave
+        // another untouched. A recovery marker is an interrupted Headroom
+        // transaction: finish its safe rollback first, then re-run the normal
+        // ownership preflight instead of leaving a crash state permanently
+        // unrecoverable.
+        let receipt = self.read_plugin_receipt(plugin)?;
+        if let Some(receipt) = receipt.as_ref() {
+            if !Self::receipt_proves_plugin_ownership(plugin, receipt) {
+                bail!(
+                    "refusing to mutate {} because its legacy receipt lacks explicit Headroom ownership metadata; reinstall it from Headroom to create a managed receipt",
+                    plugin.id
+                );
+            }
+        }
+        let recovery_marker_present = self.read_codex_marketplace_recovery(plugin)?.is_some();
+        if receipt.is_none() && recovery_marker_present {
+            let cli = PluginHost::Codex.cli().context(
+                "Codex marketplace recovery is pending, but the Codex CLI was not found on PATH",
+            )?;
+            self.restore_codex_marketplace_recovery(plugin, &cli)
+                .with_context(|| format!("recovering interrupted {} installation", plugin.id))?;
+        }
+        // Read every host registry before filtering on CLI availability. A
+        // missing CLI must not hide a pre-existing user plugin in that host's
+        // config and allow a partial install to take it over elsewhere.
+        let all_host_presence: Vec<(PluginHost, bool)> = plugin
             .hosts
             .iter()
             .copied()
-            .filter(|host| host.cli().is_some())
-            .collect();
-        if hosts.is_empty()
+            .map(|host| {
+                host.plugin_present_checked(plugin)
+                    .with_context(|| format!("checking {} plugin registry", host.label()))
+                    .map(|present| (host, present))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if all_host_presence
+            .iter()
+            .all(|(host, _)| host.cli().is_none())
             && plugin.hosts.len() == 1
             && matches!(plugin.hosts[0], PluginHost::Codex)
         {
             bail!("Codex CLI ('codex') was not found on PATH. Install Codex, then try again.");
         }
-        if hosts.is_empty() {
+        if all_host_presence
+            .iter()
+            .all(|(host, _)| host.cli().is_none())
+        {
             bail!(
                 "Neither the Claude Code CLI ('claude') nor the Codex CLI ('codex') was found on PATH. Install one, then try again."
             );
         }
-        let previous_version = self
-            .read_tool_receipt(plugin.id)
-            .and_then(|receipt| receipt.get("version")?.as_str().map(str::to_string));
-        let mut hosts: Vec<(PluginHost, bool)> = hosts
+        let previous_version = receipt.as_ref().and_then(|receipt| {
+            receipt
+                .get("version")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+        let preexisting: Vec<&str> = if receipt.is_none() {
+            all_host_presence
+                .iter()
+                .filter_map(|(host, present)| present.then_some(host.label()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut hosts: Vec<(PluginHost, bool)> = all_host_presence
             .into_iter()
-            .map(|host| (host, host.plugin_present(plugin)))
+            .filter(|(host, _)| host.cli().is_some())
             .collect();
+        if !preexisting.is_empty() {
+            bail!(
+                "refusing to take over existing {} plugin registration on {} without a Headroom ownership receipt",
+                plugin.id,
+                preexisting.join(", ")
+            );
+        }
         // Install missing hosts before touching existing ones. If a new host
         // fails, hosts that were already working remain unchanged.
         hosts.sort_by_key(|(_, was_registered)| *was_registered);
@@ -8177,15 +9071,55 @@ impl ToolManager {
         let rollback_hosts = |manager: &Self| {
             for host in newly_registered_hosts.iter().copied() {
                 if let Some(cli) = host.cli() {
-                    let _ =
-                        manager.run_plugin_cmd(plugin, &cli, host, &host.uninstall_args(plugin));
-                    if !plugin_uses_existing_marketplace(plugin) {
-                        let _ = manager.run_plugin_cmd(
-                            plugin,
-                            &cli,
-                            host,
-                            &host.marketplace_remove_args(plugin),
+                    if let Err(err) =
+                        manager.run_plugin_cmd(plugin, &cli, host, &host.uninstall_args(plugin))
+                    {
+                        log::error!(
+                            "{} rollback: removing {} from {} failed: {err:#}",
+                            plugin.id,
+                            plugin.id,
+                            host.label()
                         );
+                    }
+                    match manager.marketplace_removal_allowed(plugin, host) {
+                        Ok(true) => {
+                            if let Err(err) = manager.run_plugin_cmd(
+                                plugin,
+                                &cli,
+                                host,
+                                &host.marketplace_remove_args(plugin),
+                            ) {
+                                log::error!(
+                                    "{} rollback: removing marketplace {} failed: {err:#}",
+                                    plugin.id,
+                                    plugin.marketplace_name
+                                );
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(err) => log::error!(
+                            "{} rollback: could not verify marketplace ownership: {err:#}",
+                            plugin.id
+                        ),
+                    }
+                    if matches!(host, PluginHost::Codex) {
+                        if let Err(err) = manager.restore_codex_marketplace_recovery(plugin, &cli) {
+                            // Keep the recovery marker when restoration fails;
+                            // uninstall/retry can make another explicit attempt.
+                            log::warn!(
+                                "{} Codex marketplace rollback deferred: {err:#}",
+                                plugin.id
+                            );
+                        }
+                        if !manager.codex_marketplace_recovery_path(plugin).exists() {
+                            if let Err(err) = manager.remove_owned_codex_adapter_marketplace(plugin)
+                            {
+                                log::error!(
+                                    "{} rollback: removing managed Codex marketplace failed: {err:#}",
+                                    plugin.id
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -8235,9 +9169,10 @@ impl ToolManager {
             let _ = self.remove_plugin_runtime(plugin);
             return Err(err);
         }
-        if let Err(err) =
-            self.write_tool_receipt(plugin.id, json!({ "version": version, "enabled": true }))
-        {
+        if let Err(err) = self.write_tool_receipt(
+            plugin.id,
+            Self::plugin_receipt_payload(plugin, &version, true),
+        ) {
             rollback_hosts(self);
             let _ = self.remove_plugin_runtime(plugin);
             return Err(err);
@@ -8249,18 +9184,11 @@ impl ToolManager {
                 std::fs::remove_file(self.runtime.tools_dir.join(format!("{}.json", plugin.id)));
             return Err(err);
         }
-        self.write_tool_receipt(plugin.id, json!({ "version": version, "enabled": true }))?;
-        self.enforce_exclusive_plugin_group(plugin.id)?;
-        if !errors.is_empty() {
-            return Err(anyhow!(
-                "installing {id} plugin failed on some hosts: {}",
-                errors.join("; ")
-            ));
-        }
         Ok(codex_outdated)
     }
 
     pub fn set_plugin_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        let _guard = PACKAGE_UPDATE_LOCK.get_or_init(|| Mutex::new(())).lock();
         self.set_plugin_enabled_inner(id, enabled)?;
         if enabled {
             self.enforce_exclusive_plugin_group(id)?;
@@ -8270,26 +9198,57 @@ impl ToolManager {
 
     fn set_plugin_enabled_inner(&self, id: &str, enabled: bool) -> Result<()> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
-        // Guard on the receipt, not host presence: disabling on a host without a
-        // disable verb (Codex) removes the plugin, so `plugin_installed()`
-        // would be false and re-enabling could never get past this check.
-        if !self.plugin_receipt_exists(plugin) {
-            bail!("{id} is not installed");
-        }
-        let previous_version = self
-            .read_tool_receipt(plugin.id)
-            .and_then(|receipt| receipt.get("version")?.as_str().map(str::to_string));
+        // The receipt is the ownership boundary. A host registration without
+        // this proof may belong to the user and must never be toggled by us.
+        let receipt = self.require_owned_plugin_receipt(plugin)?;
+        let previous_version = receipt
+            .get("version")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         let mut errors: Vec<String> = Vec::new();
         for &host in plugin.hosts {
-            let Some(cli) = host.cli() else { continue };
-            // Codex has no enable/disable verb, so enabling re-installs and
-            // disabling removes. Skip disabling a host that isn't present.
-            let result = if enabled {
-                self.install_plugin_into(plugin, host)
-            } else if host.plugin_present(plugin) {
-                self.run_plugin_cmd(plugin, &cli, host, &host.disable_args(plugin))
+            let present = match host.plugin_present_checked(plugin) {
+                Ok(present) => present,
+                Err(err) => {
+                    errors.push(format!("{} registry: {err:#}", host.label()));
+                    continue;
+                }
+            };
+            // Codex exposes plugin activation as an `enabled` field in
+            // config.toml. Toggle that field in place so Disable keeps the
+            // install/cache and Enable does not need a network refresh. Only a
+            // missing registration on Enable falls back to `plugin add`.
+            let result = if matches!(host, PluginHost::Codex) {
+                if present {
+                    set_codex_plugin_enabled(plugin, enabled)
+                } else if enabled {
+                    self.install_plugin_into(plugin, host)
+                } else {
+                    continue;
+                }
             } else {
-                continue;
+                let Some(cli) = host.cli() else {
+                    if present {
+                        errors.push(format!(
+                            "{} CLI is unavailable while {} is still registered",
+                            host.label(),
+                            plugin.id
+                        ));
+                    }
+                    continue;
+                };
+                if enabled {
+                    self.install_plugin_into(plugin, host)
+                } else if present {
+                    self.run_plugin_cmd(
+                        plugin,
+                        &cli,
+                        host,
+                        &["plugin", "disable", plugin.plugin_ref],
+                    )
+                } else {
+                    continue;
+                }
             };
             if let Err(err) = result {
                 errors.push(format!("{}: {err:#}", host.label()));
@@ -8301,7 +9260,10 @@ impl ToolManager {
         let version = installed_plugin_version(plugin)
             .or(previous_version)
             .unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
-        self.write_tool_receipt(plugin.id, json!({ "version": version, "enabled": enabled }))?;
+        self.write_tool_receipt(
+            plugin.id,
+            Self::plugin_receipt_payload(plugin, &version, enabled),
+        )?;
         if enabled {
             self.ensure_plugin_runtime(plugin)?;
         } else {
@@ -8311,35 +9273,97 @@ impl ToolManager {
     }
 
     pub fn uninstall_plugin(&self, id: &str) -> Result<()> {
+        let _guard = PACKAGE_UPDATE_LOCK.get_or_init(|| Mutex::new(())).lock();
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
         // No receipt means Headroom never installed it. Don't touch the user's
         // plugin config or marketplace registration (which they may own).
-        if !self.plugin_receipt_exists(plugin) {
-            return Ok(());
-        }
+        let recovery_marker_present = self.read_codex_marketplace_recovery(plugin)?.is_some();
+        let _receipt = match self.read_plugin_receipt(plugin) {
+            Ok(Some(receipt)) if Self::receipt_proves_plugin_ownership(plugin, &receipt) => receipt,
+            Ok(Some(_)) => {
+                bail!(
+                    "refusing to uninstall {} because its legacy receipt lacks explicit Headroom ownership metadata; reinstall it from Headroom to create a managed receipt",
+                    plugin.id
+                );
+            }
+            Ok(None) if recovery_marker_present => {
+                // The marker itself is Headroom's durable ownership evidence
+                // for an interrupted migration. Recover the user's checkout
+                // and registration, then leave all user plugin state alone.
+                let cli = PluginHost::Codex.cli().context(
+                    "Codex marketplace recovery is pending, but the Codex CLI was not found on PATH",
+                )?;
+                self.restore_codex_marketplace_recovery(plugin, &cli)
+                    .with_context(|| {
+                        format!("recovering interrupted {} installation", plugin.id)
+                    })?;
+                return Ok(());
+            }
+            Ok(None) => return Ok(()),
+            Err(err) => {
+                bail!(
+                    "refusing to uninstall {} because its ownership receipt is invalid: {err:#}",
+                    plugin.id
+                );
+            }
+        };
         let mut uninstall_errors = Vec::new();
         for &host in plugin.hosts {
-            if let Some(cli) = host.cli() {
-                if !host.plugin_present(plugin) {
+            let present = match host.plugin_present_checked(plugin) {
+                Ok(present) => present,
+                Err(err) => {
+                    uninstall_errors.push(format!("{} registry: {err:#}", host.label()));
                     continue;
                 }
-                let mut host_uninstall_succeeded = true;
-                if let Err(err) =
-                    self.run_plugin_cmd(plugin, &cli, host, &host.uninstall_args(plugin))
-                {
-                    host_uninstall_succeeded = false;
-                    uninstall_errors.push(format!("{}: {err:#}", host.label()));
+            };
+            if !present {
+                continue;
+            }
+            let Some(cli) = host.cli() else {
+                uninstall_errors.push(format!(
+                    "{} CLI is unavailable while {} is still registered",
+                    host.label(),
+                    plugin.id
+                ));
+                continue;
+            };
+            let mut host_uninstall_succeeded = true;
+            if let Err(err) = self.run_plugin_cmd(plugin, &cli, host, &host.uninstall_args(plugin))
+            {
+                host_uninstall_succeeded = false;
+                uninstall_errors.push(format!("{}: {err:#}", host.label()));
+            }
+            if host_uninstall_succeeded {
+                match self.marketplace_removal_allowed(plugin, host) {
+                    Ok(true) => {
+                        if let Err(err) = self.run_plugin_cmd(
+                            plugin,
+                            &cli,
+                            host,
+                            &host.marketplace_remove_args(plugin),
+                        ) {
+                            uninstall_errors.push(format!("{} marketplace: {err:#}", host.label()));
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(err) => uninstall_errors
+                        .push(format!("{} marketplace ownership: {err:#}", host.label())),
                 }
-                if host_uninstall_succeeded && !plugin_uses_existing_marketplace(plugin) {
-                    if let Err(err) = self.run_plugin_cmd(
-                        plugin,
-                        &cli,
-                        host,
-                        &host.marketplace_remove_args(plugin),
-                    ) {
-                        uninstall_errors.push(format!("{} marketplace: {err:#}", host.label()));
+            }
+        }
+        // All in Luna can move a user Git marketplace aside while preparing its
+        // local Codex adapter. Restore that checkout and its original
+        // registration before deleting our receipt. If recovery fails, keep the
+        // marker and receipt so a later explicit retry can finish safely.
+        if uninstall_errors.is_empty() && self.codex_marketplace_recovery_path(plugin).exists() {
+            match PluginHost::Codex.cli() {
+                Some(cli) => {
+                    if let Err(err) = self.restore_codex_marketplace_recovery(plugin, &cli) {
+                        uninstall_errors.push(format!("Codex marketplace recovery: {err:#}"));
                     }
                 }
+                None => uninstall_errors
+                    .push("Codex marketplace recovery requires the Codex CLI on PATH".to_string()),
             }
         }
         if !uninstall_errors.is_empty() {
@@ -8348,7 +9372,10 @@ impl ToolManager {
                 uninstall_errors.join("; ")
             );
         }
-        let receipt = self.runtime.tools_dir.join(format!("{}.json", plugin.id));
+        if !self.codex_marketplace_recovery_path(plugin).exists() {
+            self.remove_owned_codex_adapter_marketplace(plugin)?;
+        }
+        let receipt = self.plugin_receipt_path(plugin);
         self.remove_plugin_runtime(plugin)?;
         if receipt.exists() {
             std::fs::remove_file(&receipt)
@@ -8359,12 +9386,20 @@ impl ToolManager {
 
     fn detect_status(&self, tool_id: &str) -> ToolStatus {
         if let Some(plugin) = plugin_addon(tool_id) {
-            let Some(receipt) = self.read_tool_receipt(plugin.id) else {
-                return ToolStatus::NotInstalled;
+            let receipt = match self.read_plugin_receipt(plugin) {
+                Ok(Some(receipt)) => receipt,
+                Ok(None) => return ToolStatus::NotInstalled,
+                Err(err) => {
+                    log::warn!(
+                        "could not validate {} ownership receipt; reporting degraded: {err:#}",
+                        plugin.id
+                    );
+                    return ToolStatus::Degraded;
+                }
             };
-            // Intentionally disabled via the app: the plugin may be gone from
-            // hosts that lack a disable verb (Codex), but the receipt means it's
-            // still installed -- report Healthy so the card shows Enable, not Install.
+            // Intentionally disabled via the app. The ownership receipt keeps
+            // the card in its installed state while each host retains its
+            // registration with activation turned off.
             let enabled = receipt
                 .get("enabled")
                 .and_then(Value::as_bool)
@@ -8430,9 +9465,9 @@ impl ToolManager {
 }
 
 /// Plugin addons ship marketplace plugins that both Claude Code and Codex can
-/// install through their own `<cli> plugin ...` managers. Their verbs differ
-/// (Claude has enable/disable/install/uninstall; Codex only add/remove), so
-/// each host carries its own argument vectors.
+/// install through their own `<cli> plugin ...` managers. Codex activation is
+/// persisted in config.toml rather than exposed as a CLI verb; removal remains
+/// an explicit uninstall operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PluginHost {
     ClaudeCode,
@@ -8466,8 +9501,7 @@ impl PluginHost {
 
     fn prepare_marketplace_snapshot(self, plugin: &PluginAddon) -> Result<()> {
         if matches!(self, PluginHost::Codex) {
-            let root = crate::client_adapters::home_dir()
-                .join(".codex")
+            let root = crate::client_adapters::codex_home()
                 .join(".tmp")
                 .join("marketplaces");
             write_codex_compat_marketplace_manifest_at(&root, plugin)?;
@@ -8520,13 +9554,6 @@ impl PluginHost {
         }
     }
 
-    fn disable_args(self, plugin: &PluginAddon) -> Vec<&'static str> {
-        match self {
-            PluginHost::ClaudeCode => vec!["plugin", "disable", plugin.plugin_ref],
-            PluginHost::Codex => vec!["plugin", "remove", plugin.plugin_ref],
-        }
-    }
-
     fn uninstall_args(self, plugin: &PluginAddon) -> Vec<&'static str> {
         match self {
             PluginHost::ClaudeCode => vec!["plugin", "uninstall", plugin.plugin_ref],
@@ -8538,6 +9565,18 @@ impl PluginHost {
         match self {
             PluginHost::ClaudeCode => claude_plugin_present(plugin),
             PluginHost::Codex => codex_plugin_present(plugin),
+        }
+    }
+
+    /// Ownership-sensitive operations must distinguish "not registered" from
+    /// "the host registry could not be read or parsed". The best-effort bool
+    /// above remains useful for dashboard health, but install/uninstall paths
+    /// use this checked variant so malformed user config cannot be treated as
+    /// permission to adopt or delete a plugin.
+    fn plugin_present_checked(self, plugin: &PluginAddon) -> Result<bool> {
+        match self {
+            PluginHost::ClaudeCode => claude_plugin_present_checked(plugin),
+            PluginHost::Codex => codex_plugin_present_checked(plugin),
         }
     }
 }
@@ -8610,19 +9649,19 @@ fn normalize_codex_plugin_manifest_at(plugin_root: &Path) -> Result<()> {
 
     let prompts: Option<&[&str]> = match name.as_str() {
         "allinluna" => Some(&[
-            "Use All in Luna to compile the goal or plan into an executable task graph.",
-            "Resolve resources by explicit request, task override, user preference, capability, then host default; preserve receipts.",
-            "Execute only the resolved host action with frozen arguments and retain verified handoff evidence.",
+            "Advisory default only: for complex or parallelizable goals, use All in Luna to compile a task graph; keep simple tasks direct.",
+            "System, developer, security, and permission controls plus explicit user/task scope take precedence.",
+            "Follow project instructions; execute host actions only within authorized scope and retain verified handoff evidence.",
         ]),
         "research-routes" => Some(&[
-            "Use Research Routes to map evidence-backed routes before choosing one.",
-            "Keep claims, evidence, contradictions, unknowns, failures, and provenance as separate records.",
-            "Require human authorization before route selection, promotion, or implementation.",
+            "Advisory default only: use Research Routes to map evidence-backed routes when useful.",
+            "System, developer, security, and permission controls plus explicit user/task scope take precedence; follow project instructions.",
+            "Keep claims, evidence, contradictions, unknowns, failures, and provenance separate; ask only when scope expands.",
         ]),
         "stop-that-shit" => Some(&[
-            "Review the diff and report findings without editing.",
-            "Fix only the failing test requested by the user.",
-            "Keep the requested change direct and avoid unnecessary delegation or defensive wording.",
+            "Advisory only: follow system, developer, security, permission, user, and project instructions; never block authorized work.",
+            "Review the diff and report findings; edit when the requested fix is within existing authorization.",
+            "Keep the requested change direct; delegate only when useful and within authorized scope.",
         ]),
         _ => None,
     };
@@ -8862,8 +9901,7 @@ fn codex_marketplace_plugin_root(root: &Path, plugin: &PluginAddon) -> PathBuf {
 /// them. Normalize the copied manifests too; normalizing only `.tmp` leaves
 /// Codex validating the original oversized prompts and invalid icon paths.
 fn normalize_codex_plugin_cache(plugin: &PluginAddon) -> Result<()> {
-    let cache = crate::client_adapters::home_dir()
-        .join(".codex")
+    let cache = crate::client_adapters::codex_home()
         .join("plugins")
         .join("cache");
     normalize_codex_plugin_cache_at(&cache, plugin)
@@ -8900,16 +9938,16 @@ fn normalize_codex_plugin_cache_plugin_at(plugin_root: &Path) -> Result<()> {
 }
 
 fn prepare_codex_adapter_marketplace(plugin: &PluginAddon) -> Result<PathBuf> {
-    let root = crate::client_adapters::home_dir()
-        .join(".codex")
+    let root = crate::client_adapters::codex_home()
         .join(".tmp")
         .join("marketplaces");
     std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
     let source = root.join(plugin.marketplace_name);
     let marker = source.join(".headroom-local-community-adapter.json");
+    let mut fresh_clone = false;
 
     if source.join(".git").is_dir() {
-        if !marker.is_file() {
+        if !codex_adapter_marker_is_owned(&source, plugin)? {
             bail!(
                 "{} already exists but is not marked as a Headroom-managed adapter marketplace",
                 source.display()
@@ -8927,28 +9965,113 @@ fn prepare_codex_adapter_marketplace(plugin: &PluginAddon) -> Result<PathBuf> {
         let url = format!("https://github.com/{}.git", plugin.marketplace);
         let source_text = source.to_string_lossy().into_owned();
         run_codex_adapter_command("git", &["clone", "--depth", "1", &url, &source_text], &root)?;
-        crate::client_adapters::atomic_write(
-            &marker,
-            &serde_json::to_vec_pretty(&json!({
-                "id": plugin.id,
-                "source": plugin.source_url
-            }))
-            .context("serializing Codex adapter ownership marker")?,
-        )
-        .with_context(|| format!("writing {}", marker.display()))?;
+        fresh_clone = true;
     }
 
-    write_codex_compat_marketplace_manifest_at(&root, plugin)?;
-    prepare_codex_plugin_adapter_at(&root, plugin)?;
-    normalize_codex_plugin_manifest_at(&codex_marketplace_plugin_root(&root, plugin))?;
-    if plugin.id == "allinluna" {
-        normalize_codex_plugin_manifest_at(
-            &root
-                .join(plugin.marketplace_name)
-                .join("plugins/research-routes"),
-        )?;
+    let preparation = (|| -> Result<()> {
+        if fresh_clone {
+            crate::client_adapters::atomic_write(
+                &marker,
+                &serde_json::to_vec_pretty(&json!({
+                    "id": plugin.id,
+                    "source": plugin.source_url
+                }))
+                .context("serializing Codex adapter ownership marker")?,
+            )
+            .with_context(|| format!("writing {}", marker.display()))?;
+        }
+        write_codex_compat_marketplace_manifest_at(&root, plugin)?;
+        prepare_codex_plugin_adapter_at(&root, plugin)?;
+        normalize_codex_plugin_manifest_at(&codex_marketplace_plugin_root(&root, plugin))?;
+        if plugin.id == "allinluna" {
+            normalize_codex_plugin_manifest_at(
+                &root
+                    .join(plugin.marketplace_name)
+                    .join("plugins/research-routes"),
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = preparation {
+        if fresh_clone {
+            if let Err(cleanup_err) = cleanup_fresh_codex_adapter_checkout(&source, plugin) {
+                return Err(anyhow!(
+                    "{err:#}; cleaning fresh Codex adapter checkout {} also failed: {cleanup_err:#}",
+                    source.display()
+                ));
+            }
+        }
+        return Err(err);
     }
     Ok(source)
+}
+
+/// Remove a checkout created by the current adapter preparation only when the
+/// exact ownership marker proves that the path is still ours. If marker
+/// publication failed or another process replaced the path, leave it in place
+/// so an error path never deletes user-managed data.
+fn cleanup_fresh_codex_adapter_checkout(source: &Path, plugin: &PluginAddon) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("inspecting {}", source.display())),
+    };
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "refusing to remove fresh Codex adapter path {} after it became a symlink",
+            source.display()
+        );
+    }
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    let owned = match codex_adapter_marker_is_owned(source, plugin) {
+        Ok(owned) => owned,
+        Err(err) => {
+            log::warn!(
+                "leaving failed Codex adapter checkout {} in place because its ownership marker is invalid: {err:#}",
+                source.display()
+            );
+            false
+        }
+    };
+    if !owned {
+        return Ok(());
+    }
+    std::fs::remove_dir_all(source).with_context(|| {
+        format!(
+            "removing failed fresh Codex adapter checkout {}",
+            source.display()
+        )
+    })
+}
+
+/// Return whether a Codex adapter checkout carries the exact ownership marker
+/// Headroom wrote for `plugin`. A present marker with another id/source is an
+/// ownership violation, so report it as an error instead of treating it as a
+/// missing marker and mutating the checkout.
+fn codex_adapter_marker_is_owned(root: &Path, plugin: &PluginAddon) -> Result<bool> {
+    let marker = root.join(".headroom-local-community-adapter.json");
+    let bytes = match std::fs::read(&marker) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", marker.display())),
+    };
+    let value: Value =
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", marker.display()))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("{} must contain a JSON object", marker.display()))?;
+    let id = object.get("id").and_then(Value::as_str);
+    let source = object.get("source").and_then(Value::as_str);
+    if id != Some(plugin.id) || source != Some(plugin.source_url) {
+        bail!(
+            "Codex adapter ownership marker {} does not match {}",
+            marker.display(),
+            plugin.id
+        );
+    }
+    Ok(true)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -8957,6 +10080,37 @@ enum CodexAdapterSourceDecision {
     ReuseManaged,
     MigrateGit { backup: PathBuf },
     Refuse,
+}
+
+/// Recovery metadata for the one Codex adapter path that can temporarily move
+/// a user's Git marketplace aside. Keep this outside the marketplace checkout:
+/// the checkout is replaced by the adapter and may be refreshed or deleted on
+/// uninstall, while this small marker must survive every failure boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct CodexMarketplaceRecovery {
+    backup_path: PathBuf,
+    #[serde(default)]
+    original_git_source: Option<String>,
+    /// False while the durable marker has been published but the checkout has
+    /// not yet moved; true after the backup rename succeeds. Writing the
+    /// marker first closes the crash window that previously orphaned a user's
+    /// checkout without recovery metadata.
+    moved: bool,
+}
+
+/// Recovery markers written by the first implementation did not carry a phase
+/// bit. That writer emitted the marker only after the checkout had been moved,
+/// so treating the missing field as `true` preserves the old, recoverable
+/// meaning instead of reopening a crash window during upgrade.
+impl Default for CodexMarketplaceRecovery {
+    fn default() -> Self {
+        Self {
+            backup_path: PathBuf::new(),
+            original_git_source: None,
+            moved: true,
+        }
+    }
 }
 
 fn codex_adapter_source_decision(source: &Path, marker: &Path) -> CodexAdapterSourceDecision {
@@ -8981,21 +10135,54 @@ fn codex_adapter_source_decision(source: &Path, marker: &Path) -> CodexAdapterSo
     }
 }
 
-fn migrate_unmanaged_codex_marketplace(plugin: &PluginAddon) -> Result<Option<PathBuf>> {
+fn migrate_unmanaged_codex_marketplace(
+    plugin: &PluginAddon,
+    registration: &CodexMarketplaceRegistration,
+) -> Result<Option<PathBuf>> {
     if plugin.id != "allinluna" {
         return Ok(None);
     }
-    let root = crate::client_adapters::home_dir()
-        .join(".codex")
+    let root = crate::client_adapters::codex_home()
         .join(".tmp")
         .join("marketplaces");
     let source = root.join(plugin.marketplace_name);
     let marker = source.join(".headroom-local-community-adapter.json");
+    // A checkout with no matching host registration is simply a user's local
+    // repository. Installing an adapter must never move it aside merely
+    // because it happens to use the same directory name. A registered Git
+    // marketplace is the narrow case where the user explicitly selected this
+    // checkout through Codex and the recovery sidecar can preserve it.
+    if source.join(".git").is_dir()
+        && !marker.is_file()
+        && !matches!(registration, CodexMarketplaceRegistration::Git(_))
+    {
+        bail!(
+            "{} is an unregistered Git checkout; refusing to move user-managed Codex marketplace without a matching registration",
+            source.display()
+        );
+    }
     let CodexAdapterSourceDecision::MigrateGit { backup } =
         codex_adapter_source_decision(&source, &marker)
     else {
         return Ok(None);
     };
+    let CodexMarketplaceRegistration::Git(registered_source) = registration else {
+        // The caller normally performs this guard before reaching here. Keep
+        // it local as well so this helper cannot ever move an unregistered
+        // checkout if another call site is added later.
+        bail!(
+            "{} is not registered as a Git marketplace; refusing to move user-managed checkout",
+            source.display()
+        );
+    };
+    if registered_source.trim().is_empty()
+        || !git_checkout_matches_source(&source, registered_source)
+    {
+        bail!(
+            "Codex marketplace checkout {} does not match its registered Git source; refusing to move user-managed checkout",
+            source.display()
+        );
+    }
     if backup.exists() {
         bail!(
             "refusing to overwrite recoverable Codex marketplace backup {}",
@@ -9009,6 +10196,29 @@ fn migrate_unmanaged_codex_marketplace(plugin: &PluginAddon) -> Result<Option<Pa
         )
     })?;
     Ok(Some(backup))
+}
+
+fn git_checkout_matches_source(path: &Path, expected: &str) -> bool {
+    let path_text = path.to_string_lossy().into_owned();
+    let Ok(output) = crate::proc::command("git")
+        .args(["-C", &path_text, "config", "--get", "remote.origin.url"])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let actual = String::from_utf8_lossy(&output.stdout);
+    normalize_git_source(&actual) == normalize_git_source(expected)
+}
+
+fn normalize_git_source(source: &str) -> String {
+    source
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_ascii_lowercase()
 }
 
 fn restore_codex_marketplace_backup(backup: &Path, destination: &Path) -> Result<()> {
@@ -9090,8 +10300,60 @@ fn codex_marketplace_registration(
     }
     let value: Value =
         serde_json::from_slice(&output.stdout).context("parsing Codex marketplace list JSON")?;
+    if !json_marketplace_list_shape_is_supported(&value) {
+        bail!(
+            "Codex marketplace list JSON has an unsupported schema; refusing to treat it as an empty registry"
+        );
+    }
     Ok(json_marketplace_registration(&value, marketplace_name)
         .unwrap_or(CodexMarketplaceRegistration::Missing))
+}
+
+/// Return whether the marketplace-list payload has a shape that this client
+/// understands. A schema drift must be an error, never `Missing`, because the
+/// latter authorizes replacing or deleting a user marketplace during install
+/// and recovery. The recursive form accepts the nested `marketplaces` object
+/// used by current Codex builds and the array/direct-object forms covered by
+/// older builds.
+fn json_marketplace_list_shape_is_supported(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .all(|item| matches!(item, Value::Object(_) | Value::Array(_))),
+        Value::Object(object) => {
+            if let Some(marketplaces) = object.get("marketplaces") {
+                return matches!(marketplaces, Value::Array(items)
+                    if items
+                        .iter()
+                        .all(|item| matches!(item, Value::Object(_) | Value::Array(_))));
+            }
+            if let Some(name) = object.get("name").or_else(|| object.get("marketplace")) {
+                return name.is_string();
+            }
+            object.values().any(|child| {
+                matches!(child, Value::Object(_) | Value::Array(_))
+                    && json_marketplace_list_shape_is_supported(child)
+            })
+        }
+        _ => false,
+    }
+}
+
+fn ensure_codex_git_registration(
+    cli: &Path,
+    cwd: &Path,
+    marketplace_name: &str,
+    expected_source: &str,
+) -> Result<()> {
+    match codex_marketplace_registration(cli, cwd, marketplace_name)? {
+        CodexMarketplaceRegistration::Git(actual)
+            if normalize_git_source(&actual) == normalize_git_source(expected_source) => Ok(()),
+        other => bail!(
+            "Codex marketplace {} was not restored as the expected Git source {}; observed {other:?}",
+            marketplace_name,
+            expected_source
+        ),
+    }
 }
 
 fn json_marketplace_registration(
@@ -9282,14 +10544,7 @@ fn prepare_codex_plugin_adapter_at(root: &Path, plugin: &PluginAddon) -> Result<
                 run_codex_adapter_binary(&bun, &["run", "build"], &plugin_root)?;
                 run_codex_adapter_binary(
                     &bun,
-                    &[
-                        "run",
-                        "gen:skill-docs",
-                        "--host",
-                        "codex",
-                        "--model",
-                        "gpt-5.6-sol",
-                    ],
+                    &["run", "gen:skill-docs", "--host", "codex"],
                     &plugin_root,
                 )?;
             }
@@ -9382,19 +10637,326 @@ fn claude_plugin_present(plugin: &PluginAddon) -> bool {
         .unwrap_or(false)
 }
 
+fn claude_plugin_present_checked(plugin: &PluginAddon) -> Result<bool> {
+    let path = crate::client_adapters::home_dir()
+        .join(".claude")
+        .join("plugins")
+        .join("installed_plugins.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+    };
+    let value: Value =
+        serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
+    let root = value
+        .as_object()
+        .ok_or_else(|| anyhow!("{} must contain a JSON object", path.display()))?;
+    let Some(plugins) = root.get("plugins") else {
+        return Ok(false);
+    };
+    let plugins = plugins
+        .as_object()
+        .ok_or_else(|| anyhow!("{}.plugins must be a JSON object", path.display()))?;
+    let Some(entry) = plugins.get(plugin.plugin_ref) else {
+        return Ok(false);
+    };
+    let installs = entry.as_array().ok_or_else(|| {
+        anyhow!(
+            "{}.plugins[{}] must be a JSON array",
+            path.display(),
+            plugin.plugin_ref
+        )
+    })?;
+    Ok(!installs.is_empty())
+}
+
 /// Codex records installs in `~/.codex/config.toml` under a
-/// `[plugins."<plugin>@<marketplace>"]` table. Keys containing `@` are always
-/// quoted, so a header substring match is reliable and avoids a TOML parse
-/// dependency (matching how client_adapters edits this file).
+/// `[plugins."<plugin>@<marketplace>"]` table. A disabled plugin remains
+/// registered with `enabled = false`; that distinction lets uninstall remove
+/// only a plugin that is actually installed while the app's Disable action
+/// keeps the cache and marketplace checkout intact.
 fn codex_plugin_present(plugin: &PluginAddon) -> bool {
-    let Some(path) = dirs::home_dir().map(|h| h.join(".codex").join("config.toml")) else {
-        return false;
+    codex_plugin_present_checked(plugin).unwrap_or(false)
+}
+
+fn codex_plugin_present_checked(plugin: &PluginAddon) -> Result<bool> {
+    let path = crate::client_adapters::codex_home().join("config.toml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
     };
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return false;
+    let root: toml::Value = toml::from_str(&text)
+        .with_context(|| format!("parsing Codex config {}", path.display()))?;
+    let Some(plugins) = root.get("plugins") else {
+        return Ok(false);
     };
-    let header = format!("[plugins.\"{}\"]", plugin.plugin_ref);
-    text.lines().any(|line| line.trim_start() == header)
+    let plugins = plugins.as_table().ok_or_else(|| {
+        anyhow!(
+            "Codex config {} has a non-table plugins value",
+            path.display()
+        )
+    })?;
+    let Some(entry) = plugins.get(plugin.plugin_ref) else {
+        return Ok(false);
+    };
+    if !entry.is_table() {
+        bail!(
+            "Codex config {} has a non-table plugin entry for {}",
+            path.display(),
+            plugin.plugin_ref
+        );
+    }
+    Ok(true)
+}
+
+/// Return the activation state encoded by one Codex plugin table. Codex treats
+/// a missing `enabled` key as enabled, but Headroom writes an explicit value on
+/// every transition so the dashboard and Codex agree after a restart.
+fn codex_plugin_enabled_from_text(content: &str, plugin_ref: &str) -> Result<Option<bool>> {
+    let root: toml::Value = toml::from_str(content).context("parsing Codex config TOML")?;
+    let Some(plugins) = root.get("plugins") else {
+        return Ok(None);
+    };
+    let plugins = plugins
+        .as_table()
+        .context("Codex config plugins value must be a table")?;
+    let Some(entry) = plugins.get(plugin_ref) else {
+        return Ok(None);
+    };
+    let entry = entry
+        .as_table()
+        .with_context(|| format!("Codex plugin entry {plugin_ref} must be a table"))?;
+    match entry.get("enabled") {
+        Some(value) => Ok(Some(value.as_bool().with_context(|| {
+            format!("Codex plugin entry {plugin_ref}.enabled must be a boolean")
+        })?)),
+        None => Ok(Some(true)),
+    }
+}
+
+fn toml_line_body(line: &str) -> (&str, &str) {
+    if let Some(body) = line.strip_suffix("\r\n") {
+        (body, "\r\n")
+    } else if let Some(body) = line.strip_suffix('\n') {
+        (body, "\n")
+    } else {
+        (line, "")
+    }
+}
+
+/// Find a TOML comment marker without treating a `#` inside a quoted string as
+/// a comment. This is intentionally small: it only supports the string forms
+/// needed to preserve an `enabled = true # comment` line and table headers.
+fn toml_comment_start(line: &str) -> Option<usize> {
+    let mut basic = false;
+    let mut literal = false;
+    let mut escaped = false;
+    for (index, ch) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if basic && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        match ch {
+            '"' if !literal => basic = !basic,
+            '\'' if !basic => literal = !literal,
+            '#' if !basic && !literal => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn toml_line_code(line: &str) -> &str {
+    let (body, _) = toml_line_body(line);
+    let end = toml_comment_start(body).unwrap_or(body.len());
+    body[..end].trim()
+}
+
+fn codex_plugin_header_matches(line: &str, plugin_ref: &str) -> bool {
+    let code = toml_line_code(line);
+    code == format!("[plugins.\"{plugin_ref}\"]") || code == format!("[plugins.'{plugin_ref}']")
+}
+
+fn toml_table_header(line: &str) -> bool {
+    let code = toml_line_code(line);
+    code.starts_with('[') && code.ends_with(']')
+}
+
+/// Replace only the boolean value on a direct `enabled = ...` line. The
+/// caller has already parsed the complete document, so a non-boolean value is
+/// reported as an error before this function is reached. Keeping the original
+/// prefix, spacing, comment, and line ending makes the edit safe for configs
+/// users format by hand.
+fn replace_codex_enabled_line(line: &str, enabled: bool) -> Option<String> {
+    let (body, ending) = toml_line_body(line);
+    let code_end = toml_comment_start(body).unwrap_or(body.len());
+    let code = &body[..code_end];
+    let equals = code.find('=')?;
+    let key = code[..equals].trim();
+    let key = key
+        .strip_prefix('"')
+        .and_then(|key| key.strip_suffix('"'))
+        .or_else(|| {
+            key.strip_prefix('\'')
+                .and_then(|key| key.strip_suffix('\''))
+        })
+        .unwrap_or(key);
+    if key != "enabled" {
+        return None;
+    }
+    let value_start = equals + 1;
+    let rhs = &code[value_start..];
+    let leading = rhs.len() - rhs.trim_start().len();
+    let trailing = rhs.trim_end().len();
+    if leading >= trailing {
+        return None;
+    }
+    let start = value_start + leading;
+    let end = value_start + trailing;
+    let mut updated = String::with_capacity(line.len() + 1);
+    updated.push_str(&body[..start]);
+    updated.push_str(if enabled { "true" } else { "false" });
+    updated.push_str(&body[end..]);
+    updated.push_str(ending);
+    Some(updated)
+}
+
+/// Render a Codex config with one managed plugin's activation flag changed.
+/// This function never creates a missing plugin table: callers must first
+/// prove ownership and registration, so an unexpected config shape fails
+/// closed instead of mutating a similarly named user entry.
+fn render_codex_plugin_enabled(
+    content: &str,
+    plugin_ref: &str,
+    enabled: bool,
+) -> Result<Option<String>> {
+    let current = codex_plugin_enabled_from_text(content, plugin_ref)?;
+    let Some(_current) = current else {
+        bail!("Codex plugin {plugin_ref} is not registered");
+    };
+    // An omitted key has Codex's enabled-by-default meaning. Still materialize
+    // `enabled = true` so a later Disable transition has a stable line to edit.
+
+    let lines: Vec<&str> = content.split_inclusive('\n').collect();
+    let target_start = lines
+        .iter()
+        .position(|line| codex_plugin_header_matches(line, plugin_ref))
+        .ok_or_else(|| {
+            anyhow!("Codex plugin {plugin_ref} is registered in an unsupported inline-table form")
+        })?;
+    let target_end = lines
+        .iter()
+        .enumerate()
+        .skip(target_start + 1)
+        .find_map(|(index, line)| toml_table_header(line).then_some(index))
+        .unwrap_or(lines.len());
+
+    let mut out = String::with_capacity(content.len() + 24);
+    let mut replaced = false;
+    for (index, line) in lines.iter().enumerate() {
+        if index == target_start {
+            out.push_str(line);
+            continue;
+        }
+        if index > target_start && index < target_end {
+            if let Some(updated) = replace_codex_enabled_line(line, enabled) {
+                out.push_str(&updated);
+                replaced = true;
+                continue;
+            }
+        }
+        out.push_str(line);
+    }
+
+    if !replaced {
+        let insertion = if target_start < lines.len() {
+            let (_, ending) = toml_line_body(lines[target_start]);
+            if ending.is_empty() {
+                format!("\nenabled = {}", if enabled { "true" } else { "false" })
+            } else {
+                format!(
+                    "enabled = {}{ending}",
+                    if enabled { "true" } else { "false" }
+                )
+            }
+        } else {
+            unreachable!("target_start came from lines");
+        };
+        let mut rebuilt = String::with_capacity(out.len() + insertion.len());
+        for (index, line) in lines.iter().enumerate() {
+            if index == target_start {
+                rebuilt.push_str(line);
+                rebuilt.push_str(&insertion);
+            } else {
+                rebuilt.push_str(line);
+            }
+        }
+        out = rebuilt;
+    }
+
+    if out == content {
+        return Ok(None);
+    }
+    let parsed: toml::Value =
+        toml::from_str(&out).context("rewritten Codex config is invalid TOML")?;
+    let parsed_enabled = parsed
+        .get("plugins")
+        .and_then(toml::Value::as_table)
+        .and_then(|plugins| plugins.get(plugin_ref))
+        .and_then(toml::Value::as_table)
+        .and_then(|entry| entry.get("enabled"))
+        .and_then(toml::Value::as_bool);
+    if parsed_enabled != Some(enabled) {
+        bail!("rewritten Codex plugin {plugin_ref} did not receive enabled = {enabled}");
+    }
+    Ok(Some(out))
+}
+
+/// Atomically persist one Codex plugin activation transition. Codex may write
+/// config.toml while the desktop is changing it, so re-read before publishing
+/// and verify after the rename; a changed file is merged and retried rather
+/// than blindly overwriting a concurrent user update.
+fn set_codex_plugin_enabled(plugin: &PluginAddon, enabled: bool) -> Result<()> {
+    const MAX_ATTEMPTS: usize = 3;
+    let path = crate::client_adapters::codex_home().join("config.toml");
+    for attempt in 0..MAX_ATTEMPTS {
+        let existing = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading Codex config {}", path.display()))?;
+        let Some(updated) = render_codex_plugin_enabled(&existing, plugin.plugin_ref, enabled)?
+        else {
+            return Ok(());
+        };
+        // Detect a Codex/user write that happened during rendering. The final
+        // verify below closes the remaining rename race and causes a retry.
+        if std::fs::read_to_string(&path)
+            .with_context(|| format!("checking Codex config {}", path.display()))?
+            != existing
+        {
+            continue;
+        }
+        let _ = crate::client_adapters::backup_if_exists(&path)?;
+        crate::client_adapters::atomic_write(&path, updated.as_bytes())
+            .with_context(|| format!("writing Codex config {}", path.display()))?;
+        let verify = std::fs::read_to_string(&path)
+            .with_context(|| format!("verifying Codex config {}", path.display()))?;
+        if codex_plugin_enabled_from_text(&verify, plugin.plugin_ref)? == Some(enabled) {
+            return Ok(());
+        }
+        if attempt + 1 == MAX_ATTEMPTS {
+            break;
+        }
+    }
+    bail!(
+        "Codex config {} changed while toggling plugin {}; please retry",
+        path.display(),
+        plugin.id
+    )
 }
 
 /// One serena tool application logs exactly one line containing this marker
@@ -9712,7 +11274,7 @@ fn global_git_excludes_path() -> Option<PathBuf> {
         .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .filter(|path| !path.is_empty());
-    let home = dirs::home_dir()?;
+    let home = crate::client_adapters::home_dir();
     Some(match configured {
         Some(path) => match path.strip_prefix("~/") {
             Some(rest) => home.join(rest),
@@ -9776,13 +11338,34 @@ fn set_serena_global_gitignore(present: bool) {
     let Some(path) = global_git_excludes_path() else {
         return;
     };
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(existing) => existing,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            // Never replace an unreadable excludes file with an empty one: it
+            // may contain user-owned patterns that we cannot safely recover.
+            log::warn!(
+                "serena: reading global git excludes {} failed; leaving it untouched: {err:#}",
+                path.display()
+            );
+            return;
+        }
+    };
     let Some(updated) = apply_serena_gitignore(&existing, present) else {
         return;
     };
     if let Some(parent) = path.parent() {
         if let Err(err) = std::fs::create_dir_all(parent) {
             log::info!("serena: creating {} failed: {err:#}", parent.display());
+            return;
+        }
+    }
+    if path.exists() {
+        if let Err(err) = crate::client_adapters::backup_if_exists(&path) {
+            log::warn!(
+                "serena: preserving global git excludes {} failed; leaving it untouched: {err:#}",
+                path.display()
+            );
             return;
         }
     }
@@ -9841,7 +11424,7 @@ fn apply_serena_dashboard_interface(existing: &str) -> Option<String> {
 fn set_serena_browser_dashboard() {
     let home_dir = std::env::var_os("SERENA_HOME")
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".serena")));
+        .or_else(|| Some(crate::client_adapters::home_dir().join(".serena")));
     let Some(dir) = home_dir else {
         return;
     };
@@ -9862,6 +11445,15 @@ fn set_serena_browser_dashboard() {
     if let Err(err) = std::fs::create_dir_all(&dir) {
         log::info!("serena: creating {} failed: {err:#}", dir.display());
         return;
+    }
+    if path.exists() {
+        if let Err(err) = crate::client_adapters::backup_if_exists(&path) {
+            log::warn!(
+                "serena: preserving {} failed; leaving it untouched: {err:#}",
+                path.display()
+            );
+            return;
+        }
     }
     if let Err(err) = crate::client_adapters::atomic_write(&path, updated.as_bytes()) {
         log::info!("serena: updating {} failed: {err:#}", path.display());
@@ -9891,9 +11483,7 @@ fn installed_plugin_version(plugin: &PluginAddon) -> Option<String> {
         return None;
     }
 
-    let codex_tmp = crate::client_adapters::home_dir()
-        .join(".codex")
-        .join(".tmp");
+    let codex_tmp = crate::client_adapters::codex_home().join(".tmp");
     plugin_version_from_codex_cache(plugin, &codex_tmp)
 }
 
@@ -10101,11 +11691,20 @@ fn write_headroom_to_claude_json_at(path: &Path, entrypoint: &Path, proxy_url: &
         let _ = crate::client_adapters::backup_if_exists(path)?;
 
         // Publish atomically (tmp + rename) so a crash mid-write can never
-        // leave a truncated ~/.claude.json behind.
-        let mut tmp = path.as_os_str().to_os_string();
-        tmp.push(".headroom-local-community-tmp");
-        let tmp = PathBuf::from(tmp);
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&config)?)
+        // leave a truncated ~/.claude.json behind. Give each writer its own
+        // temporary name: a fixed sibling lets two concurrent repairs rename
+        // one another's file or fail with ENOENT.
+        static MCP_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = MCP_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut tmp_os = path.as_os_str().to_os_string();
+        tmp_os.push(format!(
+            ".headroom-local-community-tmp.{}.{}",
+            std::process::id(),
+            n
+        ));
+        let tmp = PathBuf::from(tmp_os);
+        let serialized = serde_json::to_vec_pretty(&config)?;
+        crate::client_adapters::atomic_write(&tmp, &serialized)
             .with_context(|| format!("writing {}", tmp.display()))?;
 
         if modified_time(path) != seen_modified && attempt + 1 < MAX_ATTEMPTS {
@@ -12113,20 +13712,37 @@ fn output_savings_ledger_path() -> Option<PathBuf> {
 
 /// Core of [`purge_legacy_output_savings_control_arm_once`]: given the ledger bytes, return
 /// rewritten bytes when a non-empty `control` arm was cleared, else `None`
-/// (missing/empty control, or unparseable input we must not clobber).
-fn ledger_bytes_without_control(bytes: &[u8]) -> Option<Vec<u8>> {
-    let mut ledger = serde_json::from_slice::<Value>(bytes).ok()?;
-    let has_control = ledger
-        .get("control")
-        .and_then(Value::as_object)
-        .is_some_and(|c| !c.is_empty());
+/// (missing/empty control). Parse and serialization failures are returned so
+/// the caller can leave the ledger and its once-only stamp untouched.
+fn ledger_bytes_without_control(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    let mut ledger =
+        serde_json::from_slice::<Value>(bytes).context("parsing output_savings ledger")?;
+    // A syntactically valid JSON scalar/array is still an invalid ledger
+    // schema. Treat it as an unresolved persistence boundary so the caller
+    // leaves the source and retry stamp untouched rather than recording a
+    // successful purge against data it could not safely interpret.
+    if !ledger.is_object() {
+        bail!("output_savings ledger must be a JSON object");
+    }
+    let has_control = match ledger.get("control") {
+        None => false,
+        Some(control) => {
+            let control = control.as_object().ok_or_else(|| {
+                anyhow!("output_savings ledger control arm must be a JSON object")
+            })?;
+            !control.is_empty()
+        }
+    };
     if !has_control {
-        return None;
+        return Ok(None);
     }
     ledger
-        .as_object_mut()?
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("output_savings ledger must be a JSON object"))?
         .insert("control".to_string(), json!({}));
-    serde_json::to_vec(&ledger).ok()
+    Ok(Some(
+        serde_json::to_vec(&ledger).context("serializing output_savings ledger")?,
+    ))
 }
 
 /// Drop the output-shaper A/B control arm left over from the abandoned 1%
@@ -12156,7 +13772,16 @@ fn purge_legacy_output_savings_control_arm_once() {
     let Ok(bytes) = std::fs::read(&path) else {
         return;
     };
-    if let Some(out) = ledger_bytes_without_control(&bytes) {
+    let rewritten = match ledger_bytes_without_control(&bytes) {
+        Ok(rewritten) => rewritten,
+        Err(err) => {
+            log::warn!(
+                "[tool_manager] refusing to mark output_savings control-arm purge complete: {err:#}"
+            );
+            return;
+        }
+    };
+    if let Some(out) = rewritten {
         if let Err(err) = crate::client_adapters::atomic_write(&path, &out) {
             log::warn!("[tool_manager] purging output_savings control arm failed: {err}");
             // Leave the stamp unwritten so the next spawn retries; a failed
@@ -12923,7 +14548,8 @@ mod tests {
         bootstrap_requirements_lock_for_target, build_command, cc_switch_reconcile_for_runtime,
         classify_kompress_prefetch_failure, codebase_memory_distribution_artifact,
         compact_pip_failure, describe_proxy_port_occupant, diagnose_proxy_port, exe_path_is_under,
-        extract_required_pydantic_core_version, format_all_foreign_bail,
+        explain_host_marketplace_missing_plugin, extract_required_pydantic_core_version,
+        format_all_foreign_bail,
         format_already_running_bail, headroom_entrypoint_startup_args,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
@@ -12933,9 +14559,10 @@ mod tests {
         plugin_install_failure_category, pre_upstream_concurrency, probe_backend_readyz_ok,
         proxy_argv_contains_expected_flags, purge_legacy_output_savings_control_arm_once,
         read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
-        reclaim_orphan_proxy, redact_sensitive, requirements_lock_sha, rtk_distribution_artifact,
-        run_command, sanitize_log_variant, savings_profile_for_runtime, settle_unowned_port,
-        sha256_bytes, summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
+        reclaim_orphan_proxy, redact_sensitive, render_codex_plugin_enabled, requirements_lock_sha,
+        rtk_distribution_artifact, run_command, sanitize_log_variant, savings_profile_for_runtime,
+        set_codex_plugin_enabled, settle_unowned_port, sha256_bytes,
+        summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
         write_codex_compat_marketplace_manifest_at, CommandFailure, HeadroomRelease,
         ManagedRuntime, PipOutputCapture, PluginHost, PortState, ToolManager, UpgradeOutcome,
         ATOMIC_REBUILD_FLOOR_VERSION, HEADROOM_LINUX_REQUIREMENTS_LOCK, HEADROOM_PINNED_VERSION,
@@ -13146,16 +14773,30 @@ No actionable patterns found.
         // Non-empty control -> rewrite with control emptied; baseline/treatment kept.
         let with_control =
             br#"{"baseline":{"glob":{"n":5}},"treatment":{"k":{"n":3}},"control":{"k":{"n":2}}}"#;
-        let out = ledger_bytes_without_control(with_control).expect("rewrite when control present");
+        let out = ledger_bytes_without_control(with_control)
+            .expect("parse/rewrite ledger")
+            .expect("rewrite when control present");
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["control"].as_object().unwrap().len(), 0);
         assert_eq!(v["treatment"]["k"]["n"], 3);
         assert_eq!(v["baseline"]["glob"]["n"], 5);
 
         // Empty control, absent control, and unparseable input -> no rewrite.
-        assert!(ledger_bytes_without_control(br#"{"control":{}}"#).is_none());
-        assert!(ledger_bytes_without_control(br#"{"treatment":{"k":{"n":1}}}"#).is_none());
-        assert!(ledger_bytes_without_control(b"{not json").is_none());
+        assert!(ledger_bytes_without_control(br#"{"control":{}}"#)
+            .expect("parse empty control")
+            .is_none());
+        assert!(
+            ledger_bytes_without_control(br#"{"treatment":{"k":{"n":1}}}"#)
+                .expect("parse missing control")
+                .is_none()
+        );
+        assert!(ledger_bytes_without_control(b"{not json").is_err());
+        // Valid JSON with the wrong root schema must not be treated as a
+        // missing control arm: the purge caller must leave its retry stamp
+        // untouched until the ledger can be repaired or replaced safely.
+        assert!(ledger_bytes_without_control(br#"[]"#).is_err());
+        assert!(ledger_bytes_without_control(br#"null"#).is_err());
+        assert!(ledger_bytes_without_control(br#"{"control":[]}"#).is_err());
     }
 
     #[test]
@@ -15539,6 +17180,127 @@ after
     }
 
     #[test]
+    fn codex_adapter_marker_requires_matching_plugin_identity() {
+        let root = tempfile::tempdir().expect("marker root");
+        let plugin = super::PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "allinluna")
+            .expect("All in Luna addon");
+        let marker_root = root.path().join(plugin.marketplace_name);
+        fs::create_dir_all(&marker_root).expect("marker directory");
+        let marker = marker_root.join(".headroom-local-community-adapter.json");
+
+        fs::write(
+            &marker,
+            serde_json::to_vec(&json!({
+                "id": "another-plugin",
+                "source": plugin.source_url
+            }))
+            .expect("serialize forged marker"),
+        )
+        .expect("write forged marker");
+        let err = super::codex_adapter_marker_is_owned(&marker_root, plugin)
+            .expect_err("forged marker must be rejected");
+        assert!(format!("{err:#}").contains("does not match"));
+
+        fs::write(
+            &marker,
+            serde_json::to_vec(&json!({
+                "id": plugin.id,
+                "source": plugin.source_url
+            }))
+            .expect("serialize valid marker"),
+        )
+        .expect("write valid marker");
+        assert!(
+            super::codex_adapter_marker_is_owned(&marker_root, plugin).expect("read valid marker")
+        );
+    }
+
+    #[test]
+    fn cleanup_fresh_codex_adapter_checkout_requires_owned_marker() {
+        let root = tempfile::tempdir().expect("marker root");
+        let plugin = super::PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "allinluna")
+            .expect("All in Luna addon");
+        let checkout = root.path().join(plugin.marketplace_name);
+        fs::create_dir_all(&checkout).expect("checkout directory");
+        let marker = checkout.join(".headroom-local-community-adapter.json");
+
+        fs::write(
+            &marker,
+            serde_json::to_vec(&json!({
+                "id": "another-plugin",
+                "source": plugin.source_url
+            }))
+            .expect("serialize forged marker"),
+        )
+        .expect("write forged marker");
+        super::cleanup_fresh_codex_adapter_checkout(&checkout, plugin)
+            .expect("forged marker must leave checkout untouched");
+        assert!(checkout.exists());
+
+        fs::write(
+            &marker,
+            serde_json::to_vec(&json!({
+                "id": plugin.id,
+                "source": plugin.source_url
+            }))
+            .expect("serialize owned marker"),
+        )
+        .expect("write owned marker");
+        super::cleanup_fresh_codex_adapter_checkout(&checkout, plugin)
+            .expect("owned checkout cleanup");
+        assert!(!checkout.exists());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn codex_marketplace_migration_requires_matching_git_remote() {
+        let (root, _runtime, _manager) = seed_test_runtime("plugin-migration-remote");
+        let _home = HomeGuard::new(&root);
+        let plugin = PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "allinluna")
+            .expect("All in Luna addon");
+        let source = crate::client_adapters::codex_home()
+            .join(".tmp/marketplaces")
+            .join(plugin.marketplace_name);
+        fs::create_dir_all(&source).expect("marketplace directory");
+        let source_text = source.to_string_lossy().into_owned();
+        let init = crate::proc::command("git")
+            .args(["init", "--quiet", &source_text])
+            .output()
+            .expect("git init");
+        assert!(init.status.success(), "git init failed: {init:?}");
+        let remote = crate::proc::command("git")
+            .args([
+                "-C",
+                &source_text,
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/another-owner/another-marketplace.git",
+            ])
+            .output()
+            .expect("git remote add");
+        assert!(remote.status.success(), "git remote add failed: {remote:?}");
+
+        let registration = super::CodexMarketplaceRegistration::Git(plugin.source_url.into());
+        let err = super::migrate_unmanaged_codex_marketplace(plugin, &registration)
+            .expect_err("mismatched remote must not be moved");
+        assert!(format!("{err:#}").contains("does not match"));
+        assert!(source.exists(), "mismatched checkout must remain in place");
+        assert!(
+            !source.with_file_name("allinluna.headroom-legacy").exists(),
+            "mismatched checkout must not create a recovery backup"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn codex_marketplace_backup_restore_moves_original_back() {
         let root = tempfile::tempdir().expect("tempdir");
         let destination = root.path().join("allinluna");
@@ -15647,6 +17409,25 @@ after
             super::json_marketplace_registration(&local, "missing"),
             None
         );
+    }
+
+    #[test]
+    fn codex_marketplace_list_schema_drift_is_not_treated_as_empty() {
+        assert!(super::json_marketplace_list_shape_is_supported(&json!({
+            "marketplaces": []
+        })));
+        assert!(super::json_marketplace_list_shape_is_supported(&json!([
+            {"name": "other", "sourceType": "git"}
+        ])));
+        assert!(!super::json_marketplace_list_shape_is_supported(&json!({
+            "marketplaces": {}
+        })));
+        assert!(!super::json_marketplace_list_shape_is_supported(&json!({
+            "unexpected": "schema"
+        })));
+        assert!(!super::json_marketplace_list_shape_is_supported(&json!(
+            null
+        )));
     }
 
     #[cfg(unix)]
@@ -15774,7 +17555,9 @@ after
             assert!(body.contains(r".codex\.tmp\marketplaces\allinluna"));
             assert!(body.contains(r".claude\plugins\marketplaces\allinluna"));
         } else {
-            assert!(body.contains(".codex/.tmp/marketplaces/allinluna"));
+            assert!(body.contains("CODEX_HOME"));
+            assert!(body.contains("codex_root"));
+            assert!(body.contains(".tmp/marketplaces/allinluna"));
             assert!(body.contains(".claude/plugins/marketplaces/allinluna"));
         }
         let required_python = if cfg!(target_os = "windows") {
@@ -16663,6 +18446,24 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
     }
 
     #[test]
+    fn malformed_upgrade_marker_is_preserved_for_recovery() {
+        let (root, _runtime, manager) = seed_test_runtime("marker-malformed");
+        let marker = manager.upgrade_marker_path();
+        fs::write(&marker, br#"["#).expect("malformed marker");
+
+        assert!(
+            !manager.recover_from_interrupted_upgrade(),
+            "malformed marker must stop recovery rather than guessing"
+        );
+        assert!(marker.exists(), "malformed marker must remain for repair");
+        assert!(
+            manager.read_in_place_marker().is_none(),
+            "compatibility reader reports no usable in-place marker"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn update_headroom_receipt_after_in_place_upgrade_rewrites_artifact() {
         // Guards the legacy-sha migration path. When LEGACY_REQUIREMENTS_LOCK_SHAS
         // is empty (current state after the 0.19.0 lock regen), there is no
@@ -17410,6 +19211,84 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
 
     #[test]
     #[serial_test::serial]
+    #[cfg(unix)] // exercises a fake Codex shell binary; Windows cannot exec it
+    fn successful_codex_command_survives_cache_normalization_failure() {
+        let (root, _runtime, manager) = seed_test_runtime("plugin-cmd-cache-normalization");
+        let _home = HomeGuard::new(&root);
+        let plugin = PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "stop-that-shit")
+            .expect("Stop That Shit addon");
+
+        // A syntactically invalid copied manifest makes the post-command
+        // normalization fail. The CLI command itself still exits successfully;
+        // run_plugin_cmd must preserve that committed result so callers do not
+        // attempt a compensating rollback against an already-mutated registry.
+        let cached_manifest = root
+            .join(".codex/plugins/cache")
+            .join(plugin.marketplace_name)
+            .join(plugin.id)
+            .join("test-version/.codex-plugin/plugin.json");
+        fs::create_dir_all(cached_manifest.parent().expect("manifest parent"))
+            .expect("cache manifest parent");
+        fs::write(&cached_manifest, b"{not valid json").expect("corrupt cached manifest");
+
+        let cli = root.join("fake-codex");
+        write_executable(&cli, "#!/bin/sh\nexit 0\n");
+        manager
+            .run_plugin_cmd(plugin, &cli, PluginHost::Codex, &["plugin", "add", "x"])
+            .expect("a successful Codex command must remain successful");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_plugin_paths_follow_custom_codex_home() {
+        let (root, _runtime, manager) = seed_test_runtime("plugin-custom-codex-home");
+        let custom_codex_home = root.join("codex-home");
+
+        {
+            // HomeGuard serializes environment-sensitive tests and keeps the
+            // real user profile out of plugin path resolution.
+            let _home = HomeGuard::new(&root);
+            std::env::set_var("CODEX_HOME", &custom_codex_home);
+
+            let plugin = super::plugin_addon("allinluna").expect("All in Luna plugin");
+            let package_root = custom_codex_home
+                .join(".tmp")
+                .join("marketplaces")
+                .join("allinluna");
+            assert_eq!(
+                manager.marketplace_package_root(plugin),
+                package_root,
+                "marketplace roots must use CODEX_HOME"
+            );
+            assert_eq!(
+                manager.codex_plugin_source_path(plugin),
+                package_root.join("plugins/allinluna"),
+                "plugin source paths must use CODEX_HOME"
+            );
+
+            let runtime = package_root.join("plugins/allinluna/runtime");
+            fs::create_dir_all(runtime.join("allinluna_runtime")).expect("runtime directory");
+            fs::write(
+                runtime.join("allinluna_runtime/__main__.py"),
+                b"# test runtime\n",
+            )
+            .expect("runtime marker");
+            assert_eq!(
+                manager.allinluna_runtime_path(),
+                Some(runtime),
+                "runtime discovery must follow CODEX_HOME"
+            );
+        }
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn smoke_test_plugin_is_noop_when_not_installed() {
         let (root, _runtime, manager) = seed_test_runtime("plugin-smoke-absent");
         let _home = HomeGuard::new(&root);
@@ -17418,6 +19297,111 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
                 .smoke_test_plugin(plugin.id)
                 .expect("no-op when plugin receipt is absent");
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_plugin_toggle_preserves_unrelated_toml_and_inline_comment() {
+        let before = concat!(
+            "model = \"gpt-5\"\n",
+            "\n",
+            "[plugins.\"ponytail@ponytail\"]\n",
+            "source = \"user\"\n",
+            "enabled = true # keep this explanation\n",
+            "\n",
+            "[plugins.\"other@marketplace\"]\n",
+            "enabled = true\n",
+        );
+
+        let after = render_codex_plugin_enabled(before, "ponytail@ponytail", false)
+            .expect("render toggle")
+            .expect("toggle changes config");
+        assert!(
+            after.contains("enabled = false # keep this explanation\n"),
+            "only the boolean value should change: {after:?}"
+        );
+        assert!(
+            after.contains("[plugins.\"other@marketplace\"]\nenabled = true\n"),
+            "unrelated plugin table must remain byte-for-byte present"
+        );
+        let parsed: toml::Value = after.parse().expect("rewritten config parses");
+        assert_eq!(
+            parsed["plugins"]["ponytail@ponytail"]["enabled"].as_bool(),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn codex_plugin_toggle_inserts_explicit_flag_and_keeps_crlf() {
+        let before = concat!(
+            "[plugins.'allinluna@allinluna']\r\n",
+            "source = 'user'\r\n",
+            "[profiles.default]\r\n",
+            "model = 'gpt-5'\r\n",
+        );
+        let after = render_codex_plugin_enabled(before, "allinluna@allinluna", false)
+            .expect("render toggle")
+            .expect("toggle changes config");
+        assert!(
+            after.starts_with(
+                "[plugins.'allinluna@allinluna']\r\nenabled = false\r\nsource = 'user'\r\n"
+            ),
+            "the inserted flag should use the existing line ending: {after:?}"
+        );
+        assert!(after.contains("[profiles.default]\r\nmodel = 'gpt-5'\r\n"));
+        assert_eq!(
+            super::codex_plugin_enabled_from_text(&after, "allinluna@allinluna")
+                .expect("read enabled state"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn codex_plugin_toggle_rejects_missing_or_malformed_registration() {
+        let missing_header = "[plugins]\n\"ponytail@ponytail\" = { enabled = true }\n";
+        assert!(
+            render_codex_plugin_enabled(missing_header, "ponytail@ponytail", false).is_err(),
+            "inline user config must not be rewritten as a managed table"
+        );
+
+        let malformed = "[plugins.\"ponytail@ponytail\"]\nenabled = nope\n";
+        assert!(
+            render_codex_plugin_enabled(malformed, "ponytail@ponytail", false).is_err(),
+            "a non-boolean enabled value must fail closed"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_plugin_toggle_keeps_registration_for_fast_reenable() {
+        let (root, _runtime, _manager) = seed_test_runtime("codex-plugin-toggle");
+        let _home = HomeGuard::new(&root);
+        let plugin = PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "ponytail")
+            .expect("Ponytail addon");
+        let codex_home = root.join(".codex");
+        fs::create_dir_all(&codex_home).expect("Codex home");
+        let config = codex_home.join("config.toml");
+        fs::write(
+            &config,
+            "[plugins.\"ponytail@ponytail\"]\nsource = \"managed\"\nenabled = true\n",
+        )
+        .expect("Codex plugin registration");
+
+        set_codex_plugin_enabled(plugin, false).expect("disable Codex plugin");
+        let disabled = fs::read_to_string(&config).expect("disabled config");
+        assert!(disabled.contains("enabled = false"));
+        assert!(disabled.contains("source = \"managed\""));
+        assert!(
+            super::codex_plugin_present_checked(plugin).expect("presence check"),
+            "Disable must keep the plugin registration for uninstall/re-enable"
+        );
+
+        set_codex_plugin_enabled(plugin, true).expect("re-enable Codex plugin");
+        let enabled = fs::read_to_string(&config).expect("enabled config");
+        assert!(enabled.contains("enabled = true"));
+        assert!(enabled.contains("source = \"managed\""));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -17431,8 +19415,8 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
         for plugin in &PLUGIN_ADDONS {
             let receipt = runtime.tools_dir.join(format!("{}.json", plugin.id));
 
-            // Disabled by the user: hosts without a disable verb (Codex) hold
-            // no registration, so absence is not a failure (RUST-22).
+            // Disabled by the user: the receipt is enough to make the smoke
+            // path a no-op even when the host registry is unavailable.
             fs::write(&receipt, br#"{"version":"latest","enabled":false}"#).expect("receipt");
             manager
                 .smoke_test_plugin(plugin.id)
@@ -17453,9 +19437,10 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
 
     #[test]
     fn plugin_disabled_receipt_reports_installed_not_missing() {
-        // A receipt with enabled:false means the user disabled it via the app.
-        // On hosts without a disable verb the plugin is gone, but the card must
-        // still show "installed" (Enable), not "not installed" (Install).
+        // A receipt with enabled:false means the user disabled it via the app;
+        // the card must still show "installed" (Enable), not "not installed"
+        // (Install), while the host registration remains available for a fast
+        // re-enable.
         let (root, runtime, manager) = seed_test_runtime("plugin-disabled");
         for plugin in &PLUGIN_ADDONS {
             fs::write(
@@ -17485,6 +19470,168 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
                 .uninstall_plugin(plugin.id)
                 .expect("no-op when plugin receipt is absent");
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn malformed_plugin_receipt_is_not_ownership_proof() {
+        let (root, runtime, manager) = seed_test_runtime("plugin-malformed-receipt");
+        let plugin = PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "allinluna")
+            .expect("All in Luna addon");
+        let receipt = runtime.tools_dir.join(format!("{}.json", plugin.id));
+        fs::write(&receipt, b"{this is not json").expect("malformed receipt");
+
+        assert!(
+            !manager.plugin_receipt_exists(plugin),
+            "malformed receipt must not count as ownership"
+        );
+        let err = manager
+            .uninstall_plugin(plugin.id)
+            .expect_err("destructive cleanup must reject malformed ownership data");
+        assert!(
+            err.to_string().contains("ownership receipt is invalid"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            receipt.exists(),
+            "invalid receipt must be preserved for repair"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_plugin_receipt_cannot_authorize_destructive_mutation() {
+        let (root, runtime, manager) = seed_test_runtime("plugin-legacy-receipt");
+        let plugin = PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "allinluna")
+            .expect("All in Luna addon");
+        let receipt = runtime.tools_dir.join(format!("{}.json", plugin.id));
+        fs::write(&receipt, br#"{"version":"latest","enabled":true}"#).expect("legacy receipt");
+
+        let err = manager
+            .uninstall_plugin(plugin.id)
+            .expect_err("legacy receipt must not authorize uninstall");
+        assert!(
+            err.to_string()
+                .contains("legacy receipt lacks explicit Headroom ownership"),
+            "unexpected error: {err:#}"
+        );
+        assert!(receipt.exists(), "legacy receipt must remain for migration");
+
+        let err = manager
+            .set_plugin_enabled(plugin.id, false)
+            .expect_err("legacy receipt must not authorize toggling");
+        assert!(
+            err.to_string()
+                .contains("legacy receipt lacks explicit Headroom ownership"),
+            "unexpected error: {err:#}"
+        );
+        assert!(receipt.exists(), "legacy receipt must remain for migration");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn install_refuses_to_take_over_preexisting_codex_plugin_without_receipt() {
+        let (root, _runtime, manager) = seed_test_runtime("plugin-preexisting-codex");
+        let _home = HomeGuard::new(&root);
+        let codex_home = root.join(".codex");
+        fs::create_dir_all(&codex_home).expect("Codex home");
+        let config = codex_home.join("config.toml");
+        let before = b"[plugins.\"allinluna@allinluna\"]\nsource = \"user\"\n";
+        fs::write(&config, before).expect("user plugin registration");
+        let invoked = root.join("codex-invoked");
+        let codex = root.join(".local/bin/codex");
+        write_executable(
+            &codex,
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\ntouch '{}'\nexit 99\n",
+                invoked.display()
+            ),
+        );
+
+        let err = manager
+            .install_plugin("allinluna")
+            .expect_err("existing user plugin must not be adopted implicitly");
+        assert!(
+            err.to_string().contains("refusing to take over existing"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(fs::read(&config).expect("config bytes"), before);
+        assert!(
+            !invoked.exists(),
+            "preflight refusal must happen before invoking the host CLI"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_marketplace_recovery_marker_roundtrips_atomically() {
+        let (root, _runtime, manager) = seed_test_runtime("plugin-recovery-marker");
+        let _home = HomeGuard::new(&root);
+        let plugin = PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "allinluna")
+            .expect("All in Luna addon");
+        let backup = manager
+            .marketplace_package_root(plugin)
+            .with_file_name("allinluna.headroom-legacy");
+        let recovery = super::CodexMarketplaceRecovery {
+            backup_path: backup.clone(),
+            original_git_source: Some("https://example.invalid/allinluna.git".to_string()),
+            moved: true,
+        };
+        manager
+            .write_codex_marketplace_recovery(plugin, &recovery)
+            .expect("write recovery marker");
+        let loaded = manager
+            .read_codex_marketplace_recovery(plugin)
+            .expect("read recovery marker")
+            .expect("recovery marker exists");
+        assert_eq!(loaded.backup_path, backup);
+        assert_eq!(loaded.original_git_source, recovery.original_git_source);
+        assert!(loaded.moved);
+        manager
+            .clear_codex_marketplace_recovery(plugin)
+            .expect("clear recovery marker");
+        assert!(!manager.codex_marketplace_recovery_path(plugin).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn legacy_codex_marketplace_recovery_marker_defaults_to_moved() {
+        let (root, _runtime, manager) = seed_test_runtime("plugin-recovery-marker-legacy");
+        let _home = HomeGuard::new(&root);
+        let plugin = PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "allinluna")
+            .expect("All in Luna addon");
+        let backup = manager
+            .marketplace_package_root(plugin)
+            .with_file_name("allinluna.headroom-legacy");
+        let marker = manager.codex_marketplace_recovery_path(plugin);
+        // Markers from the first recovery implementation had no `moved` bit;
+        // they were emitted only after the checkout rename, so they must load
+        // as moved=true and remain recoverable after an app upgrade.
+        let legacy = serde_json::json!({
+            "backupPath": backup,
+            "originalGitSource": "https://example.invalid/allinluna.git"
+        });
+        fs::write(
+            &marker,
+            serde_json::to_vec(&legacy).expect("serialize legacy marker"),
+        )
+        .expect("write legacy marker");
+
+        let loaded = manager
+            .read_codex_marketplace_recovery(plugin)
+            .expect("read legacy marker")
+            .expect("legacy marker exists");
+        assert!(loaded.moved, "legacy marker must default to moved=true");
         let _ = fs::remove_dir_all(root);
     }
 
@@ -17878,6 +20025,34 @@ exit 0
         assert!(!backup.exists());
         assert!(!receipt_backup.exists());
         assert!(!marker.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn recover_codebase_memory_pending_rejects_missing_rollback_flags() {
+        let (root, runtime, manager) = seed_test_runtime("codebase-memory-pending-malformed");
+        let destination = manager.codebase_memory_entrypoint();
+        let receipt = runtime.tools_dir.join("codebase-memory.json");
+        let marker = manager.codebase_memory_pending_marker_path();
+        write_executable(&destination, "live binary\n");
+        fs::write(&receipt, br#"{"version":"0.10.8","enabled":true}"#).expect("receipt");
+        fs::write(&marker, br#"{"version":"0.10.8"}"#).expect("incomplete marker");
+
+        let err = manager
+            .recover_codebase_memory_pending()
+            .expect_err("missing rollback flags must stop recovery");
+        assert!(
+            format!("{err:#}").contains("missing required hadDestination"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            fs::read(&destination).expect("live binary"),
+            b"live binary\n"
+        );
+        assert!(receipt.exists(), "receipt must remain untouched");
+        assert!(marker.exists(), "incomplete marker must remain for repair");
 
         let _ = fs::remove_dir_all(root);
     }
@@ -18285,6 +20460,74 @@ exit 0
         assert!(
             seen.len() >= 5,
             "the five RUST-6K shapes must land in distinct buckets, got: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn host_marketplace_missing_plugin_gains_a_cause_and_a_fix() {
+        // The user's report: Update on Superpowers returned the bare CLI line
+        // every single time. Codex prepares `openai-curated` itself, so the
+        // only useful thing to say is why it is empty and what resolves it.
+        let plugin = PLUGIN_ADDONS
+            .iter()
+            .find(|p| p.id == "superpowers")
+            .expect("superpowers addon");
+        let raw = anyhow::anyhow!(
+            "command failed (exit 1): codex plugin add superpowers@openai-curated\n\
+             stdout:\n\nstderr:\nError: plugin `superpowers` was not found in marketplace \
+             `openai-curated`"
+        );
+
+        let explained = explain_host_marketplace_missing_plugin(plugin, raw);
+        let message = explained.to_string();
+        assert!(
+            message.contains("has not finished preparing its built-in `openai-curated` marketplace"),
+            "the cause must be named, got: {message}"
+        );
+        assert!(
+            message.contains("Open the Codex app once"),
+            "the fix must be actionable, got: {message}"
+        );
+
+        // The CLI text has to survive the rewrite: it is the needle the Sentry
+        // category matches on, so bucketing must not change.
+        let chained = format!(
+            "{:#}",
+            explain_host_marketplace_missing_plugin(
+                plugin,
+                anyhow::anyhow!(
+                    "stderr:\nError: plugin `superpowers` was not found in marketplace `openai-curated`"
+                ),
+            )
+        );
+        assert!(
+            chained.contains("not found in marketplace"),
+            "raw CLI text must stay in the chain, got: {chained}"
+        );
+        assert_eq!(plugin_install_failure_category(&chained), "marketplace-missing");
+
+        // Unrelated failures from the same addon pass through untouched --
+        // otherwise a network error would tell the user to open Codex.
+        let other = explain_host_marketplace_missing_plugin(
+            plugin,
+            anyhow::anyhow!("network is unreachable"),
+        );
+        assert!(
+            !other.to_string().contains("Open the Codex app once"),
+            "only the marketplace-miss shape is rewritten, got: {other}"
+        );
+        // And it is scoped to the addon whose marketplace the host owns.
+        let ponytail = PLUGIN_ADDONS
+            .iter()
+            .find(|p| p.id == "ponytail")
+            .expect("ponytail addon");
+        let untouched = explain_host_marketplace_missing_plugin(
+            ponytail,
+            anyhow::anyhow!("Error: plugin `ponytail` was not found in marketplace `ponytail`"),
+        );
+        assert!(
+            !untouched.to_string().contains("Open the Codex app once"),
+            "Headroom registers ponytail's marketplace itself, so it keeps the raw error, got: {untouched}"
         );
     }
 

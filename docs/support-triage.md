@@ -38,6 +38,8 @@ choke on comments or `?`/`()` when the user pastes it.
 
   echo "=== Proxy reachable ==="
   curl -s -o /dev/null -w "6867 intercept: HTTP %{http_code}\n" http://127.0.0.1:6867/readyz || echo "6867 connection refused"
+  curl -s http://127.0.0.1:6891/__headroom_codex_router_health 2>/dev/null \
+    || echo "6891 Codex router unavailable"
 
   echo "=== Per-request proxy errors (~/.headroom/logs/proxy.log) ==="
   grep -iE "error|status=4|status=5| 401|refus|upstream" ~/.headroom/logs/proxy.log 2>/dev/null | tail -30
@@ -54,7 +56,7 @@ choke on comments or `?`/`()` when the user pastes it.
 | version | matches current release | old build with a since-fixed bug |
 | Claude config | `settings.json OK` + `ANTHROPIC_BASE_URL=http://127.0.0.1:6867` | `INVALID` = corrupt file blocks the write; wrong/absent URL = not routing, or a gateway (Bedrock/corp proxy) override |
 | `which claude` | a real path | empty = installed via a PATH the GUI can't see, so the toggle is greyed out |
-| Codex config | `model_provider = "headroom"`, `base_url = ...6867` | wrong provider/base_url = Codex not routing through Headroom (works, just unoptimized) |
+| Codex config | `model_provider = "headroom_local_community"` plus a `6891` router URL (`/v1` for an OpenAI API key or `/backend-api/codex` for ChatGPT OAuth) | wrong provider/base URL = Codex is not using the stable fail-open router |
 | Proxy reachable | any HTTP code (200/503) | `connection refused` = app not running |
 | logs | quiet | `client setup failed` = enable bug; `gate`/`401`/trial-ended = the account is gated, not broken |
 

@@ -45,7 +45,7 @@ If enabled, have Claude call `mcp__headroom__headroom_retrieve` with any small q
 Click the tray icon, open the dashboard. Expect savings chart and per-client stats render without a blank/error state.
 
 ### 6. Pause / resume cleanly strips and restores interception
-In Settings, toggle Pause then Resume. After Pause, `grep -c headroom-rtk-rewrite "$USERPROFILE/.claude/settings.json"` should return `0`; after Resume it should return `1`. This verifies the Claude Code config only — Pause clears *all* clients, so check C4 in the Codex pass confirms Codex's config is stripped and restored too.
+In Settings, toggle Pause then Resume. After Pause, `grep -c headroom-rtk-rewrite "$USERPROFILE/.claude/settings.json"` should return `0`; after Resume it should return `1`. This verifies the Claude Code config only. Codex deliberately keeps its stable `6891` route during Pause; check C4 confirms that its detached router switches to direct mode and back instead.
 
 ### 7. Proxy is actively optimizing this conversation (not just a heartbeat)
 The proxy always runs in `token` mode now (`HEADROOM_MODE=token`, hardcoded). The compression policy is chosen per request by the auth-mode classifier from the client `User-Agent`: Claude Code subscription/OAuth traffic (UA `claude-code/`) is classified `SUBSCRIPTION` → conservative policy; pay-per-token API-key / Codex traffic is classified `PAYG`/`OAUTH` → aggressive policy, so `requests_compressed` and `total_tokens_removed` move directly.
@@ -102,17 +102,17 @@ Expect: non-zero hook references for RTK rewrite and markitdown, and the hook sc
 
 ## Codex checks (Codex pass)
 
-Run these from a Codex CLI session. Codex routes through Headroom via an `OPENAI_BASE_URL` shell export plus a managed provider block in `%USERPROFILE%\.codex\config.toml`, and its traffic is pay-per-token, so the proxy runs it in `token` mode.
+Run these from a Codex CLI session. Codex uses a stable local router at `127.0.0.1:6891`; while Headroom is healthy it relays to the Rust intercept on `6867`, and when Headroom is paused, closed, or crashed it forwards to the native provider. The router is configured via an `OPENAI_BASE_URL` shell export plus a managed provider block in `%USERPROFILE%\.codex\config.toml`, and its traffic is pay-per-token, so the proxy runs it in `token` mode.
 
 ### C1. Codex is configured to route through Headroom
 ```bash
-grep -q 'model_provider = "headroom"' "$USERPROFILE/.codex/config.toml" && \
-  grep -q 'openai_base_url = "http://127.0.0.1:6867/v1"' "$USERPROFILE/.codex/config.toml" && \
-  grep -qF '[model_providers.headroom]' "$USERPROFILE/.codex/config.toml" && \
+grep -q 'model_provider = "headroom_local_community"' "$USERPROFILE/.codex/config.toml" && \
+  grep -Eq 'openai_base_url = "http://127.0.0.1:6891/(v1|backend-api/codex)"' "$USERPROFILE/.codex/config.toml" && \
+  grep -qF '[model_providers.headroom_local_community]' "$USERPROFILE/.codex/config.toml" && \
   grep -q 'supports_websockets = false' "$USERPROFILE/.codex/config.toml" && \
   echo PASS || echo FAIL
 ```
-Expect: `PASS`.
+Expect: `PASS`. An OpenAI API-key profile uses `/v1`; a ChatGPT OAuth profile uses `/backend-api/codex`.
 
 ### C2. Codex traffic is actively optimized (token mode)
 1. Capture the baseline:
@@ -127,12 +127,14 @@ Expect: `mode` is `token`, `primary_model` is a `gpt-*` model, `requests_compres
 ### C3. Codex savings are attributed on the dashboard
 Open the dashboard and confirm a **Codex** group appears in the per-provider savings with non-zero values. Provider `openai` maps to the Codex group.
 
-### C4. Pause / resume cleanly strips and restores Codex routing
+### C4. Pause / resume keeps the stable Codex route and switches its mode
 In Settings, toggle Pause then Resume, checking after each:
 ```bash
-grep -c 'headroom:codex_cli' "$USERPROFILE/.codex/config.toml"
+grep -c 'headroom-local-community:codex_cli' "$USERPROFILE/.codex/config.toml"
+grep -nE 'openai_base_url = "http://127.0.0.1:6891/(v1|backend-api/codex)"' "$USERPROFILE/.codex/config.toml"
+curl -s http://127.0.0.1:6891/__headroom_codex_router_health
 ```
-Expect: after Pause it prints `0`; after Resume it is non-zero (back to `4` marker lines).
+Expect: the marker and `6891` URL remain present; after Pause the health endpoint prints `direct`, and after Resume it prints `proxy` once 6867/readyz is healthy. An explicit Disconnect Codex action removes the managed config.
 
 ## Inspecting the proxy directly
 

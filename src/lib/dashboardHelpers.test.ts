@@ -309,6 +309,30 @@ describe("dashboard helpers", () => {
     expect(connectorStatusLine({ ...base, lastConfiguredAt: null }, now)).toBeNull();
     expect(connectorStatusLine({ ...base, enabled: false }, now)).toBeNull();
 
+    // Another tool owning the Codex route is a coexist state, not a failure:
+    // report who owns it and how to take over, and do not unlock the restart
+    // action (`note`, not `restart`).
+    expect(
+      connectorStatusLine(
+        {
+          ...base,
+          verified: false,
+          verification: {
+            clientId: "codex",
+            verified: false,
+            proxyReachable: true,
+            checks: [],
+            failures: [],
+            foreignProvider: "codex_local_access"
+          }
+        },
+        now
+      )
+    ).toEqual({
+      text: "Codex routing is currently handled by codex_local_access, so Headroom is not intercepting. Turn this connector off and on to route Codex through Headroom.",
+      tone: "note"
+    });
+
     const staleCodex = {
       ...base,
       installed: true,

@@ -138,7 +138,6 @@ import {
   compactNumber,
   connectorDashboardStatus,
   connectorStatusLine,
-  shouldAutoRestartCodex,
   currency,
   currencyExact,
   dayOfMonthTickFormatter,
@@ -392,12 +391,18 @@ function localizeUiText(t: Translate, value: string): string {
   if (notDetected) return t("connections.notDetectedInstall", { name: notDetected[1] });
   const verifyPrompt = value.match(/^Run one (.+) prompt and verify activity appears in Headroom\.$/);
   if (verifyPrompt) return t("connections.setup.verifyPrompt", { name: verifyPrompt[1] });
+  const foreignProvider = value.match(
+    /^Codex routing is currently handled by (.+), so Headroom is not intercepting\. Turn this connector off and on to route Codex through Headroom\.$/
+  );
+  if (foreignProvider) {
+    return t("connections.foreignProviderStatus", { provider: foreignProvider[1] });
+  }
   const exact: Record<string, TranslationKey> = {
     "Client was already configured for Headroom.": "connections.setup.alreadyConfigured",
     "Client configuration updated to route through Headroom.": "connections.setup.updated",
     "Your shell profile (e.g. ~/.zshrc) couldn't be updated - it isn't writable, or it isn't valid UTF-8 text. Core routing still works via the client's own config; to launch the client from a terminal, fix the file and re-run setup, or add the export manually.": "connections.setup.shellProfileUnwritable",
     "Restart your terminal/editor session to pick up environment changes.": "connections.setup.restartSession",
-    "Quit and reopen any Codex desktop app, CLI, or IDE sessions to load the managed provider.": "connections.setup.reopenCodex",
+    "After first setup, quit and reopen any Codex desktop, CLI, or IDE session once to load the stable route; later Headroom pauses or crashes do not require a Codex restart.": "connections.setup.reopenCodex",
     "In Codex, run /hooks and trust the Headroom routing guard so it can warn you if routing breaks (re-trust if Headroom updates the guard).": "connections.setup.trustCodexGuard",
     "Found Claude Code ANTHROPIC_BASE_URL export in managed shell block.": "connections.verification.claudeShellFound",
     "Found Headroom-managed RTK PATH export in shell profiles.": "connections.verification.rtkPathFound",
@@ -3150,7 +3155,8 @@ export default function App() {
   async function handleAutoLearnToggle(nextEnabled: boolean) {
     setAutoLearnBusy(true);
     try {
-      // The proxy restarts inside this command, so it can take a moment.
+      // Persist the preference without stopping an active proxy request. The
+      // next normal proxy start picks up the flag.
       const enabled = await invoke<boolean>("set_auto_learn_enabled", { enabled: nextEnabled });
       setAutoLearnEnabled(enabled);
     } catch (error) {
@@ -5105,12 +5111,27 @@ export default function App() {
     if (connectorsBusy || codexRestartBusy) {
       return;
     }
+    // A different tool may own the Codex route right now (its own root
+    // `model_provider`). Taking it over replaces that tool's provider, so ask
+    // first: Headroom records the displaced provider and restores it when the
+    // connector is disabled again.
+    const foreignProvider = nextEnabled
+      ? connector.verification?.foreignProvider ?? null
+      : null;
+    if (
+      foreignProvider &&
+      !window.confirm(t("connections.setup.takeoverConfirm", { provider: foreignProvider }))
+    ) {
+      return;
+    }
+    const allowTakeover = Boolean(foreignProvider);
     setConnectorsBusy(true);
     setConnectorsError(null);
     try {
       if (nextEnabled) {
         const result = await invoke<ClientSetupResult>("apply_client_setup", {
           clientId: connector.clientId,
+          allowTakeover,
         });
         setConnectorsNotice(localizedClientSetupNotice(t, connector.name, result));
       } else {
@@ -5122,15 +5143,10 @@ export default function App() {
       applyDashboardIfChanged(latestDashboard);
       const latestConnectors = await fetchConnectors();
       applyConnectorsIfChanged(latestConnectors);
-      if (
-        shouldAutoRestartCodex(
-          connector.clientId,
-          nextEnabled,
-          latestConnectors
-        )
-      ) {
-        await restartCodexDesktop();
-      }
+      // Applying a connector changes on-disk routing, but must not terminate
+      // an active Codex desktop session behind the user's back. The setup
+      // notice and the existing manual button tell the user when a reopen is
+      // required; they can choose a safe time for it.
     } catch (error) {
       setConnectorsError(
         describeInvokeError(error, "Failed to update connector.")
@@ -8407,6 +8423,13 @@ export default function App() {
                                   × {localizeUiText(t, failure)}
                                         </li>
                                       ))}
+                                      {connector.verification.foreignProvider ? (
+                                        <li className="is-note" key="foreign-provider">
+                                  • {t("connections.verification.codexForeignProvider", {
+                                            provider: connector.verification.foreignProvider,
+                                          })}
+                                        </li>
+                                      ) : null}
                                       {!connector.verification.proxyReachable ? (
                                         <li className="is-waiting">
                                           … {t("connections.proxyNotAnswering")}

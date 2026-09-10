@@ -1,6 +1,6 @@
-# Headroom Local Community
+# Headroom-desktop (free)
 
-> GitHub 项目：[`OneBigMoon/Headroom-desktop-CN`](https://github.com/OneBigMoon/Headroom-desktop-CN)
+> GitHub 项目：[`OneBigMoon/Headroom-desktop`](https://github.com/OneBigMoon/Headroom-desktop)
 
 Headroom Local Community is an unofficial, local-only desktop edition derived
 from the MIT-licensed
@@ -10,7 +10,7 @@ by any upstream paid Headroom product.
 
 ## 下载
 
-从 [GitHub Releases](https://github.com/OneBigMoon/Headroom-desktop-CN/releases/latest) 下载：macOS 使用稳定版 universal DMG；Windows 11 x64 preview（预览版）使用同一 Release 中的 NSIS `.exe` 安装包。
+从 [GitHub Releases](https://github.com/OneBigMoon/Headroom-desktop/releases/latest) 下载：macOS 使用稳定版 universal DMG；Windows 11 x64 preview（预览版）使用同一 Release 中的 NSIS `.exe` 安装包。
 
 This fork keeps the open-source local proxy, client connectors, token and
 savings dashboard, RTK, MarkItDown, and local add-on management. It does not
@@ -47,16 +47,55 @@ key or OAuth authentication. The proxy and headroom-ai state stay local.
 ## How it works
 
 ```text
-Claude Code / Codex / OpenCode
+Claude Code / OpenCode
   | ANTHROPIC_BASE_URL=http://127.0.0.1:6867
-  | OPENAI_BASE_URL=http://127.0.0.1:6867/v1
+  | provider base URL=http://127.0.0.1:6867/v1
   v
 Rust intercept proxy :6867
   v
 Managed headroom-ai backend :6868-6890
   v
 The same upstream API selected by the coding client
+
+Codex (OpenAI API key)
+  | stable provider URL=http://127.0.0.1:6891/v1
+Codex (ChatGPT OAuth)
+  | stable provider URL=http://127.0.0.1:6891/backend-api/codex
+  v
+Detached Codex router :6891
+  | Headroom running + heartbeat -> Rust intercept :6867
+  | Headroom paused/closed/crashed -> native OpenAI or ChatGPT Codex API
 ```
+
+Codex keeps the same loopback provider URL throughout this switch. The
+detached router changes only its next hop: a healthy Headroom heartbeat enables
+optimization through `:6867`; a paused, closed, or crashed Headroom process
+leaves the router running in direct mode, so an already-running Codex session
+does not need its configuration rewritten.
+
+### Codex plugin boundary and controls
+
+Headroom's Codex integration is a provider/router connector, not a standard
+Codex plugin. Codex plugins are designed to bundle Skills, MCP servers, and
+lifecycle hooks; they do not sit in front of Codex's model-provider request
+transport. The routing switch therefore lives in Headroom's connector control
+and the detached `:6891` router:
+
+| State | Codex route | Headroom process |
+|---|---|---|
+| Connector enabled and heartbeat healthy | `:6891` → Headroom intercept `:6867` | running |
+| Paused, disconnected, closed, or heartbeat expired | `:6891` → native OpenAI/ChatGPT endpoint | not required |
+| Explicit uninstall | managed provider, shell export, guard hook, and router removed | removed |
+
+Headroom's marketplace plugin cards use the same control model as Codex's
+plugin browser. Enabling or disabling a Codex plugin edits its registered
+`[plugins."plugin@marketplace"]` `enabled` value and keeps the installed cache;
+uninstalling is the separate action that removes the bundle. Codex loads plugin
+Skills and tools for a new chat or session, so an already-running conversation
+keeps the capabilities it already resolved. See the [Codex plugin
+documentation](https://learn.chatgpt.com/docs/plugins), [MCP configuration
+documentation](https://learn.chatgpt.com/docs/extend/mcp), and [provider
+configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
 
 Anonymous headroom-ai telemetry, Sentry, Aptabase, account APIs, and the
 official updater are disabled in this edition.

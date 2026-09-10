@@ -1,10 +1,10 @@
 # macOS 安装、签名与自动更新说明
 
-Headroom Local Community（GitHub 项目：[`OneBigMoon/Headroom-desktop-CN`](https://github.com/OneBigMoon/Headroom-desktop-CN)）是非官方社区版本，不包含官方付费服务、官方签名证书或官方更新通道。
+Headroom Local Community（GitHub 项目：[`OneBigMoon/Headroom-desktop`](https://github.com/OneBigMoon/Headroom-desktop)）是非官方免费社区版本，不包含官方付费服务、官方签名证书或官方更新通道。
 
 ## 推荐安装方式
 
-1. 从 [GitHub Releases](https://github.com/OneBigMoon/Headroom-desktop-CN/releases/latest) 下载最新稳定版 DMG。
+1. 从 [GitHub Releases](https://github.com/OneBigMoon/Headroom-desktop/releases/latest) 下载最新稳定版 DMG。
 2. 打开 DMG，把 `Headroom Local Community.app` 拖入“应用程序”。
 3. 首次启动优先在 Finder 中右键应用并选择“打开”。
 
@@ -24,8 +24,8 @@ codesign --verify --deep --strict --verbose=2 "/Applications/Headroom Local Comm
 ## 本机从源码构建
 
 ```bash
-git clone https://github.com/OneBigMoon/Headroom-desktop-CN.git
-cd Headroom-desktop-CN
+git clone https://github.com/OneBigMoon/Headroom-desktop.git
+cd Headroom-desktop
 npm ci
 npm run build:mac:local
 ```
@@ -42,7 +42,7 @@ src-tauri/target/release/bundle/dmg/Headroom Local Community_<版本>_<架构>.d
 Tauri updater 使用 Community 独立发布密钥，更新地址为：
 
 ```text
-https://github.com/OneBigMoon/Headroom-desktop-CN/releases/latest/download/latest.json
+https://github.com/OneBigMoon/Headroom-desktop/releases/latest/download/latest.json
 ```
 
 应用不会静默安装更新；下载和安装前会显示确认。私钥只能保存在发布者本机或 GitHub Secrets，不能提交到仓库。

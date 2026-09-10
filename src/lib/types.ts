@@ -247,6 +247,13 @@ export interface ClientSetupVerification {
   proxyReachable: boolean;
   checks: string[];
   failures: string[];
+  /**
+   * Set when another tool owns the Codex route (its own root `model_provider`).
+   * Headroom deliberately stands aside instead of clobbering it, so this is a
+   * coexist state: the UI shows it as a neutral note plus an explicit takeover,
+   * never as a broken setup.
+   */
+  foreignProvider?: string | null;
 }
 
 /// Test overrides read from HEADROOM_FAKE_* env vars by the Rust side. Every

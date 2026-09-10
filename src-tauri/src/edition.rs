@@ -62,6 +62,10 @@ mod tests {
 
     #[test]
     fn runtime_env_overrides_telemetry_and_uses_community_model_cache() {
+        // Other integration tests temporarily redirect HOME to hermetic
+        // profiles. Serialize this read of the process-global environment so
+        // the expected cache path cannot straddle another test's HOME swap.
+        let _home_lock = crate::test_env_lock::lock_home();
         let mut command = crate::proc::command("headroom-ai");
         command
             .env("HEADROOM_TELEMETRY", "on")

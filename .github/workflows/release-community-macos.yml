@@ -127,7 +127,7 @@ jobs:
       - name: Build universal app and DMG
         shell: bash
         env:
-          HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/OneBigMoon/Headroom-desktop-CN/releases/latest/download/latest.json"]'
+          HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/OneBigMoon/Headroom-desktop/releases/latest/download/latest.json"]'
           HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
         run: |
           set -euo pipefail
@@ -243,7 +243,7 @@ jobs:
       - name: Build NSIS installer and updater archive
         shell: bash
         env:
-          HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/OneBigMoon/Headroom-desktop-CN/releases/latest/download/latest.json"]'
+          HEADROOM_UPDATER_ENDPOINTS: '["https://github.com/OneBigMoon/Headroom-desktop/releases/latest/download/latest.json"]'
           HEADROOM_UPDATER_PUBLIC_KEY: ${{ vars.HEADROOM_UPDATER_PUBLIC_KEY }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}

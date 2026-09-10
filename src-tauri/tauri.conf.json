@@ -62,7 +62,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEYzQjlBMTUwODdBN0UxQ0EKUldUSzRhZUhVS0c1ODRjaWVYSDg1UUdpMlJiREM3SjZBSlE2bnlCVDM3OXdNUnBWMmI0bUY1d3IK",
       "endpoints": [
-        "https://github.com/OneBigMoon/Headroom-desktop-CN/releases/latest/download/latest.json"
+        "https://github.com/OneBigMoon/Headroom-desktop/releases/latest/download/latest.json"
       ]
     }
   },

@@ -53,6 +53,11 @@ struct LocalPricingState {
     /// auth-silent alarm (backend reachable, Bearer channel dead).
     #[serde(default)]
     last_account_sync_ok_at: Option<DateTime<Utc>>,
+    /// Runtime-only write barrier. Set when a corrupt local state file could
+    /// not be quarantined; keep the source intact until it is removed or
+    /// repaired rather than replacing it with a reset grace clock.
+    #[serde(skip)]
+    persistence_blocked: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -2234,7 +2239,7 @@ fn resolve_tier_mismatch(
                     if let Ok(mut local) = load_or_initialize_local_state() {
                         if local.mismatch_since.is_some() {
                             local.mismatch_since = None;
-                            let _ = write_local_state(&local);
+                            let _ = write_local_state(&mut local);
                         }
                     }
                 }
@@ -2248,7 +2253,7 @@ fn resolve_tier_mismatch(
         None => {
             let now = Utc::now();
             local.mismatch_since = Some(now);
-            let _ = write_local_state(&local);
+            let _ = write_local_state(&mut local);
             now
         }
     };
@@ -3331,40 +3336,55 @@ pub fn refresh_paywall_first_flag() {
     if let Ok(mut local) = load_or_initialize_local_state() {
         if local.paywall_first != Some(config.paywall_first) {
             local.paywall_first = Some(config.paywall_first);
-            let _ = write_local_state(&local);
+            let _ = write_local_state(&mut local);
         }
     }
 }
 
 fn load_or_initialize_local_state() -> Result<LocalPricingState, String> {
     let path = local_state_path();
+    let mut persistence_blocked = false;
     if let Ok(bytes) = std::fs::read(&path) {
         match serde_json::from_slice::<LocalPricingState>(&bytes) {
             Ok(state) => return Ok(state),
             // Only reachable now for a truncated/non-JSON file: every field
             // defaults, so a schema change alone parses. write_local_state
             // below would overwrite it, so keep a copy first.
-            Err(err) => crate::client_adapters::quarantine_unparsable(
-                &path,
-                &format!("pricing state: {err}"),
-            ),
+            Err(err) => {
+                persistence_blocked = path.exists()
+                    && !crate::client_adapters::quarantine_unparsable(
+                        &path,
+                        &format!("pricing state: {err}"),
+                    );
+            }
         }
+    } else if path.exists() {
+        // A non-NotFound read failure leaves the source in place. Do not let
+        // the fresh fallback overwrite it on the next write.
+        persistence_blocked = true;
     }
 
-    let state = LocalPricingState {
+    let mut state = LocalPricingState {
         first_seen_at: Utc::now(),
         reconcile_with_server: true,
         mismatch_since: None,
         paywall_first: None,
         last_server_contact_at: None,
         last_account_sync_ok_at: None,
+        persistence_blocked,
     };
-    write_local_state(&state)?;
+    write_local_state(&mut state)?;
     Ok(state)
 }
 
-fn write_local_state(state: &LocalPricingState) -> Result<(), String> {
+fn write_local_state(state: &mut LocalPricingState) -> Result<(), String> {
     let path = local_state_path();
+    if state.persistence_blocked && path.exists() {
+        return Err(format!(
+            "Refusing to replace pricing state {} because its recovery copy could not be created",
+            path.display()
+        ));
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| {
             format!(
@@ -3384,7 +3404,9 @@ fn write_local_state(state: &LocalPricingState) -> Result<(), String> {
     // context is only "writing <tmp path>". Display alone dropped the io::Error
     // underneath, so Sentry RUST-6R reported a truncated message that could not
     // distinguish ENOSPC from EACCES.
-    .map_err(|err| format!("Failed to write pricing state {}: {err:#}", path.display()))
+    .map_err(|err| format!("Failed to write pricing state {}: {err:#}", path.display()))?;
+    state.persistence_blocked = false;
+    Ok(())
 }
 
 /// Minimum spacing between grace/start POSTs from one process.
@@ -3461,7 +3483,7 @@ fn reconcile_local_state_with_server(state: &AppState) -> Result<LocalPricingSta
             {
                 local.first_seen_at = new_first_seen;
                 local.reconcile_with_server = false;
-                if let Err(err) = write_local_state(&local) {
+                if let Err(err) = write_local_state(&mut local) {
                     sentry::capture_message(
                         // {err:#} not {err}: atomic_write puts the rename's os
                         // error in the anyhow chain as a source, but {err} shows
@@ -3767,6 +3789,7 @@ mod tests {
             paywall_first: None,
             last_server_contact_at: stale,
             last_account_sync_ok_at: stale,
+            persistence_blocked: false,
         };
 
         // Network class: no backend contact for 30h -> server alarm only.

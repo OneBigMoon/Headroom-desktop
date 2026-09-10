@@ -1,7 +1,7 @@
 import type { Translate } from "./i18n";
 
 export const PROJECT_ISSUES_NEW_URL =
-  "https://github.com/OneBigMoon/Headroom-desktop-CN/issues/new";
+  "https://github.com/OneBigMoon/Headroom-desktop/issues/new";
 
 export function platformPreviewNoticeFor(
   platform: string | undefined,

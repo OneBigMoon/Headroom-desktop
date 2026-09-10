@@ -9,6 +9,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -40,9 +41,32 @@ fn marker_path() -> PathBuf {
     config_file(&app_data_dir(), MARKER_FILE)
 }
 
+fn read_at_checked(path: &Path) -> Result<Option<PortConflictMarker>> {
+    let raw = match fs::read(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+    };
+    serde_json::from_slice(&raw)
+        .with_context(|| format!("parsing port-conflict marker {}", path.display()))
+        .map(Some)
+}
+
 fn read_at(path: &Path) -> Option<PortConflictMarker> {
-    let raw = fs::read(path).ok()?;
-    serde_json::from_slice(&raw).ok()
+    match read_at_checked(path) {
+        Ok(marker) => marker,
+        Err(err) => {
+            // Marker telemetry is optional, but an unreadable marker must not
+            // be mistaken for an empty one and overwritten without a recovery
+            // copy. Keep it in place until a later explicit repair can inspect
+            // it.
+            log::warn!(
+                "could not read port-conflict marker {}; leaving it untouched: {err:#}",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 fn write_at(path: &Path, marker: &PortConflictMarker) -> anyhow::Result<()> {
@@ -54,9 +78,27 @@ fn write_at(path: &Path, marker: &PortConflictMarker) -> anyhow::Result<()> {
 }
 
 fn clear_at(path: &Path) -> Option<PortConflictMarker> {
-    let prior = read_at(path);
-    let _ = fs::remove_file(path);
-    prior
+    let prior = match read_at_checked(path) {
+        Ok(prior) => prior,
+        Err(err) => {
+            log::warn!(
+                "cleanup: port-conflict marker {} is unreadable; leaving it untouched: {err:#}",
+                path.display()
+            );
+            return None;
+        }
+    }?;
+    match fs::remove_file(path) {
+        Ok(()) => Some(prior),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(prior),
+        Err(err) => {
+            log::warn!(
+                "cleanup: removing port-conflict marker {} failed; leaving it for retry: {err}",
+                path.display()
+            );
+            None
+        }
+    }
 }
 
 fn clear_marker() -> Option<PortConflictMarker> {
@@ -110,7 +152,34 @@ fn record_failure_at(
     now: DateTime<Utc>,
 ) -> anyhow::Result<PortConflictMarker> {
     let (cmd, pid) = parse_occupant(err_chain);
-    let prior = read_at(path);
+    let prior = match read_at_checked(path) {
+        Ok(prior) => prior,
+        Err(err) => {
+            // A malformed marker is still user/runtime state. Preserve its
+            // exact bytes before starting a fresh conflict record, and abort
+            // the write if that recovery copy cannot be made.
+            match crate::client_adapters::backup_if_exists(path) {
+                Ok(Some(backup)) => log::warn!(
+                    "port-conflict marker {} was unreadable ({err:#}); preserved original at {}",
+                    path.display(),
+                    backup.display()
+                ),
+                Ok(None) => log::warn!(
+                    "port-conflict marker {} disappeared while it was being read; starting fresh",
+                    path.display()
+                ),
+                Err(backup_err) => {
+                    return Err(backup_err).with_context(|| {
+                        format!(
+                            "preserving unreadable port-conflict marker {} before replacement",
+                            path.display()
+                        )
+                    });
+                }
+            }
+            None
+        }
+    };
 
     let marker = match prior {
         Some(prior) => {

@@ -239,6 +239,9 @@ pub struct ActivityFacts {
     last_weekly_recap: Option<WeeklyRecapEvent>,
     last_train_suggestion: Option<TrainSuggestionEvent>,
     dirty: bool,
+    /// Set when a rejected source file could not be preserved. While the
+    /// source remains present, save_if_dirty must refuse to replace it.
+    persistence_blocked: bool,
 }
 
 impl ActivityFacts {
@@ -250,12 +253,16 @@ impl ActivityFacts {
 
         // Pre-v2 schemas accumulated full request/response bodies in two
         // queues and could grow into the 100s of MB. Refuse to even load
-        // those — drop the file and start fresh. Keeps boot fast and the
-        // IPC hot path unblocked.
+        // those, but preserve a rollback copy before resetting. Keeping the
+        // original bytes is part of the persistence contract: a size guard
+        // must not become an irreversible data-loss path.
         if let Ok(metadata) = std::fs::metadata(&path) {
             if metadata.len() > MAX_FACTS_FILE_BYTES {
-                let _ = std::fs::remove_file(&path);
-                return Ok(Self::empty(path));
+                let blocked =
+                    preserve_before_reset(&path, "file exceeds the activity-facts size limit");
+                let mut fresh = Self::empty(path);
+                fresh.persistence_blocked = blocked;
+                return Ok(fresh);
             }
         }
 
@@ -265,7 +272,10 @@ impl ActivityFacts {
             Ok(bytes) => bytes,
             Err(err) => {
                 log::warn!("activity-facts.json unreadable ({err}); starting fresh");
-                return Ok(Self::empty(path));
+                let blocked = preserve_before_reset(&path, "unreadable activity-facts file");
+                let mut fresh = Self::empty(path);
+                fresh.persistence_blocked = blocked;
+                return Ok(fresh);
             }
         };
         // A corrupt file (e.g. truncated by a crash mid-write) must never
@@ -276,14 +286,23 @@ impl ActivityFacts {
             Ok(persisted) => persisted,
             Err(err) => {
                 log::warn!("activity-facts.json is corrupt ({err}); starting fresh");
-                let _ = std::fs::remove_file(&path);
-                return Ok(Self::empty(path));
+                let blocked = preserve_before_reset(&path, "corrupt activity-facts JSON");
+                let mut fresh = Self::empty(path);
+                fresh.persistence_blocked = blocked;
+                return Ok(fresh);
             }
         };
         if persisted.schema_version != SCHEMA_VERSION {
-            // Best-effort delete so the next save replaces the stale file
-            // outright rather than silently leaving the old payload behind.
-            let _ = std::fs::remove_file(&path);
+            // Preserve the old payload before the next save publishes the
+            // current schema. A schema migration may discard tile slots, but
+            // it must never make the pre-migration bytes unrecoverable.
+            let blocked = preserve_before_reset(
+                &path,
+                &format!(
+                    "activity-facts schema {} (expected {})",
+                    persisted.schema_version, SCHEMA_VERSION
+                ),
+            );
             // Salvage the format-agnostic bookkeeping: schema bumps reshape
             // the *tile slots*, but the record counters, recap dedupe keys,
             // and fire-once sets are stable scalars — wiping them used to
@@ -297,6 +316,7 @@ impl ActivityFacts {
             carried.train_suggestions_fired = persisted.train_suggestions_fired;
             carried.stale_train_suggestions_fired_at = persisted.stale_train_suggestions_fired_at;
             carried.dirty = true;
+            carried.persistence_blocked = blocked;
             return Ok(carried);
         }
 
@@ -318,6 +338,7 @@ impl ActivityFacts {
             last_weekly_recap: persisted.last_weekly_recap,
             last_train_suggestion: persisted.last_train_suggestion,
             dirty: false,
+            persistence_blocked: false,
         })
     }
 
@@ -340,6 +361,7 @@ impl ActivityFacts {
             last_weekly_recap: None,
             last_train_suggestion: None,
             dirty: false,
+            persistence_blocked: false,
         }
     }
 
@@ -869,6 +891,17 @@ impl ActivityFacts {
         if !self.dirty {
             return Ok(());
         }
+        if self.persistence_blocked {
+            if self.path.exists() {
+                return Err(anyhow::anyhow!(
+                    "refusing to replace {} because its recovery copy could not be created",
+                    self.path.display()
+                ));
+            }
+            // The source disappeared out-of-band. There is no remaining file
+            // whose bytes could be destroyed, so a later save may proceed.
+            self.persistence_blocked = false;
+        }
         let persisted = PersistedActivityFacts {
             schema_version: SCHEMA_VERSION,
             all_time_record_tokens: self.all_time_record_tokens,
@@ -894,6 +927,36 @@ impl ActivityFacts {
         crate::client_adapters::atomic_write(&self.path, &bytes)?;
         self.dirty = false;
         Ok(())
+    }
+}
+
+/// Keep a recoverable copy before an oversized, corrupt, or stale activity
+/// facts file is reset. If the backup cannot be made, leave the source in
+/// place so a later write cannot silently destroy the only copy.
+fn preserve_before_reset(path: &Path, reason: &str) -> bool {
+    match crate::client_adapters::backup_if_exists(path) {
+        Ok(Some(backup)) => {
+            log::warn!(
+                "preserving {} before reset ({reason}); rollback copy: {}",
+                path.display(),
+                backup.display()
+            );
+            false
+        }
+        Ok(None) => {
+            log::warn!(
+                "reset requested for {} ({reason}), but no source file was present",
+                path.display()
+            );
+            false
+        }
+        Err(err) => {
+            log::error!(
+                "could not preserve {} before reset ({reason}); leaving original untouched: {err:#}",
+                path.display()
+            );
+            true
+        }
     }
 }
 
@@ -931,11 +994,63 @@ mod tests {
         let base = dir.path().to_path_buf();
         let path = base.join("config").join("activity-facts.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, b"{\"schemaVersion\": 3, trunc").unwrap();
+        let original = b"{\"schemaVersion\": 3, trunc";
+        std::fs::write(&path, original).unwrap();
 
         let facts = ActivityFacts::load_or_create(&base).expect("corrupt file must not error");
         assert_eq!(facts.all_time_record_tokens, 0);
-        assert!(!path.exists(), "corrupt file is removed for a fresh start");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let backups: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("activity-facts.json.headroom-local-community-backup-")
+                    })
+            })
+            .collect();
+        assert!(
+            backups.iter().any(|backup| std::fs::read(backup)
+                .map(|bytes| bytes == original)
+                .unwrap_or(false)),
+            "corrupt file must retain a byte-preserving rollback copy"
+        );
+    }
+
+    #[test]
+    fn oversized_file_is_preserved_before_reset() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().to_path_buf();
+        let path = base.join("config").join("activity-facts.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = vec![b'x'; MAX_FACTS_FILE_BYTES as usize + 1];
+        std::fs::write(&path, &original).unwrap();
+
+        let facts = ActivityFacts::load_or_create(&base).expect("oversized file must not error");
+        assert_eq!(facts.all_time_record_tokens, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .any(|backup| {
+                    backup
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with("activity-facts.json.headroom-local-community-backup-")
+                        })
+                        && std::fs::read(backup)
+                            .map(|bytes| bytes == original)
+                            .unwrap_or(false)
+                }),
+            "oversized file must retain a byte-preserving rollback copy"
+        );
     }
 
     #[test]
@@ -947,11 +1062,9 @@ mod tests {
         // An old-schema file: tile slots are stale, but the record counter and
         // recap dedupe key must survive the bump instead of re-firing
         // notifications and zeroing all-time records fleet-wide.
-        std::fs::write(
-            &path,
-            br#"{"schemaVersion": 3, "allTimeRecordTokens": 91234, "lastWeeklyRecapWeekKey": "2026-W26"}"#,
-        )
-        .unwrap();
+        let original =
+            br#"{"schemaVersion": 3, "allTimeRecordTokens": 91234, "lastWeeklyRecapWeekKey": "2026-W26"}"#;
+        std::fs::write(&path, original).unwrap();
 
         let facts = ActivityFacts::load_or_create(&base).expect("mismatch must not error");
         assert_eq!(facts.all_time_record_tokens, 91234);
@@ -962,6 +1075,25 @@ mod tests {
         assert!(
             facts.last_transformation.is_none(),
             "tile slots from the old schema are dropped"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .any(|backup| {
+                    backup
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with("activity-facts.json.headroom-local-community-backup-")
+                        })
+                        && std::fs::read(backup)
+                            .map(|bytes| bytes == original)
+                            .unwrap_or(false)
+                }),
+            "schema migration must retain a byte-preserving rollback copy"
         );
     }
 

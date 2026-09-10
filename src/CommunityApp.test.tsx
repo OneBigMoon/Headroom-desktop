@@ -17,6 +17,7 @@ import { mockDashboard } from "./lib/mockData";
 import type { AppliedPatterns, ClientConnectorStatus, DashboardState, HeadroomLearnStatus, RuntimeStatus } from "./lib/types";
 
 let connectorEnabled = false;
+let connectorForeignProvider: string | null = null;
 let rtkInstalled = false;
 let rtkEnabled = false;
 let cavemanInstalled = true;
@@ -184,7 +185,17 @@ function connectorsState(): ClientConnectorStatus[] {
       name: "Codex",
       installed: true,
       enabled: connectorEnabled,
-      verified: connectorEnabled,
+      verified: connectorEnabled && !connectorForeignProvider,
+      verification: connectorForeignProvider
+        ? {
+            clientId: "codex",
+            verified: false,
+            proxyReachable: true,
+            checks: [],
+            failures: [],
+            foreignProvider: connectorForeignProvider,
+          }
+        : undefined,
     },
   ];
 }
@@ -213,6 +224,7 @@ beforeEach(() => {
   document.documentElement.lang = "";
   setNavigatorLanguages(["en-US"]);
   connectorEnabled = false;
+  connectorForeignProvider = null;
   rtkInstalled = false;
   rtkEnabled = false;
   cavemanInstalled = true;
@@ -378,13 +390,56 @@ describe("CommunityApp", () => {
     await user.click(await screen.findByRole("button", { name: "Connect" }));
 
     await waitFor(() => {
-      expect(invokeMock).toHaveBeenCalledWith("apply_client_setup", { clientId: "codex" });
+      expect(invokeMock).toHaveBeenCalledWith("apply_client_setup", {
+        clientId: "codex",
+        allowTakeover: false,
+      });
     });
 
     await user.click(await screen.findByRole("button", { name: "Disconnect" }));
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("disable_client_setup", { clientId: "codex" });
     });
+  });
+
+  it("asks for confirmation before taking over a Codex route owned by another tool", async () => {
+    connectorForeignProvider = "codex_local_access";
+    const confirmMock = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const user = userEvent.setup();
+    renderCommunityApp();
+
+    await screen.findByText("Proxy online");
+    await user.click(screen.getByRole("button", { name: "Connections" }));
+    await user.click(await screen.findByRole("button", { name: "Connect" }));
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("apply_client_setup", {
+        clientId: "codex",
+        allowTakeover: true,
+      });
+    });
+    expect(confirmMock).toHaveBeenCalledTimes(1);
+    confirmMock.mockRestore();
+  });
+
+  it("leaves another tool's Codex route untouched when the takeover is declined", async () => {
+    connectorForeignProvider = "codex_local_access";
+    const confirmMock = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const user = userEvent.setup();
+    renderCommunityApp();
+
+    await screen.findByText("Proxy online");
+    await user.click(screen.getByRole("button", { name: "Connections" }));
+    await user.click(await screen.findByRole("button", { name: "Connect" }));
+
+    await waitFor(() => {
+      expect(confirmMock).toHaveBeenCalledTimes(1);
+    });
+    expect(invokeMock).not.toHaveBeenCalledWith("apply_client_setup", {
+      clientId: "codex",
+      allowTakeover: true,
+    });
+    confirmMock.mockRestore();
   });
 
   it("installs and toggles a local tool", async () => {
