@@ -63,9 +63,36 @@ const ALLINLUNA: UpdateSource = UpdateSource::GithubPluginManifest {
 const OPENSPEC: UpdateSource = UpdateSource::GithubRelease {
     repository: "Fission-AI/OpenSpec",
 };
-const SUPERPOWERS: UpdateSource = UpdateSource::GithubRelease {
-    repository: "obra/superpowers",
-};
+/// Addons whose content is delivered by a marketplace Headroom does not own,
+/// so it can neither read their release cadence nor force a refresh.
+///
+/// `superpowers` installs from Codex's own `openai-curated` marketplace:
+/// `codex plugin marketplace upgrade` refuses every source that is not a Git
+/// checkout, and Codex syncs that snapshot on its own schedule. Comparing the
+/// installed version against obra/superpowers' GitHub release therefore
+/// advertised an update that a click could not deliver -- the click
+/// reinstalled whatever the curated snapshot currently held, Headroom
+/// reported "updated", and the offer came straight back (2026-09-10, the
+/// user's report after several rounds of this: installed 5.0.7, offered
+/// 6.3.0, unchanged after "Superpowers 已更新。"). Nothing Headroom can do
+/// advances that version, so the card reports it without an update action;
+/// Codex updates the curated plugin as its snapshot moves.
+const HOST_MANAGED_ADDONS: &[&str] = &["superpowers"];
+
+/// Whether Headroom can deliver an update for this addon.
+fn tracks_updates(id: &str) -> bool {
+    !HOST_MANAGED_ADDONS.contains(&id)
+}
+
+/// A host-managed addon still needs an answer so the card stops showing a
+/// spinner; `None` with no error is "not tracked here", not "check failed".
+fn host_managed_check(id: &'static str) -> AddonUpdateCheck {
+    AddonUpdateCheck {
+        id,
+        latest_version: None,
+        error: None,
+    }
+}
 const GSTACK: UpdateSource = UpdateSource::GithubPackageJson {
     repository: "garrytan/gstack",
 };
@@ -224,10 +251,18 @@ pub async fn check_all() -> Vec<AddonUpdateCheck> {
                 "grill-me",
             ]
             .into_iter()
-            .map(|id| AddonUpdateCheck {
-                id,
-                latest_version: None,
-                error: Some(message.clone()),
+            .map(|id| {
+                if tracks_updates(id) {
+                    AddonUpdateCheck {
+                        id,
+                        latest_version: None,
+                        error: Some(message.clone()),
+                    }
+                } else {
+                    // A host-managed addon is not checked at all, so a broken
+                    // HTTP client is not its problem to report.
+                    host_managed_check(id)
+                }
             })
             .collect();
         }
@@ -261,7 +296,8 @@ pub async fn check_all() -> Vec<AddonUpdateCheck> {
         check_one(&client, "caveman", CAVEMAN),
         check_one(&client, "allinluna", ALLINLUNA),
         check_one(&client, "openspec", OPENSPEC),
-        check_one(&client, "superpowers", SUPERPOWERS),
+        // Not checked: host-managed (see HOST_MANAGED_ADDONS).
+        async { host_managed_check("superpowers") },
         check_one(&client, "gstack", GSTACK),
         check_one(&client, "ralph-loop", RALPH_LOOP),
         check_one(&client, "stop-that-shit", STOP_THAT_SHIT),
@@ -291,10 +327,44 @@ pub async fn check_all() -> Vec<AddonUpdateCheck> {
 #[cfg(test)]
 mod tests {
     use super::{
-        github_raw_url, json_version, normalize_version, version_from_plugin_manifest,
-        version_from_release_url,
+        github_raw_url, json_version, normalize_version, tracks_updates,
+        version_from_plugin_manifest, version_from_release_url, HOST_MANAGED_ADDONS,
     };
     use serde_json::json;
+
+    /// Codex's curated marketplace is not ours to refresh, so an update offered
+    /// for a plugin installed from it can only ever be re-offered: installing
+    /// rewrites the same curated snapshot, the version does not move, and the
+    /// card asks again (the user's "点了更新还是有提示" loop). Every addon whose
+    /// content Headroom installs itself must keep a real check.
+    #[test]
+    fn host_managed_addons_are_not_advertised_as_updatable() {
+        assert!(!tracks_updates("superpowers"));
+        assert!(HOST_MANAGED_ADDONS.contains(&"superpowers"));
+        for id in [
+            "gstack",
+            "openspec",
+            "ponytail",
+            "caveman",
+            "allinluna",
+            "ralph-loop",
+            "stop-that-shit",
+            "agent-guard",
+            "grill-me",
+            "rtk",
+            "markitdown",
+        ] {
+            assert!(tracks_updates(id), "{id} must keep its update check");
+        }
+    }
+
+    #[test]
+    fn host_managed_addons_report_no_error_and_no_version() {
+        let check = super::host_managed_check("superpowers");
+        assert_eq!(check.id, "superpowers");
+        assert!(check.latest_version.is_none());
+        assert!(check.error.is_none());
+    }
 
     #[test]
     fn normalizes_registry_and_github_versions() {

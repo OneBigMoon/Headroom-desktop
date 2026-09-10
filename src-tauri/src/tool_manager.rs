@@ -10029,6 +10029,49 @@ mod codex_manifest_compat_tests {
         assert_eq!(super::codex_plugin_adapter(plugin).unwrap().0, "1.12.0");
     }
 
+    /// The adapter manifest Headroom authors is also the number the Addons card
+    /// shows as installed, so a compile-time constant there turns into a
+    /// permanent "Update to v<x>" offer the moment upstream releases: the
+    /// update rewrites the same constant, and the card asks again.
+    #[test]
+    fn codex_adapter_version_follows_the_checkout_not_a_constant() {
+        let root = tempfile::tempdir().expect("tempdir");
+        // gstack: no version anywhere but the repository's own package.json.
+        let snapshot = root.path().join("gstack");
+        fs::create_dir_all(&snapshot).expect("snapshot");
+        fs::write(
+            snapshot.join("package.json"),
+            serde_json::to_vec(&json!({ "name": "gstack", "version": "1.84.1" })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            super::codex_adapter_version(&snapshot, &snapshot, "1.79.0"),
+            "1.84.1"
+        );
+
+        // The adapter manifest Headroom wrote last time must never be the
+        // source: reading our own output back is what kept the stale version
+        // alive across updates.
+        fs::create_dir_all(snapshot.join(".codex-plugin")).unwrap();
+        fs::write(
+            snapshot.join(".codex-plugin/plugin.json"),
+            serde_json::to_vec(&json!({ "name": "gstack", "version": "1.79.0" })).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            super::codex_adapter_version(&snapshot, &snapshot, "1.79.0"),
+            "1.84.1"
+        );
+
+        // A snapshot that declares no version keeps the fallback (Ralph Loop),
+        // and a VERSION file is honored when that is all there is.
+        let bare = root.path().join("ralph");
+        fs::create_dir_all(&bare).unwrap();
+        assert_eq!(super::codex_adapter_version(&bare, &bare, "0.1.0"), "0.1.0");
+        fs::write(bare.join("VERSION"), b"0.2.0\n").unwrap();
+        assert_eq!(super::codex_adapter_version(&bare, &bare, "0.1.0"), "0.2.0");
+    }
+
     #[test]
     fn allinluna_adapter_is_selected_for_codex_install() {
         let plugin = super::PLUGIN_ADDONS
@@ -10694,11 +10737,69 @@ fn gstack_bun_binary(plugin_root: &Path) -> Result<PathBuf> {
     Ok(executable)
 }
 
+/// The version to record in the Codex adapter manifest Headroom authors for a
+/// plugin that ships no Codex manifest of its own.
+///
+/// The Addons card compares this number against the upstream update check, so
+/// it has to come from the same content an update installs. A compile-time
+/// constant drifts the moment upstream releases, and then the card offers an
+/// update that installing can never satisfy: the adapter is rewritten from the
+/// same constant, the receipt keeps the old version, and the offer comes back
+/// after every click (2026-09-10, both reproduced from the user's own
+/// machine: gstack's adapter said 1.79.0 over a 1.84.1 checkout, OpenSpec's
+/// said 1.12.0 over a 1.13.0 one, with "Update to v1.84.1" / "v1.13.0"
+/// returning each time).
+///
+/// Read the checkout's own release declaration instead. The constant stays as
+/// the fallback for a snapshot that declares no version anywhere (Ralph Loop
+/// ships none).
+fn codex_adapter_version(snapshot_root: &Path, plugin_root: &Path, fallback: &str) -> String {
+    upstream_declared_version(snapshot_root)
+        .or_else(|| upstream_declared_version(plugin_root))
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// A checkout's own version, from the files a repository uses to declare one.
+///
+/// Deliberately never reads `.codex-plugin/plugin.json`: for every plugin this
+/// is asked about that file is the adapter manifest Headroom itself writes, so
+/// reading it back is exactly how a stale version survives an update.
+fn upstream_declared_version(root: &Path) -> Option<String> {
+    let package = root.join("package.json");
+    if let Ok(value) = std::fs::read(&package).map(|bytes| serde_json::from_slice::<Value>(&bytes))
+    {
+        if let Ok(value) = value {
+            if let Some(version) = value.get("version").and_then(Value::as_str) {
+                let version = version.trim();
+                if !version.is_empty() {
+                    return Some(version.to_string());
+                }
+            }
+        }
+    }
+    let plain = root.join("VERSION");
+    if let Ok(bytes) = std::fs::read(&plain) {
+        if let Some(version) = String::from_utf8_lossy(&bytes)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+        {
+            return Some(version.to_string());
+        }
+    }
+    None
+}
+
 fn prepare_codex_plugin_adapter_at(root: &Path, plugin: &PluginAddon) -> Result<()> {
-    let Some((version, description, skills)) = codex_plugin_adapter(plugin) else {
+    let Some((fallback_version, description, skills)) = codex_plugin_adapter(plugin) else {
         return Ok(());
     };
     let plugin_root = codex_marketplace_plugin_root(root, plugin);
+    let version = codex_adapter_version(
+        &root.join(plugin.marketplace_name),
+        &plugin_root,
+        fallback_version,
+    );
     match plugin.id {
         "openspec" => {
             if !plugin_root.join("dist/cli/index.js").is_file() {
