@@ -20857,6 +20857,133 @@ exit 0
         eprintln!("{id} disable/enable round trip done");
     }
 
+    /// Live proof that a single-select workflow switch is a local operation and
+    /// completes in one shot: switching the inactive peer on turns the active
+    /// one off, and switching back restores the starting state. Timed because
+    /// the card's "Enabling …" line is tied to this call returning -- a stuck
+    /// card with a fast runtime here points at the surface, not the backend.
+    /// `cargo test --lib exclusive_switch_live -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "switches real plugins; run with --ignored"]
+    fn exclusive_switch_live() {
+        // Both peers are installed on this machine, so the switch stays local:
+        // no marketplace fetch or `plugin add` is involved.
+        const PAIR: [&str; 2] = ["openspec", "superpowers"];
+        let manager = ToolManager::new(ManagedRuntime::bootstrap_root(
+            &crate::storage::app_data_dir(),
+        ));
+        let active_before: Vec<String> = PAIR
+            .iter()
+            .filter(|id| manager.tool_enabled(id))
+            .map(|id| (*id).to_string())
+            .collect();
+        assert_eq!(
+            active_before.len(),
+            1,
+            "expected one active peer in {PAIR:?}, found {active_before:?}"
+        );
+        let inactive = PAIR
+            .iter()
+            .find(|id| !manager.tool_enabled(id))
+            .map(|id| (*id).to_string())
+            .expect("one of the pair is switched on");
+
+        let started = std::time::Instant::now();
+        manager
+            .set_plugin_enabled(&inactive, true)
+            .unwrap_or_else(|err| panic!("enabling {inactive}: {err:#}"));
+        let switched = started.elapsed();
+        assert!(manager.tool_enabled(&inactive), "{inactive} did not switch on");
+        for peer in &active_before {
+            assert!(
+                !manager.tool_enabled(peer),
+                "{peer} stayed on next to {inactive}"
+            );
+        }
+
+        let started = std::time::Instant::now();
+        restore_plugin_switches(&manager, &active_before);
+        let restored = started.elapsed();
+        assert!(
+            !manager.tool_enabled(&inactive),
+            "{inactive} stayed on after switching back"
+        );
+
+        eprintln!("switch to {inactive}: {switched:?}; switch back: {restored:?}");
+        assert!(
+            switched < std::time::Duration::from_secs(30),
+            "a local switch took {switched:?}, which would read as a stuck card"
+        );
+    }
+
+    /// Live checklist for every plugin switch on this machine: flip each
+    /// installed addon, assert the Codex `enabled` flag followed the switch, and
+    /// put the set back. The single-select groups are the interesting case --
+    /// switching one peer on turns the other off -- so the whole set is re-read
+    /// after every tool instead of trusting the one that was clicked.
+    /// `cargo test --lib every_plugin_switch_live -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "toggles every plugin addon on the real machine; run with --ignored"]
+    fn every_plugin_switch_live() {
+        let manager = ToolManager::new(ManagedRuntime::bootstrap_root(
+            &crate::storage::app_data_dir(),
+        ));
+        let config_path = crate::client_adapters::codex_home().join("config.toml");
+        let baseline = enabled_plugin_ids(&manager);
+        let mut checked: Vec<String> = Vec::new();
+        for plugin in &super::PLUGIN_ADDONS {
+            if matches!(
+                manager.detect_status(plugin.id),
+                crate::models::ToolStatus::NotInstalled
+            ) {
+                eprintln!("{}: skipped, not installed", plugin.id);
+                continue;
+            }
+            let was_on = manager.tool_enabled(plugin.id);
+            let started = std::time::Instant::now();
+            manager
+                .set_plugin_enabled(plugin.id, !was_on)
+                .unwrap_or_else(|err| panic!("switching {}: {err:#}", plugin.id));
+            let elapsed = started.elapsed();
+            assert_eq!(
+                manager.tool_enabled(plugin.id),
+                !was_on,
+                "the {} switch did not move the tool",
+                plugin.id
+            );
+            let text = std::fs::read_to_string(&config_path).expect("Codex config");
+            assert_eq!(
+                super::codex_plugin_enabled_from_text(&text, plugin.plugin_ref).expect("parse"),
+                Some(!was_on),
+                "Codex did not record the {} switch",
+                plugin.id
+            );
+            // Back the way it was, then settle whatever peer the switch moved.
+            manager
+                .set_plugin_enabled(plugin.id, was_on)
+                .unwrap_or_else(|err| panic!("restoring {}: {err:#}", plugin.id));
+            restore_plugin_switches(&manager, &baseline);
+            assert_eq!(
+                enabled_plugin_ids(&manager),
+                baseline,
+                "the machine did not come back after switching {}",
+                plugin.id
+            );
+            checked.push(plugin.id.to_string());
+            eprintln!(
+                "{}: started {}, switched and back in {elapsed:?}",
+                plugin.id,
+                if was_on { "on" } else { "off" }
+            );
+        }
+        assert!(!checked.is_empty(), "no installed plugin addon to switch");
+        eprintln!(
+            "checked {} plugin switches: {}",
+            checked.len(),
+            checked.join(", ")
+        );
+    }
+
     /// Read-only dump of the live connector table the Connections cards render:
     /// installed / enabled / verified and, for Codex, whose provider owns the
     /// route. `cargo test --lib connector_status_live -- --ignored --nocapture`.
@@ -20882,6 +21009,24 @@ exit 0
                 "detected {}: installed={} configured={} health={:?} notes={:?}",
                 client.id, client.installed, client.configured, client.health, client.notes
             );
+        }
+    }
+
+    /// Live read of the real managed runtime: every tool's status and switch,
+    /// plus how long the list takes. A card that hangs in the UI while this
+    /// stays fast and correct points at the surface, not the runtime.
+    /// `cargo test --lib list_tools_live -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "reads the real managed runtime; run with --ignored"]
+    fn list_tools_live() {
+        let manager = ToolManager::new(ManagedRuntime::bootstrap_root(
+            &crate::storage::app_data_dir(),
+        ));
+        let started = std::time::Instant::now();
+        let tools = manager.list_tools();
+        eprintln!("list_tools took {:?}", started.elapsed());
+        for tool in tools {
+            eprintln!("{}: {:?} enabled={}", tool.id, tool.status, tool.enabled);
         }
     }
 
