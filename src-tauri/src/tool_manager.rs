@@ -20793,6 +20793,36 @@ exit 0
     /// through the same `set_plugin_enabled` the card calls.
     /// `HEADROOM_LIVE_PLUGIN=openspec cargo test --lib plugin_toggle_live
     /// -- --ignored --nocapture`.
+    ///
+    /// Workflow groups are single-select, so switching one member on switches
+    /// its peers off. Every live switch rehearsal snapshots the peers first and
+    /// puts them back at the end, or the machine ends up different from how the
+    /// test found it.
+    fn enabled_plugin_ids(manager: &ToolManager) -> Vec<String> {
+        super::PLUGIN_ADDONS
+            .iter()
+            .map(|plugin| plugin.id.to_string())
+            .filter(|id| manager.tool_enabled(id))
+            .collect()
+    }
+
+    fn restore_plugin_switches(manager: &ToolManager, ids: &[String]) {
+        // Re-enabling a peer can switch another peer off again, so settle over
+        // two passes instead of trusting the first order.
+        for _ in 0..2 {
+            for id in ids {
+                if !manager.tool_enabled(id) {
+                    manager
+                        .set_plugin_enabled(id, true)
+                        .unwrap_or_else(|err| panic!("restoring {id}: {err:#}"));
+                }
+            }
+        }
+        for id in ids {
+            assert!(manager.tool_enabled(id), "could not restore {id}");
+        }
+    }
+
     #[test]
     #[ignore = "toggles a real plugin; run with --ignored"]
     fn plugin_toggle_live() {
@@ -20802,6 +20832,7 @@ exit 0
         let id = std::env::var("HEADROOM_LIVE_PLUGIN").unwrap_or_else(|_| "openspec".into());
         let plugin = super::plugin_addon(&id).expect("known plugin addon");
         assert!(manager.tool_enabled(&id), "{id} is not enabled on this machine");
+        let peers_before = enabled_plugin_ids(&manager);
 
         manager.set_plugin_enabled(&id, false).expect("disable");
         assert!(!manager.tool_enabled(&id), "switch did not disable {id}");
@@ -20822,6 +20853,7 @@ exit 0
             Some(true),
             "Codex flag stayed off after enabling {id}"
         );
+        restore_plugin_switches(&manager, &peers_before);
         eprintln!("{id} disable/enable round trip done");
     }
 
@@ -20963,6 +20995,75 @@ exit 0
             "Codex still has {id} enabled after an update"
         );
         eprintln!("{id} updated while disabled; enabled flag still false");
+    }
+
+    /// Live proof that a plugin the user had switched off can be switched on
+    /// and back off, in that order: both directions write the Codex `enabled`
+    /// flag and the receipt ends where it started. Pick any disabled plugin:
+    /// `HEADROOM_LIVE_PLUGIN=ralph-loop cargo test --lib disabled_plugin_toggle_live
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "toggles a real plugin; run with --ignored"]
+    fn disabled_plugin_toggle_live() {
+        let manager = ToolManager::new(ManagedRuntime::bootstrap_root(
+            &crate::storage::app_data_dir(),
+        ));
+        let id = std::env::var("HEADROOM_LIVE_PLUGIN").unwrap_or_else(|_| "ralph-loop".into());
+        let plugin = super::plugin_addon(&id).expect("known plugin addon");
+        let config_path = crate::client_adapters::codex_home().join("config.toml");
+        assert!(
+            !manager.tool_enabled(&id),
+            "{id} is not disabled on this machine; pick another addon"
+        );
+        let peers_before = enabled_plugin_ids(&manager);
+
+        manager
+            .install_plugin(&id, true)
+            .unwrap_or_else(|err| panic!("enabling {id}: {err:#}"));
+        assert!(manager.tool_enabled(&id), "switch did not enable {id}");
+        let on = std::fs::read_to_string(&config_path).expect("Codex config");
+        assert_eq!(
+            super::codex_plugin_enabled_from_text(&on, plugin.plugin_ref).expect("parse"),
+            Some(true),
+            "Codex flag stayed off after enabling {id}"
+        );
+
+        manager
+            .set_plugin_enabled(&id, false)
+            .unwrap_or_else(|err| panic!("disabling {id}: {err:#}"));
+        assert!(!manager.tool_enabled(&id), "switch did not disable {id} again");
+        let off = std::fs::read_to_string(&config_path).expect("Codex config");
+        assert_eq!(
+            super::codex_plugin_enabled_from_text(&off, plugin.plugin_ref).expect("parse"),
+            Some(false),
+            "Codex flag stayed on after disabling {id}"
+        );
+        restore_plugin_switches(&manager, &peers_before);
+        eprintln!("{id} off -> on -> off round trip done");
+    }
+
+    /// Puts the machine back the way a rehearsal found it: switches the plugins
+    /// named in `HEADROOM_LIVE_PLUGINS` (comma separated) back on. List at most
+    /// one id per workflow group, or the later one wins.
+    /// `HEADROOM_LIVE_PLUGINS=openspec,allinluna cargo test --lib
+    /// restore_plugin_switches_live -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "toggles real plugins; run with --ignored"]
+    fn restore_plugin_switches_live() {
+        let manager = ToolManager::new(ManagedRuntime::bootstrap_root(
+            &crate::storage::app_data_dir(),
+        ));
+        let raw = std::env::var("HEADROOM_LIVE_PLUGINS")
+            .expect("set HEADROOM_LIVE_PLUGINS to the ids you want switched back on");
+        let ids: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .collect();
+        assert!(!ids.is_empty(), "HEADROOM_LIVE_PLUGINS is empty");
+        restore_plugin_switches(&manager, &ids);
+        eprintln!("restored {}", ids.join(", "));
     }
 
     /// Live proof of the whole RTK update the card offers, against the real
