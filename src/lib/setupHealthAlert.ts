@@ -3,6 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { needsTermsAcceptance } from "./launcherHelpers";
 import { formatDayKey } from "./dashboardHelpers";
+import type { Translate } from "./i18n";
 import type { ClientConnectorStatus, DashboardState } from "./types";
 
 // Nothing at all has come through. This is the weaker of the two signals:
@@ -74,6 +75,12 @@ function stallBannerBody(kind: SetupStallKind): string {
 }
 
 export interface SetupStallContext {
+  /// Translator for surfaces that leave the app. The modal is localized by its
+  /// own component, but the native notification is built here, and a system
+  /// notification that ignores the app's language is the one place a user sees
+  /// English while every screen around it is translated. Absent in tests and on
+  /// the forceKind path, which falls back to the canonical English strings.
+  translate?: Translate;
   /// True when the account gate has optimization switched off (unpaid plan,
   /// signed out, weekly cap hit). Zero savings is the expected outcome then,
   /// and those states already have their own daily notifications. Undefined
@@ -262,10 +269,20 @@ export async function maybeFireSetupStallAlert(
   // fires about a second after launch, which is exactly when a tester is most
   // likely to have the tray open and would otherwise see the modal only.
   if (context.forceKind || !(await isWindowVisible())) {
+    const translate = context.translate;
+    const title = translate ? translate("setupStall.notifyTitle") : alert.title;
+    const body = translate
+      ? translate(
+          alert.kind === "no_traffic"
+            ? "setupStall.notifyNoTraffic"
+            : "setupStall.notifyNoSavings",
+          { minutes: setupStallNoTrafficMinutes() }
+        )
+      : alert.body;
     try {
       await invoke("show_notification", {
-        title: alert.title,
-        body: alert.body,
+        title,
+        body,
         action: "setup",
       });
     } catch {

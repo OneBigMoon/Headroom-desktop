@@ -286,6 +286,28 @@ describe("evaluateSetupStall", () => {
       // The genuine alert still has its slot available afterwards.
       expect(await maybeFireSetupStallAlert(busyDashboard(), PAST_WINDOW)).not.toBeNull();
     });
+
+    // The modal is localized by its own component, but the system notification
+    // is assembled here, so it needs the app's translator or a non-English user
+    // gets one English notification a day.
+    it("asks the translator for the notification copy when one is supplied", async () => {
+      // Tray closed: the production path that actually sends the notification.
+      isVisibleMock.mockResolvedValue(false);
+      const translate = vi.fn((key: string, values?: Record<string, string | number>) =>
+        values?.minutes === undefined ? `t:${key}` : `t:${key}:${values.minutes}`
+      );
+
+      await maybeFireSetupStallAlert(stalledDashboard(), PAST_WINDOW, {
+        connectors: UNVERIFIED,
+        translate: translate as never,
+      });
+
+      expect(invokeMock).toHaveBeenCalledWith("show_notification", {
+        title: "t:setupStall.notifyTitle",
+        body: `t:setupStall.notifyNoTraffic:${setupStallNoTrafficMinutes()}`,
+        action: "setup",
+      });
+    });
   });
 
   describe("no_savings branch", () => {

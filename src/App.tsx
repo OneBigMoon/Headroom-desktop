@@ -2957,6 +2957,7 @@ export default function App() {
         optimizationBlocked: optimizationBlockedRef.current,
         connectors: connectorsRef.current,
         forceKind: forcedSetupStall,
+        translate: t,
       });
       if (active && alert) {
         if (forcedSetupStall) {
