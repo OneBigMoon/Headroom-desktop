@@ -12338,7 +12338,8 @@ keep rtk\n\
             "model_provider = \"codex_local_access\"\n\n\
              [model_providers.codex_local_access]\n\
              name = \"Codex API Service\"\n\
-             base_url = \"http://localhost:52980/v1\"\n",
+             base_url = \"http://localhost:52980/v1\"\n\
+             experimental_bearer_token = \"agt_secret\"\n",
         )
         .unwrap();
 
@@ -12372,6 +12373,36 @@ keep rtk\n\
                 .map(String::as_str),
             Some("codex_local_access"),
             "the displaced provider must be recorded for restore-on-disable"
+        );
+
+        // The other half of "不影响其他的软件": switching the connector back
+        // off must hand Cockpit its route back exactly as it was, otherwise a
+        // user who merely tried Headroom once loses Codex to api.openai.com.
+        super::disable_client_setup("codex").expect("disable restores the displaced provider");
+
+        let restored = fs::read_to_string(&config_toml).unwrap();
+        let parsed: toml::Value = restored
+            .parse()
+            .unwrap_or_else(|e| panic!("valid toml after disable: {e}\n{restored}"));
+        assert_eq!(
+            parsed.get("model_provider").and_then(|v| v.as_str()),
+            Some("codex_local_access"),
+            "disable must restore the displaced root provider, got:\n{restored}"
+        );
+        assert!(
+            !restored.contains("headroom-local-community:codex_cli")
+                && !restored.contains("[model_providers.headroom_local_community]"),
+            "disable must remove our own blocks, got:\n{restored}"
+        );
+        assert!(
+            restored.contains("http://localhost:52980/v1")
+                && restored.contains("agt_secret"),
+            "Cockpit's provider table must survive the round trip, got:\n{restored}"
+        );
+        assert_eq!(
+            super::codex_external_provider().as_deref(),
+            Some("Cockpit (codex_local_access)"),
+            "after disable, Cockpit is reported as the route owner again"
         );
     }
 
