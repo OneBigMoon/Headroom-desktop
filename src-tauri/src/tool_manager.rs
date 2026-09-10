@@ -13469,22 +13469,134 @@ fn parse_rtk_release(value: &Value, requested_version: &str) -> Result<RtkReleas
     })
 }
 
+/// GitHub's REST API answers 60 requests per hour from one address when the
+/// request carries no token, and these release lookups are the only calls
+/// Headroom makes against it. On a shared or busy address that budget runs out
+/// and reqwest's raw status text reached the addon card verbatim -- "HTTP
+/// status client error (403 rate limit exceeded) for url (...)" (2026-09-10,
+/// several rounds of the same report). Sending the token the user already has
+/// raises the ceiling to 5,000/hour, and running out anyway is now one
+/// actionable sentence instead of a status dump.
+fn github_api_client() -> Result<reqwest::blocking::Client> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .user_agent(concat!("Headroom/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(30));
+    if let Some(token) = github_api_token() {
+        // A token that cannot be encoded as a header is not worth failing the
+        // update over: fall back to the anonymous request instead.
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+            headers.insert(
+                reqwest::header::ACCEPT,
+                reqwest::header::HeaderValue::from_static("application/vnd.github+json"),
+            );
+            builder = builder.default_headers(headers);
+        }
+    }
+    Ok(builder.build()?)
+}
+
+/// The user's own GitHub credential, in the order `gh` itself resolves it.
+/// Everything here is best-effort: a token is an optimization, so a missing,
+/// logged-out, or slow `gh` means "no token" rather than a failed update.
+fn github_api_token() -> Option<String> {
+    static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(github_api_token_uncached).clone()
+}
+
+fn github_api_token_uncached() -> Option<String> {
+    for key in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Some(value) = std::env::var_os(key) {
+            let value = value.to_string_lossy();
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    let gh = crate::claude_cli::probe_on_path("gh")?;
+    let mut command = crate::proc::command(&gh);
+    command
+        .args(["auth", "token"])
+        // A null stdin keeps a logged-out `gh` from blocking on its own
+        // interactive login prompt: it must fail fast, and we treat that as
+        // "no token".
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let token = String::from_utf8(output.stdout).ok()?;
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+/// One GitHub REST GET, with the rate-limit refusal turned into a sentence the
+/// user can act on. Trust checks on the returned payload stay with the callers.
+fn github_api_json(client: &reqwest::blocking::Client, url: &str) -> Result<Value> {
+    let response = client.get(url).send()?;
+    let status = response.status();
+    if !status.is_success() {
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+        if status.as_u16() == 403 || status.as_u16() == 429 {
+            let remaining = header("x-ratelimit-remaining").and_then(|v| v.parse::<u64>().ok());
+            if remaining == Some(0) {
+                let reset = header("x-ratelimit-reset").and_then(|v| v.parse::<i64>().ok());
+                let limit = header("x-ratelimit-limit").and_then(|v| v.parse::<u64>().ok());
+                bail!("{}", github_rate_limit_message(limit, reset));
+            }
+            if let Some(seconds) = header("retry-after").and_then(|v| v.parse::<u64>().ok()) {
+                bail!("GitHub asked us to slow down; try again in about {seconds} seconds.");
+            }
+        }
+        bail!("GitHub API request failed with HTTP {status}");
+    }
+    Ok(response.json()?)
+}
+
+/// `limit` is the per-hour ceiling GitHub reported for THIS request
+/// (`x-ratelimit-limit`): 60 anonymous, 5,000 with the user's own token. It is
+/// read from the response rather than from the token helper, so the sentence
+/// describes the request that actually failed.
+fn github_rate_limit_message(limit: Option<u64>, reset_epoch_seconds: Option<i64>) -> String {
+    let resets = reset_epoch_seconds
+        .and_then(|epoch| chrono::DateTime::from_timestamp(epoch, 0))
+        .map(|reset| {
+            let local = reset.with_timezone(&chrono::Local);
+            format!("; it resets at {}", local.format("%H:%M"))
+        })
+        .unwrap_or_default();
+    match limit {
+        Some(ceiling) if ceiling > 60 => format!(
+            "GitHub API rate limit reached for your GitHub token ({ceiling} requests per hour){resets}."
+        ),
+        _ => format!(
+            "GitHub API rate limit reached (60 requests per hour without a token){resets}. \
+             Signing in with `gh auth login` raises the limit to 5,000 per hour."
+        ),
+    }
+}
+
 fn fetch_rtk_release(version: &str) -> Result<RtkReleaseArtifact> {
     if !valid_rtk_version(version) {
         bail!("invalid RTK version: {version}");
     }
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("Headroom")
-        .timeout(Duration::from_secs(30))
-        .build()?;
-    let value: Value = client
-        .get(format!(
+    let client = github_api_client()?;
+    let value = github_api_json(
+        &client,
+        &format!(
             "https://api.github.com/repos/rtk-ai/rtk/releases/tags/v{}",
             version.strip_prefix('v').unwrap_or(version)
-        ))
-        .send()?
-        .error_for_status()?
-        .json()?;
+        ),
+    )?;
     parse_rtk_release(&value, version)
 }
 
@@ -13613,18 +13725,14 @@ fn fetch_codebase_memory_release(version: &str) -> Result<DownloadArtifact> {
     if !valid_codebase_memory_version(version) {
         bail!("invalid codebase-memory version: {version}");
     }
-    let client = reqwest::blocking::Client::builder()
-        .user_agent("Headroom")
-        .timeout(Duration::from_secs(30))
-        .build()?;
-    let value: Value = client
-        .get(format!(
+    let client = github_api_client()?;
+    let value = github_api_json(
+        &client,
+        &format!(
             "https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/tags/v{}",
             version
-        ))
-        .send()?
-        .error_for_status()?
-        .json()?;
+        ),
+    )?;
     parse_codebase_memory_release(&value, version)
 }
 
@@ -14916,7 +15024,8 @@ impl std::error::Error for HeadroomStartupFailure {}
 mod tests {
     use super::{
         codebase_memory_release_target, context7_package_spec_for, parse_codebase_memory_release,
-        parse_rtk_release, rtk_release_asset_name, rtk_version_is_downgrade,
+        fetch_rtk_release, github_api_token_uncached, github_rate_limit_message,
+        github_api_json, parse_rtk_release, rtk_release_asset_name, rtk_version_is_downgrade,
         rtk_version_output_matches, stable_package_version, valid_codebase_memory_version,
         valid_rtk_version,
     };
@@ -20647,6 +20756,91 @@ exit 0
         assert_eq!(parse_major_minor_patch(""), None);
         assert_eq!(parse_major_minor_patch("not-a-version"), None);
         assert_eq!(parse_major_minor_patch("0"), None);
+    }
+
+    /// Rate-limit text: what the card showed was reqwest's raw status string
+    /// ("HTTP status client error (403 rate limit exceeded) for url (...)"),
+    /// which named neither the cause nor a way out (2026-09-10 report).
+    #[test]
+    fn github_rate_limit_message_names_the_reset_and_the_fix() {
+        let anonymous = github_rate_limit_message(Some(60), Some(1_760_000_000));
+        assert!(anonymous.contains("60 requests per hour"), "{anonymous}");
+        assert!(anonymous.contains("resets at "), "{anonymous}");
+        assert!(anonymous.contains("gh auth login"), "{anonymous}");
+        let token = github_rate_limit_message(Some(5_000), Some(1_760_000_000));
+        assert!(token.contains("your GitHub token"), "{token}");
+        assert!(token.contains("5000 requests per hour"), "{token}");
+        let undated = github_rate_limit_message(None, None);
+        assert!(!undated.contains("resets at"), "{undated}");
+        assert!(undated.contains("gh auth login"), "{undated}");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn github_api_token_prefers_the_environment_over_gh() {
+        let _lock = crate::test_env_lock::lock_home();
+        let previous = std::env::var_os("GH_TOKEN");
+        std::env::set_var("GH_TOKEN", "gho_test_token");
+        let token = github_api_token_uncached();
+        match previous {
+            Some(value) => std::env::set_var("GH_TOKEN", value),
+            None => std::env::remove_var("GH_TOKEN"),
+        }
+        assert_eq!(token.as_deref(), Some("gho_test_token"));
+    }
+
+    /// Live proof of the whole RTK update the card offers, against the real
+    /// managed runtime: the same `install_rtk_version` the Update button calls.
+    /// `cargo test --lib rtk_update_live -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "installs into the real managed runtime; run with --ignored"]
+    fn rtk_update_live() {
+        let manager = ToolManager::new(ManagedRuntime::bootstrap_root(
+            &crate::storage::app_data_dir(),
+        ));
+        let before = manager.installed_rtk_version();
+        eprintln!("rtk before: {before:?}");
+        let target = std::env::var("HEADROOM_RTK_TARGET").unwrap_or_else(|_| "0.48.0".into());
+        manager
+            .install_rtk_version(Some(&target))
+            .expect("RTK update");
+        let after = manager.installed_rtk_version();
+        eprintln!("rtk after: {after:?}");
+        assert_eq!(after.as_deref(), Some(target.as_str()));
+    }
+
+    /// Live proof that the release lookup the RTK and codebase-memory update
+    /// buttons run actually resolves, with whatever credential this machine has
+    /// (GH_TOKEN/GITHUB_TOKEN, else `gh auth token`). Ignored by default: it
+    /// needs the network.
+    #[test]
+    #[ignore = "hits the GitHub API; run with --ignored"]
+    fn github_release_lookup_live() {
+        let rtk = fetch_rtk_release("0.47.0").expect("RTK release lookup");
+        eprintln!("rtk 0.47.0 -> {} ({})", rtk.url, rtk.sha256);
+        assert_eq!(rtk.version, "0.47.0");
+        assert_eq!(rtk.sha256.len(), 64);
+
+        // The same request without the credential: either the anonymous budget
+        // still has room, or the refusal reads as the actionable sentence.
+        // Never reqwest's raw "HTTP status client error (403 ...) for url".
+        let anonymous = reqwest::blocking::Client::builder()
+            .user_agent("Headroom-test")
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("anonymous client");
+        let url = "https://api.github.com/repos/rtk-ai/rtk/releases/tags/v0.47.0";
+        match github_api_json(&anonymous, url) {
+            Ok(_) => eprintln!("anonymous lookup is still inside its hourly budget"),
+            Err(err) => {
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains("rate limit reached"),
+                    "an anonymous refusal must read as actionable text: {message}"
+                );
+                eprintln!("anonymous refusal: {message}");
+            }
+        }
     }
 
     #[test]
