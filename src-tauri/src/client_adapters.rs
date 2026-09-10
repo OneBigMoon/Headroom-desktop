@@ -3984,7 +3984,26 @@ fn codex_foreign_model_provider(content: &str) -> Option<String> {
 pub fn codex_external_provider() -> Option<String> {
     let path = codex_config_toml_path();
     let content = std::fs::read_to_string(path).ok()?;
-    codex_foreign_model_provider(&content)
+    codex_foreign_model_provider(&content).map(|id| codex_provider_display_name(&id))
+}
+
+/// Human label for another tool's Codex provider id.
+///
+/// Both the coexist note and the takeover confirmation interpolate this value
+/// into a sentence, so a raw TOML table key (`codex_local_access`) reads as
+/// jargon where the user expects the name of the tool they installed. Unknown
+/// ids are shown verbatim: the user may have written that provider by hand, and
+/// guessing a product name for it would misattribute their own configuration.
+fn codex_provider_display_name(id: &str) -> String {
+    match id {
+        // Written by Cockpit Tools; its table carries
+        // `x-openai-actor-authorization = "cockpit-tools"`. The provider id is
+        // kept in the label: it is the string support has to grep for.
+        "codex_local_access" => "Cockpit (codex_local_access)".to_string(),
+        CODEX_OFFICIAL_PROVIDER => "Headroom (official)".to_string(),
+        CODEX_NATIVE_PROVIDER => "OpenAI".to_string(),
+        _ => id.to_string(),
+    }
 }
 
 fn codex_takeover_provider_allowed(provider: &str) -> bool {
@@ -12325,7 +12344,7 @@ keep rtk\n\
 
         assert_eq!(
             super::codex_external_provider().as_deref(),
-            Some("codex_local_access"),
+            Some("Cockpit (codex_local_access)"),
             "the other tool's provider must be reported as the current owner"
         );
 
@@ -12369,11 +12388,30 @@ keep rtk\n\
         )
         .unwrap();
 
+        // The note and the takeover confirmation print this string verbatim.
+        // A raw table key ("codex_local_access") beside the tool the user
+        // installed is what made the card read as a machine error.
+        assert_eq!(
+            super::codex_provider_display_name("codex_local_access"),
+            "Cockpit (codex_local_access)"
+        );
+        assert_eq!(
+            super::codex_provider_display_name("headroom"),
+            "Headroom (official)"
+        );
+        assert_eq!(super::codex_provider_display_name("openai"), "OpenAI");
+        assert_eq!(
+            super::codex_provider_display_name("corp-gateway"),
+            "corp-gateway",
+            "a hand-written provider id must not be renamed"
+        );
+
         let verification = super::verify_client_setup("codex").expect("verification runs");
 
         assert_eq!(
             verification.foreign_provider.as_deref(),
-            Some("codex_local_access")
+            Some("Cockpit (codex_local_access)"),
+            "the note names the tool, and keeps the provider id for support"
         );
         assert!(
             verification
@@ -12386,6 +12424,72 @@ keep rtk\n\
         assert!(
             !verification.verified,
             "Headroom is not intercepting, so the connector is not verified"
+        );
+    }
+
+    /// The shape found on the user's machine after Cockpit Tools took over the
+    /// Codex route: Cockpit's root `model_provider`, our provider table left in
+    /// place between our markers, and a single orphan *closing* marker where our
+    /// root block used to be. The card reported this as "Headroom-managed
+    /// provider block was not found", which reads as a broken install and was
+    /// the "点了更新还是有提示" complaint. It is a coexist state: Cockpit owns the
+    /// route, Headroom stands aside, and nothing of Cockpit's may be touched.
+    #[test]
+    #[serial_test::serial]
+    fn verify_names_the_tool_that_owns_the_codex_route() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join("config.toml"),
+            "# <<< headroom-local-community:codex_cli <<<\n\
+             notify = [\"/Applications/Codex Computer Use.app\"]\n\
+             model = \"gpt-5.5\"\n\
+             model_provider = \"codex_local_access\"\n\
+             \n\
+             [marketplaces.openai-bundled]\n\
+             source_type = \"local\"\n\
+             # >>> headroom-local-community:codex_cli_provider >>>\n\
+             [model_providers.headroom_local_community]\n\
+             name = \"OpenAI\"\n\
+             base_url = \"http://127.0.0.1:6891/backend-api/codex\"\n\
+             supports_websockets = false\n\
+             supports_standalone_web_search = true\n\
+             \n\
+             [model_providers.codex_local_access]\n\
+             name = \"Codex API Service\"\n\
+             base_url = \"http://localhost:52980/v1\"\n\
+             experimental_bearer_token = \"agt_secret\"\n\
+             # <<< headroom-local-community:codex_cli_provider <<<\n",
+        )
+        .unwrap();
+        let config = codex_dir.join("config.toml");
+        let before = fs::read_to_string(&config).unwrap();
+
+        // Our table is intact, but the root block that routes Codex is gone.
+        assert!(
+            !super::codex_provider_block_matches().unwrap(),
+            "a foreign root provider means Headroom is not routing"
+        );
+
+        let verification = super::verify_client_setup("codex").expect("verification runs");
+        assert_eq!(
+            verification.foreign_provider.as_deref(),
+            Some("Cockpit (codex_local_access)")
+        );
+        assert!(
+            verification
+                .failures
+                .iter()
+                .all(|failure| !failure.contains("provider block was not found")),
+            "a coexisting tool must not be reported as a Headroom write failure, got: {:?}",
+            verification.failures
+        );
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            before,
+            "verifying must not rewrite the other tool's route"
         );
     }
 

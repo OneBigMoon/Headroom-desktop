@@ -15,15 +15,69 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use log::{Level, Log, Metadata, Record, SetLoggerError};
+use log::{Level, LevelFilter, Log, Metadata, Record, SetLoggerError};
 
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
 const SENTRY_MESSAGE_CHAR_CAP: usize = 400;
+
+/// File level when `HEADROOM_LOG_LEVEL` is unset.
+///
+/// The user's log had grown to 3.4 MB / 34,453 lines, 31,638 of them
+/// `DEBUG reqwest::connect: starting new connection: http://127.0.0.1:6867/`
+/// -- dependency chatter about our own loopback proxy. Info keeps every
+/// Headroom line support actually reads. Set `HEADROOM_LOG_LEVEL=debug` (or
+/// `trace`) to get the old firehose back for one session.
+const DEFAULT_LOG_LEVEL: LevelFilter = LevelFilter::Info;
+
+/// Dependency records below this level are dropped instead of written. The
+/// official Headroom agent and Codex both write here through their own crates,
+/// so a blanket Debug filter buries our records among theirs.
+const THIRD_PARTY_FLOOR: Level = Level::Warn;
+
+fn parse_log_level(raw: &str) -> Option<LevelFilter> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "off" => Some(LevelFilter::Off),
+        "error" => Some(LevelFilter::Error),
+        "warn" | "warning" => Some(LevelFilter::Warn),
+        "info" => Some(LevelFilter::Info),
+        "debug" => Some(LevelFilter::Debug),
+        "trace" => Some(LevelFilter::Trace),
+        _ => None,
+    }
+}
+
+/// `HEADROOM_LOG_LEVEL` wins; anything unrecognized (including an empty value)
+/// falls back to the default rather than silencing the file.
+fn requested_log_level() -> LevelFilter {
+    std::env::var("HEADROOM_LOG_LEVEL")
+        .ok()
+        .and_then(|raw| parse_log_level(&raw))
+        .unwrap_or(DEFAULT_LOG_LEVEL)
+}
+
+/// An explicit Debug/Trace request is the user asking for dependency noise, so
+/// that choice is honored; otherwise only our own targets log below Warn.
+fn quiet_third_party(level: LevelFilter) -> bool {
+    matches!(
+        level,
+        LevelFilter::Off | LevelFilter::Error | LevelFilter::Warn | LevelFilter::Info
+    )
+}
+
+/// Whether a record may be written. Target prefixes are our crate and its
+/// `headroom*` modules (`headroom_desktop_lib`, `headroom::...`).
+fn admits_record(quiet_third_party: bool, level: Level, target: &str) -> bool {
+    if !quiet_third_party || level <= THIRD_PARTY_FLOOR {
+        return true;
+    }
+    target.starts_with("headroom")
+}
 
 struct FileLogger {
     file: Mutex<Option<File>>,
     path: PathBuf,
     records_since_rotate_check: std::sync::atomic::AtomicU64,
+    quiet_third_party: bool,
 }
 
 impl FileLogger {
@@ -433,6 +487,9 @@ impl Log for FileLogger {
     }
 
     fn log(&self, record: &Record) {
+        if !admits_record(self.quiet_third_party, record.level(), record.target()) {
+            return;
+        }
         let msg = format!("{}", record.args());
         let demote = record.level() <= Level::Warn && skip_sentry(record.target(), &msg);
         let display_level = if demote && record.level() == Level::Error {
@@ -493,13 +550,15 @@ pub fn init() -> Result<PathBuf, SetLoggerError> {
         .append(true)
         .open(&path)
         .ok();
+    let level = requested_log_level();
     let logger = FileLogger {
         file: Mutex::new(file),
         path: path.clone(),
         records_since_rotate_check: std::sync::atomic::AtomicU64::new(0),
+        quiet_third_party: quiet_third_party(level),
     };
     log::set_boxed_logger(Box::new(logger))?;
-    log::set_max_level(log::LevelFilter::Debug);
+    log::set_max_level(level);
     Ok(path)
 }
 
@@ -519,7 +578,44 @@ pub(crate) fn log_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::skip_sentry;
+    use super::{
+        admits_record, parse_log_level, quiet_third_party, skip_sentry, DEFAULT_LOG_LEVEL,
+        THIRD_PARTY_FLOOR,
+    };
+    use log::{Level, LevelFilter};
+
+    #[test]
+    fn log_level_defaults_to_info_and_parses_the_override() {
+        assert_eq!(DEFAULT_LOG_LEVEL, LevelFilter::Info);
+        assert_eq!(parse_log_level("debug"), Some(LevelFilter::Debug));
+        assert_eq!(parse_log_level("  TRACE "), Some(LevelFilter::Trace));
+        assert_eq!(parse_log_level("Warning"), Some(LevelFilter::Warn));
+        assert_eq!(parse_log_level("off"), Some(LevelFilter::Off));
+        // A typo must not silence the log file.
+        assert_eq!(parse_log_level("verbose"), None);
+        assert_eq!(parse_log_level(""), None);
+    }
+
+    #[test]
+    fn dependency_debug_is_dropped_but_our_own_and_all_warnings_survive() {
+        // The 31,638 `reqwest::connect` lines that buried the user's log.
+        assert!(!admits_record(true, Level::Debug, "reqwest::connect"));
+        assert!(!admits_record(true, Level::Info, "hyper::proto::h1"));
+        assert!(!admits_record(true, Level::Trace, "rustls::client"));
+        // Warnings from a dependency are still the user's problem to see.
+        assert!(admits_record(true, Level::Warn, "reqwest::connect"));
+        assert!(admits_record(true, Level::Error, "tauri_plugin_updater::updater"));
+        assert_eq!(THIRD_PARTY_FLOOR, Level::Warn);
+        // Our own records keep their full level.
+        assert!(admits_record(true, Level::Debug, "headroom_desktop_lib"));
+        assert!(admits_record(true, Level::Trace, "headroom::proxy"));
+        // `HEADROOM_LOG_LEVEL=debug` is an explicit request for the firehose.
+        assert!(admits_record(false, Level::Debug, "reqwest::connect"));
+        assert!(!quiet_third_party(LevelFilter::Debug));
+        assert!(!quiet_third_party(LevelFilter::Trace));
+        assert!(quiet_third_party(LevelFilter::Info));
+        assert!(quiet_third_party(LevelFilter::Error));
+    }
 
     #[test]
     fn skips_updater_transport_errors() {
