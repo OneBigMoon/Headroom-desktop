@@ -19,6 +19,39 @@ use crate::storage::{app_data_dir, config_file};
 // Raw proxy base — use provider-specific constants below when configuring client endpoints.
 const HEADROOM_PROXY_URL: &str = "http://127.0.0.1:6867";
 const HEADROOM_ANTHROPIC_BASE_URL: &str = "http://127.0.0.1:6867";
+
+/// Every loopback port Headroom itself serves on.
+///
+/// 6867 is the fixed ingress clients are configured for, 6868..=6890 is the
+/// backend proxy (6868 normally, a fallback when something already holds
+/// 6868), and 6891 is the Codex router. Cleanup that matched only the ingress
+/// left the others behind, so a client could keep pointing at a port nothing
+/// serves once Headroom stopped -- and the cc-switch reconciler really did
+/// write the backend port into `~/.claude/settings.json` (reproduced live
+/// 2026-09-10: the file held 6868 while teardown only recognised 6867, so the
+/// dead route survived every disable).
+const HEADROOM_MANAGED_PORT_RANGE: std::ops::RangeInclusive<u16> = 6867..=6891;
+
+/// The loopback port a base URL points at, when it is a URL at all.
+fn loopback_url_port(value: &str) -> Option<u16> {
+    let trimmed = value.trim().trim_end_matches('/');
+    let rest = trimmed
+        .strip_prefix("http://127.0.0.1:")
+        .or_else(|| trimmed.strip_prefix("http://localhost:"))?;
+    rest.split(['/', '?', '#']).next()?.parse::<u16>().ok()
+}
+
+/// Whether a base URL points at a port Headroom owns, i.e. whether the value
+/// can only have come from us. Used by teardown, which must never delete a
+/// gateway URL the user configured for themselves -- only ports in
+/// [`HEADROOM_MANAGED_PORT_RANGE`] qualify, and a foreign value captured
+/// before setup is restored rather than removed.
+fn is_headroom_managed_base_url(value: &str) -> bool {
+    matches!(
+        loopback_url_port(value),
+        Some(port) if HEADROOM_MANAGED_PORT_RANGE.contains(&port)
+    )
+}
 // Codex keeps its provider URL in memory for the lifetime of a session.  Use
 // the detached router's stable endpoint so closing or crashing the GUI can
 // switch the route to the native provider without requiring a Codex restart.
@@ -2961,6 +2994,20 @@ fn remove_json_key_if_matches(
     }
 }
 
+/// As [`remove_json_key_if_matches`], for callers whose "ours" test is a
+/// predicate rather than one literal value (a client's base URL can be any of
+/// Headroom's own loopback ports -- see `is_headroom_managed_base_url`).
+fn remove_json_key_if(
+    obj: &mut serde_json::Map<String, Value>,
+    key: &str,
+    matches: impl Fn(&str) -> bool,
+) -> bool {
+    match obj.get(key) {
+        Some(Value::String(value)) if matches(value) => obj.remove(key).is_some(),
+        _ => false,
+    }
+}
+
 /// Point `env.<env_key>` at Headroom. The third return element is a
 /// pre-existing *foreign* value this write replaced (a corporate gateway,
 /// LiteLLM, or Bedrock-proxy URL) — callers must preserve it and restore it
@@ -3182,17 +3229,25 @@ fn remove_claude_settings_env(
         .with_context(|| format!("reading {}", settings_path.display()))?;
     let mut root = parse_json_object(&raw, &settings_path)?;
     let mut changed = false;
+    // Ours is the expected value *or* any of our own loopback ports. The
+    // second case is not hypothetical: the cc-switch reconciler rewrote this
+    // key to the backend port, and a teardown that only knew 6867 left the
+    // client pointing at a port nothing serves.
+    let owned = |value: &str| value == expected_value || is_headroom_managed_base_url(value);
 
     if let Some(Value::Object(env_obj)) = root.get_mut("env") {
         match restore_value {
             Some(original)
-                if env_obj.get(env_key).and_then(|v| v.as_str()) == Some(expected_value) =>
+                if env_obj
+                    .get(env_key)
+                    .and_then(|v| v.as_str())
+                    .is_some_and(owned) =>
             {
                 env_obj.insert(env_key.into(), Value::String(original.to_string()));
                 changed = true;
             }
             _ => {
-                changed |= remove_json_key_if_matches(env_obj, env_key, expected_value);
+                changed |= remove_json_key_if(env_obj, env_key, owned);
             }
         }
         if env_obj.is_empty() {
@@ -9535,6 +9590,97 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
         );
         assert_eq!(fs::read(&settings_path).unwrap(), original);
         assert_schema_backup_preserves(&settings_path, original);
+    }
+
+    /// A base URL on any of Headroom's own loopback ports is ours, whichever
+    /// way it got written. The reconciler really did leave the backend port in
+    /// this file, and a teardown that only recognised 6867 kept the dead
+    /// route alive for the user (2026-09-10).
+    #[test]
+    #[serial_test::serial]
+    fn headroom_managed_base_urls_cover_every_port_we_serve() {
+        for value in [
+            "http://127.0.0.1:6867",
+            "http://127.0.0.1:6868/",
+            "http://127.0.0.1:6869",
+            "http://127.0.0.1:6890",
+            "http://127.0.0.1:6891/backend-api/codex",
+            "http://localhost:6868",
+            "  http://127.0.0.1:6868  ",
+        ] {
+            assert!(super::is_headroom_managed_base_url(value), "{value}");
+        }
+        for value in [
+            // A gateway the user configured, including one that merely looks
+            // like ours, must never be treated as Headroom's own.
+            "https://api.anthropic.com",
+            "http://127.0.0.1:6866",
+            "http://127.0.0.1:6892",
+            "http://127.0.0.1",
+            "http://127.0.0.1:not-a-port",
+            "http://192.168.1.9:6868",
+            "",
+        ] {
+            assert!(!super::is_headroom_managed_base_url(value), "{value}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn teardown_clears_every_headroom_port_and_keeps_foreign_urls() {
+        let home = TestHome::new();
+        let settings_path = home.path().join(".claude").join("settings.json");
+        fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+
+        // The reconciler's residue: teardown used to leave this behind.
+        fs::write(
+            &settings_path,
+            br#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:6868","KEEP":"x"}}"#,
+        )
+        .unwrap();
+        super::remove_claude_settings_env("ANTHROPIC_BASE_URL", "http://127.0.0.1:6867", None)
+            .expect("teardown");
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+        assert_eq!(value["env"]["KEEP"], "x", "unrelated env must survive");
+        assert!(
+            value["env"].get("ANTHROPIC_BASE_URL").is_none(),
+            "our own dead port must be removed: {value}"
+        );
+
+        // A foreign gateway is not ours to delete...
+        fs::write(
+            &settings_path,
+            br#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example/anthropic"}}"#,
+        )
+        .unwrap();
+        super::remove_claude_settings_env("ANTHROPIC_BASE_URL", "http://127.0.0.1:6867", None)
+            .expect("teardown");
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            value["env"]["ANTHROPIC_BASE_URL"], "https://gateway.example/anthropic",
+            "a user's gateway must survive teardown"
+        );
+
+        // ...and when setup captured one before taking over, it comes back.
+        fs::write(
+            &settings_path,
+            br#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:6868"}}"#,
+        )
+        .unwrap();
+        super::remove_claude_settings_env(
+            "ANTHROPIC_BASE_URL",
+            "http://127.0.0.1:6867",
+            Some("https://gateway.example/anthropic"),
+        )
+        .expect("teardown");
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            value["env"]["ANTHROPIC_BASE_URL"],
+            "https://gateway.example/anthropic"
+        );
     }
 
     #[test]
