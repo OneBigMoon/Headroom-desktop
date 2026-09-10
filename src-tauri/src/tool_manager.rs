@@ -8879,11 +8879,16 @@ impl ToolManager {
     /// first or the "update" reinstalls the same commit. Plain `install`/`add`
     /// on an installed plugin is a no-op, which is why Update cannot just be
     /// the install path replayed.
-    fn install_plugin_into(&self, plugin: &'static PluginAddon, host: PluginHost) -> Result<()> {
+    fn install_plugin_into(
+        &self,
+        plugin: &'static PluginAddon,
+        host: PluginHost,
+        enable: bool,
+    ) -> Result<()> {
         let cli = host.cli().context("CLI not found on PATH")?;
         if uses_codex_plugin_adapter(plugin, host) {
             self.install_codex_adapter_plugin(plugin, &cli)?;
-            set_codex_plugin_enabled(plugin, true)?;
+            set_codex_plugin_enabled(plugin, enable)?;
             return Ok(());
         }
         let plugin_present = host.plugin_present_checked(plugin)?;
@@ -8925,10 +8930,21 @@ impl ToolManager {
             bail!("install completed but the plugin was not registered");
         }
         if matches!(host, PluginHost::Codex) {
-            // `plugin add` may preserve an existing disabled flag. Install and
-            // Update are explicit enable actions in Headroom, so make the
-            // resulting Codex state unambiguous without another CLI refresh.
-            set_codex_plugin_enabled(plugin, true)?;
+            // `plugin add` may preserve an existing disabled flag -- or drop it.
+            // Install and update both make the resulting Codex state unambiguous
+            // without another CLI refresh, just from opposite directions: the
+            // update path passes `enable = false` so refreshing an addon the user
+            // switched off cannot switch it back on.
+            set_codex_plugin_enabled(plugin, enable)?;
+        } else if !enable {
+            // Claude Code owns the same choice behind its own CLI, which
+            // `plugin update` is free to leave enabled.
+            self.run_plugin_cmd(
+                plugin,
+                &cli,
+                host,
+                &["plugin", "disable", plugin.plugin_ref],
+            )?;
         }
         Ok(())
     }
@@ -9227,7 +9243,10 @@ impl ToolManager {
     /// it is too old to support `plugin add` -- the caller nudges the user to
     /// update Codex. A too-old Codex is not a real error (no Sentry warning); it
     /// is a version skew the user can only fix by updating Codex.
-    pub fn install_plugin(&self, id: &str) -> Result<bool> {
+    ///
+    /// `enable = false` is the update path for an addon the user disabled:
+    /// refreshing the files must not switch the addon back on.
+    pub fn install_plugin(&self, id: &str, enable: bool) -> Result<bool> {
         // Serialize plugin registry, marketplace, receipt, and runtime
         // mutations so concurrent addon operations cannot lose updates.
         let _guard = PACKAGE_UPDATE_LOCK.get_or_init(|| Mutex::new(())).lock();
@@ -9318,7 +9337,7 @@ impl ToolManager {
         let mut newly_registered_hosts = Vec::new();
         let mut codex_outdated = false;
         for (host, was_registered) in hosts {
-            match self.install_plugin_into(plugin, host) {
+            match self.install_plugin_into(plugin, host, enable) {
                 Ok(()) => {
                     installed_any = true;
                     if !was_registered {
@@ -9427,25 +9446,33 @@ impl ToolManager {
         let version = installed_plugin_version(plugin)
             .or(previous_version)
             .unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
-        if let Err(err) = self.ensure_plugin_runtime(plugin) {
-            rollback_hosts(self);
-            let _ = self.remove_plugin_runtime(plugin);
-            return Err(err);
+        if enable {
+            if let Err(err) = self.ensure_plugin_runtime(plugin) {
+                rollback_hosts(self);
+                let _ = self.remove_plugin_runtime(plugin);
+                return Err(err);
+            }
         }
         if let Err(err) = self.write_tool_receipt(
             plugin.id,
-            Self::plugin_receipt_payload(plugin, &version, true),
+            Self::plugin_receipt_payload(plugin, &version, enable),
         ) {
             rollback_hosts(self);
             let _ = self.remove_plugin_runtime(plugin);
             return Err(err);
         }
-        if let Err(err) = self.enforce_exclusive_plugin_group(plugin.id) {
-            rollback_hosts(self);
-            let _ = self.remove_plugin_runtime(plugin);
-            let _ =
-                std::fs::remove_file(self.runtime.tools_dir.join(format!("{}.json", plugin.id)));
-            return Err(err);
+        if enable {
+            if let Err(err) = self.enforce_exclusive_plugin_group(plugin.id) {
+                rollback_hosts(self);
+                let _ = self.remove_plugin_runtime(plugin);
+                let _ = std::fs::remove_file(
+                    self.runtime.tools_dir.join(format!("{}.json", plugin.id)),
+                );
+                return Err(err);
+            }
+        } else if let Err(err) = self.remove_plugin_runtime(plugin) {
+            // The addon stays disabled, so its runtime must stay unregistered.
+            log::warn!("{id} updated while disabled, but removing its runtime failed: {err:#}");
         }
         Ok(codex_outdated)
     }
@@ -9485,7 +9512,7 @@ impl ToolManager {
                 if present {
                     set_codex_plugin_enabled(plugin, enabled)
                 } else if enabled {
-                    self.install_plugin_into(plugin, host)
+                    self.install_plugin_into(plugin, host, true)
                 } else {
                     continue;
                 }
@@ -9501,7 +9528,7 @@ impl ToolManager {
                     continue;
                 };
                 if enabled {
-                    self.install_plugin_into(plugin, host)
+                    self.install_plugin_into(plugin, host, true)
                 } else if present {
                     self.run_plugin_cmd(
                         plugin,
@@ -20088,6 +20115,77 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
         assert!(super::is_plugin_addon("allinluna"));
     }
 
+    /// The UI reuses `install_addon` as its update path. Refreshing an addon the
+    /// user switched off must leave that choice alone: the files are updated,
+    /// but the plugin stays disabled instead of being switched back on.
+    #[test]
+    #[serial_test::serial]
+    fn updating_a_disabled_plugin_leaves_it_disabled() {
+        let (root, runtime, manager) = seed_test_runtime("plugin-update-disabled");
+        let _home = HomeGuard::new(&root);
+        let codex_home = root.join(".codex");
+        fs::create_dir_all(&codex_home).expect("Codex home");
+        let plugin = PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "superpowers")
+            .expect("Superpowers addon");
+        let config = codex_home.join("config.toml");
+        fs::write(
+            &config,
+            b"[plugins.\"superpowers@openai-curated\"]\nsource = \"managed\"\nenabled = false\n",
+        )
+        .expect("disabled Codex plugin registration");
+        let receipt = runtime.tools_dir.join(format!("{}.json", plugin.id));
+        fs::write(
+            &receipt,
+            br#"{"managedBy":"Headroom","pluginId":"superpowers","version":"1.0.0","enabled":false}"#,
+        )
+        .expect("managed receipt");
+        let invoked = root.join("codex-invoked");
+        // `plugin add` is allowed to drop an existing disabled flag, so the fake
+        // CLI re-enables the plugin on every call: the update path has to put the
+        // user's choice back.
+        write_executable(
+            &root.join(".local/bin/codex"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{invoked}'\n\
+                 printf '[plugins.\"superpowers@openai-curated\"]\\nsource = \"managed\"\\nenabled = true\\n' > '{config}'\n\
+                 exit 0\n",
+                invoked = invoked.display(),
+                config = config.display()
+            ),
+        );
+
+        manager
+            .install_plugin(plugin.id, false)
+            .expect("updating a disabled addon must succeed");
+
+        assert!(
+            !manager.tool_enabled(plugin.id),
+            "an update must not switch a disabled addon back on"
+        );
+        let after = fs::read_to_string(&config).expect("Codex config");
+        assert!(
+            after.contains("enabled = false"),
+            "update rewrote the Codex plugin flag: {after}"
+        );
+        let calls = fs::read_to_string(&invoked).expect("codex was invoked");
+        assert!(
+            calls.contains("plugin add superpowers@openai-curated"),
+            "unexpected Codex calls: {calls}"
+        );
+
+        // The other direction still works: an enabled addon that is installed
+        // again ends up enabled, so an install is still an enable action.
+        manager
+            .install_plugin(plugin.id, true)
+            .expect("updating an enabled addon");
+        assert!(manager.tool_enabled(plugin.id));
+        let enabled = fs::read_to_string(&config).expect("Codex config");
+        assert!(enabled.contains("enabled = true"), "{enabled}");
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn uninstall_plugin_is_noop_without_receipt() {
         // Cleanup must not touch plugin/marketplace config Headroom never wrote.
@@ -20180,7 +20278,7 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
         );
 
         let err = manager
-            .install_plugin("allinluna")
+            .install_plugin("allinluna", true)
             .expect_err("existing user plugin must not be adopted implicitly");
         assert!(
             err.to_string().contains("refusing to take over existing"),
@@ -20282,7 +20380,7 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
 
         // Capture every result and always run uninstall before asserting, so a
         // failed assertion never leaves the plugin behind on the real machine.
-        let install = manager.install_plugin(&id);
+        let install = manager.install_plugin(&id, true);
         let installed = manager.plugin_installed(&id);
         let disable = manager.set_plugin_enabled(&id, false);
         let disabled = !manager.tool_enabled(&id);
@@ -20325,7 +20423,7 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
         for id in ids.split(',').map(str::trim).filter(|id| !id.is_empty()) {
             super::plugin_addon(id).unwrap_or_else(|| panic!("unknown plugin addon: {id}"));
             manager
-                .install_plugin(id)
+                .install_plugin(id, true)
                 .unwrap_or_else(|err| panic!("install {id}: {err:#}"));
             manager
                 .smoke_test_plugin(id)

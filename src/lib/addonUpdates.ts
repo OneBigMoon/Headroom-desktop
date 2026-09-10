@@ -126,8 +126,10 @@ export function applyAddonUpdateChecks(
     const comparison = compareAddonVersions(check.latestVersion, tool.version);
     const upstreamAhead = comparison === 1;
     // A fresh successful check is authoritative; do not carry an optimistic
-    // action over after the upstream version catches up.
-    const updateActionAvailable = tool.enabled && upstreamAhead;
+    // action over after the upstream version catches up. Updating installs the
+    // pinned version and never touches the enable state, so a disabled tool is
+    // still updatable.
+    const updateActionAvailable = upstreamAhead;
     if (DIRECT_UPSTREAM_UPDATE_IDS.has(tool.id) && comparison === null) {
       return {
         ...tool,
@@ -147,8 +149,8 @@ export function applyAddonUpdateChecks(
         updateActionAvailable,
         repairActionAvailable,
         updateCheckFailed: false,
-        updateAvailable: upstreamAhead && tool.enabled,
-        availableVersion: upstreamAhead && tool.enabled ? check.latestVersion : null,
+        updateAvailable: upstreamAhead,
+        availableVersion: upstreamAhead ? check.latestVersion : null,
         upstreamVersion: check.latestVersion,
         upstreamUpdateAvailable: upstreamAhead,
         updateRequiresAppUpdate: false,
@@ -159,8 +161,8 @@ export function applyAddonUpdateChecks(
         ...tool,
         updateActionAvailable,
         repairActionAvailable,
-        updateAvailable: upstreamAhead && tool.enabled,
-        availableVersion: upstreamAhead && tool.enabled ? check.latestVersion : null,
+        updateAvailable: upstreamAhead,
+        availableVersion: upstreamAhead ? check.latestVersion : null,
         upstreamVersion: check.latestVersion,
         upstreamUpdateAvailable: upstreamAhead,
         updateRequiresAppUpdate: false,

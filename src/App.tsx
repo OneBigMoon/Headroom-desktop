@@ -1673,11 +1673,6 @@ function AddonCard({
             })}
           </p>
         ) : null}
-        {upstreamUpdateAvailable && !updateAvailable && !updateRequiresAppUpdate && upstreamVersion ? (
-          <p className="addon-card__notice addon-card__notice--update">
-            {t("addons.enableBeforeUpdate", { latest: formatAddonVersion(upstreamVersion, resolvedLocale) })}
-          </p>
-        ) : null}
         {updateCheckFailed ? (
           <p className="addon-card__notice">{t("addons.updateCheckFailed")}</p>
         ) : null}
@@ -5282,23 +5277,6 @@ export default function App() {
       tool.status !== "not_installed" &&
       tool.updateActionAvailable === true
   ).length;
-  const disabledAddonUpdates = checkedTools.filter(
-    (tool) =>
-      !tool.required &&
-      tool.status !== "not_installed" &&
-      tool.enabled === false &&
-      tool.upstreamUpdateAvailable === true
-  ).length;
-  const disabledAddonUpdatesLabel =
-    resolvedLocale === "zh-CN"
-      ? `有 ${disabledAddonUpdates} 个工具可更新，但需先启用`
-      : resolvedLocale === "zh-TW"
-        ? `有 ${disabledAddonUpdates} 個工具可更新，但需先啟用`
-        : resolvedLocale === "ja"
-          ? `${disabledAddonUpdates} 件の更新は有効化後に実行できます`
-          : resolvedLocale === "ko"
-            ? `업데이트 ${disabledAddonUpdates}개는 먼저 활성화해야 합니다`
-            : `${disabledAddonUpdates} updates require enabling the tool first`;
   const lifetimeDataDays = new Set(
     dashboard.dailySavings
       .map((point) => point.date)
@@ -7717,11 +7695,6 @@ export default function App() {
                 !claudeProjects.some((project) => project.projectPath === headroomLearnStatus.projectPath) ? (
                   <p className="install-progress__error" role="alert">{headroomLearnStatus.error}</p>
                 ) : null}
-                {addonUpdatesChecked && !addonUpdateBusy && disabledAddonUpdates > 0 ? (
-                  <span className="addons-card__update-disabled-notice">
-                    {disabledAddonUpdatesLabel}
-                  </span>
-                ) : null}
               </div>
             </article>
 
@@ -7872,7 +7845,9 @@ export default function App() {
                       availableVersion={tool.availableVersion ?? null}
                       unavailableReason={tool.unavailableReason ?? null}
                       onUpdate={() =>
-                        void runAddonAction("install_addon", tool.id, undefined, {
+                        // Pass the current enable state so updating a disabled
+                        // addon refreshes its files without switching it on.
+                        void runAddonAction("install_addon", tool.id, tool.enabled, {
                           busy: t(tool.repairActionAvailable ? "addons.repairing" : "addons.updating", { name: tool.name }),
                           done: t(tool.repairActionAvailable ? "addons.repaired" : "addons.updated", { name: tool.name })
                         }, tool.availableVersion)
@@ -7944,7 +7919,7 @@ export default function App() {
                   null
                 }
                 onUpdate={() =>
-                  void runAddonAction("install_addon", "rtk", undefined, {
+                  void runAddonAction("install_addon", "rtk", runtimeStatus?.rtk.enabled === true, {
                     busy: t("addons.updating", { name: "RTK" }),
                     done: t("addons.updated", { name: "RTK" })
                   }, checkedRtkTool?.availableVersion)

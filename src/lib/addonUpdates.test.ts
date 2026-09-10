@@ -149,15 +149,32 @@ describe("addon update checks", () => {
     expect(checked.updateActionAvailable).toBe(false);
   });
 
-  it("does not make a disabled update actionable", () => {
-    const [checked] = applyAddonUpdateChecks(
-      [tool({ id: "context7", enabled: false })],
-      [{ id: "context7", latestVersion: "4.0.4", error: null }],
+  it("keeps the update actionable while the tool stays disabled", () => {
+    const [directUpstream, marketplacePlugin] = applyAddonUpdateChecks(
+      [
+        tool({ id: "context7", enabled: false }),
+        tool({ id: "ponytail", enabled: false, version: "4.9.0", supportedVersion: "latest" }),
+      ],
+      [
+        { id: "context7", latestVersion: "4.0.4", error: null },
+        { id: "ponytail", latestVersion: "5.0.0", error: null },
+      ],
     );
-    expect(checked).toMatchObject({
+
+    expect(directUpstream).toMatchObject({
+      enabled: false,
+      updateActionAvailable: true,
+      updateAvailable: true,
+      availableVersion: "4.0.4",
       upstreamUpdateAvailable: true,
-      updateAvailable: false,
-      availableVersion: null,
+      updateRequiresAppUpdate: false,
+    });
+    expect(marketplacePlugin).toMatchObject({
+      enabled: false,
+      updateActionAvailable: true,
+      updateAvailable: true,
+      availableVersion: "5.0.0",
+      upstreamUpdateAvailable: true,
       updateRequiresAppUpdate: false,
     });
   });

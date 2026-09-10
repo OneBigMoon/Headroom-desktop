@@ -1272,38 +1272,47 @@ async fn install_addon(
     state: State<'_, AppState>,
     id: String,
     version: Option<String>,
+    // The UI reuses this command for updates. `enable: Some(false)` means the
+    // addon is currently switched off, so refreshing its files must not switch
+    // its integration back on. `None` keeps the install behaviour: enabling.
+    enabled: Option<bool>,
 ) -> Result<DashboardState, String> {
+    let enable = enabled.unwrap_or(true);
     match id.as_str() {
         "markitdown" => {
             state
                 .tool_manager
                 .install_markitdown_version(version.as_deref())
                 .map_err(command_error)?;
-            client_adapters::enable_markitdown_integration(
-                &state.tool_manager.markitdown_entrypoint(),
-                &state.tool_manager.markitdown_shim_path(),
-                &state.tool_manager.managed_python(),
-            )
-            .map_err(|err| {
-                format!("markitdown installed but enabling integration failed: {err:#}")
-            })?;
+            if enable {
+                client_adapters::enable_markitdown_integration(
+                    &state.tool_manager.markitdown_entrypoint(),
+                    &state.tool_manager.markitdown_shim_path(),
+                    &state.tool_manager.managed_python(),
+                )
+                .map_err(|err| {
+                    format!("markitdown installed but enabling integration failed: {err:#}")
+                })?;
+            }
         }
         "rtk" => {
             state
                 .tool_manager
                 .install_rtk_version(version.as_deref())
                 .map_err(command_error)?;
-            client_adapters::set_rtk_enabled(
-                true,
-                &state.tool_manager.rtk_entrypoint(),
-                &state.tool_manager.managed_python(),
-            )
-            .map_err(|err| format!("rtk installed but enabling integration failed: {err:#}"))?;
+            if enable {
+                client_adapters::set_rtk_enabled(
+                    true,
+                    &state.tool_manager.rtk_entrypoint(),
+                    &state.tool_manager.managed_python(),
+                )
+                .map_err(|err| format!("rtk installed but enabling integration failed: {err:#}"))?;
+            }
         }
         plugin_id if tool_manager::is_plugin_addon(plugin_id) => {
             let codex_outdated = state
                 .tool_manager
-                .install_plugin(&id)
+                .install_plugin(&id, enable)
                 .map_err(command_error)?;
             if codex_outdated {
                 let name = match id.as_str() {
@@ -1324,15 +1333,17 @@ async fn install_addon(
                 .tool_manager
                 .install_serena_version(version.as_deref())
                 .map_err(command_error)?;
-            if let Err(err) = client_adapters::enable_serena_integration() {
-                return match state.tool_manager.set_serena_enabled(false) {
-                    Ok(()) => Err(format!(
-                        "Serena usage instructions failed, so Serena was disabled again: {err:#}"
-                    )),
-                    Err(rollback_err) => Err(format!(
-                        "Serena usage instructions failed ({err:#}); disabling Serena also failed: {rollback_err:#}"
-                    )),
-                };
+            if enable {
+                if let Err(err) = client_adapters::enable_serena_integration() {
+                    return match state.tool_manager.set_serena_enabled(false) {
+                        Ok(()) => Err(format!(
+                            "Serena usage instructions failed, so Serena was disabled again: {err:#}"
+                        )),
+                        Err(rollback_err) => Err(format!(
+                            "Serena usage instructions failed ({err:#}); disabling Serena also failed: {rollback_err:#}"
+                        )),
+                    };
+                }
             }
         }
         "context7" => {
