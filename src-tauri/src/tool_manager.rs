@@ -445,7 +445,11 @@ endpoint was silently replaced). The guard re-points the reconciler at the
 URL clients actually use (HEADROOM_INGRESS_URL, default
 http://127.0.0.1:6867), which makes the loop guard branch fire instead of
 the capture branch -- and still captures every genuine third-party
-endpoint. Kill switch: HEADROOM_CC_SWITCH_SELF_URL=0.
+endpoint. It also treats a base_url already sitting on any of the desktop's
+own loopback ports as ours rather than as a provider: an install that
+already carries the 6868 the old reconciler wrote would otherwise be
+"captured" as the upstream and looped straight back into the proxy.
+Kill switch: HEADROOM_CC_SWITCH_SELF_URL=0.
 """
 import faulthandler
 import signal
@@ -1067,6 +1071,10 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-local-community-proxy":
             "HEADROOM_CC_SWITCH_SELF_URL", "1"
         ).strip().lower() not in ("0", "false", "no", "off"):
             import headroom.proxy.cc_switch_reconciler as _hd_cc
+            import json as _hd_cc_json
+            import logging as _hd_cc_logging
+
+            _hd_cc_log = _hd_cc_logging.getLogger("headroom.proxy")
 
             _hd_cc_self = (
                 _hd_os.environ.get("HEADROOM_INGRESS_URL") or "http://127.0.0.1:6867"
@@ -1085,6 +1093,68 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-local-community-proxy":
                 return _hd_cc_orig_init(self, *args, **kwargs)
 
             _hd_cc.CCSwitchReconciler.__init__ = _hd_cc_init
+
+            # Every loopback port the desktop itself serves on: the ingress
+            # (6867), the backend proxy (6868, or 6869..=6890 when something
+            # already holds 6868) and the Codex router (6891).
+            def _hd_cc_is_our_url(url):
+                try:
+                    from urllib.parse import urlsplit
+
+                    parts = urlsplit(url if "://" in url else "http://" + url)
+                    if (parts.hostname or "").strip("[]") not in (
+                        "127.0.0.1",
+                        "localhost",
+                        "::1",
+                    ):
+                        return False
+                    port = parts.port
+                except Exception:
+                    return False
+                return port is not None and 6867 <= port <= 6891
+
+            _hd_cc_orig_tick = _hd_cc.CCSwitchReconciler.tick
+
+            def _hd_cc_tick(self):
+                # A base_url already pointing at one of OUR ports -- the
+                # backend port this reconciler used to write, a fallback, or
+                # the Codex router -- is not a third-party gateway. Upstream
+                # would "capture" it as the upstream and then forward Anthropic
+                # traffic straight back into the proxy: the self-loop again,
+                # and worse than leaving the stale value alone. Make the file
+                # say the ingress URL instead, which is where the client
+                # should have been pointing.
+                try:
+                    mtime_ns = self.path.stat().st_mtime_ns
+                    if mtime_ns == self._last_mtime_ns:
+                        return False
+                    data = _hd_cc_json.loads(self.path.read_text(encoding="utf-8"))
+                    env = data.get("env")
+                    url = env.get("ANTHROPIC_BASE_URL") if isinstance(env, dict) else None
+                    if (
+                        isinstance(url, str)
+                        and _hd_cc_is_our_url(url)
+                        and url.rstrip("/") != self.proxy_url
+                    ):
+                        env = dict(env)
+                        env["ANTHROPIC_BASE_URL"] = self.proxy_url
+                        data = dict(data)
+                        data["env"] = env
+                        self._atomic_write(data)
+                        _hd_cc_log.warning(
+                            "event=cc_switch_reconciler_normalized_stale_self_url "
+                            "from=%s to=%s (leftover Headroom port, not a provider)",
+                            url,
+                            self.proxy_url,
+                        )
+                        return True
+                except Exception:
+                    # Any surprise falls through to upstream behaviour rather
+                    # than leaving the file unmanaged.
+                    pass
+                return _hd_cc_orig_tick(self)
+
+            _hd_cc.CCSwitchReconciler.tick = _hd_cc_tick
     except Exception:
         pass
 "#;
@@ -15414,6 +15484,20 @@ asyncio.run(verify())
         // Must be off-switchable and must never take the backend down.
         assert!(py.contains("HEADROOM_CC_SWITCH_SELF_URL"));
         assert!(py.contains("except Exception:"));
+        // A leftover base_url on one of our own ports -- the backend port this
+        // very reconciler used to write -- must be normalized to the ingress,
+        // never "captured" as a third-party gateway: capturing it sends
+        // Anthropic traffic straight back into the proxy (an upgrade from the
+        // affected build carries exactly that file).
+        assert!(py.contains("_hd_cc.CCSwitchReconciler.tick = _hd_cc_tick"));
+        assert!(py.contains("6867 <= port <= 6891"));
+        assert!(py.contains("event=cc_switch_reconciler_normalized_stale_self_url"));
+        // The wrapper runs outside the reconciler module, so its imports are
+        // its own -- a bare `json.` there is a NameError that silently falls
+        // back to the capture path (it did, until this was caught live).
+        assert!(py.contains("import json as _hd_cc_json"));
+        assert!(py.contains("_hd_cc_json.loads("));
+        assert!(!py.contains("data = json.loads("));
     }
 
     #[test]
