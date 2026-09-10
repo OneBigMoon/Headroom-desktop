@@ -12292,6 +12292,180 @@ keep rtk\n\
         );
     }
 
+    /// Line-level diff for the rehearsal printout. Only used to make the
+    /// evidence readable; the assertions are semantic.
+    #[cfg(test)]
+    fn rehearsal_line_diff(left: &str, right: &str) -> String {
+        let left_lines: Vec<&str> = left.lines().collect();
+        let right_lines: Vec<&str> = right.lines().collect();
+        let mut out = String::new();
+        for line in &left_lines {
+            if !right_lines.contains(line) {
+                out.push_str(&format!("- {line}\n"));
+            }
+        }
+        for line in &right_lines {
+            if !left_lines.contains(line) {
+                out.push_str(&format!("+ {line}\n"));
+            }
+        }
+        if out.is_empty() {
+            out.push_str("(no line-level difference)\n");
+        }
+        out
+    }
+
+    /// Flatten parsed TOML to `path -> value`, so a round trip can be checked
+    /// key by key instead of by string comparison.
+    fn flatten_toml(
+        value: &toml::Value,
+        prefix: &str,
+        out: &mut std::collections::BTreeMap<String, String>,
+    ) {
+        match value {
+            toml::Value::Table(table) => {
+                for (key, child) in table {
+                    let path = if prefix.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    flatten_toml(child, &path, out);
+                }
+            }
+            other => {
+                out.insert(prefix.to_string(), format!("{other:?}"));
+            }
+        }
+    }
+
+    /// Rehearse the whole Codex connector against a *copy* of a real
+    /// `config.toml` that another tool owns, in a throwaway HOME.
+    ///
+    /// Ignored by default: it needs a real config and touches nothing of the
+    /// caller's. Run it before claiming a coexistence change is safe:
+    ///
+    /// ```text
+    /// HEADROOM_REHEARSAL_CODEX_CONFIG=~/.codex/config.toml \
+    ///   cargo test --lib rehearsal_codex_round_trip -- --ignored --nocapture
+    /// ```
+    ///
+    /// The three claims it proves, in order: verification classifies the other
+    /// tool as the owner without writing anything; a confirmed takeover routes
+    /// Codex through Headroom while keeping the other tool's provider table;
+    /// disabling restores the file to a *semantically identical* document, so
+    /// the other tool never learns Headroom was there.
+    #[test]
+    #[serial_test::serial]
+    #[ignore = "needs HEADROOM_REHEARSAL_CODEX_CONFIG pointing at a real config.toml"]
+    fn rehearsal_codex_round_trip_on_a_real_config() {
+        let Ok(seed) = std::env::var("HEADROOM_REHEARSAL_CODEX_CONFIG") else {
+            eprintln!("set HEADROOM_REHEARSAL_CODEX_CONFIG to run the rehearsal");
+            return;
+        };
+        let original = fs::read_to_string(&seed).expect("rehearsal config is readable");
+        let parsed_original: toml::Value = original
+            .parse()
+            .unwrap_or_else(|e| panic!("the seeded config is valid toml: {e}"));
+
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# rehearsal zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config = codex_dir.join("config.toml");
+        fs::write(&config, &original).unwrap();
+
+        // 1. Nothing is written just by looking, and the other tool is named as
+        //    the current owner instead of Headroom reporting a broken install.
+        let before = super::verify_client_setup("codex").expect("verify runs");
+        eprintln!(
+            "[1] foreign_provider={:?} verified={} failures={:?}",
+            before.foreign_provider, before.verified, before.failures
+        );
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            original,
+            "verification must be read-only"
+        );
+        assert!(
+            before
+                .failures
+                .iter()
+                .all(|failure| !failure.contains("provider block was not found")),
+            "a tool that owns the route is not a Headroom failure, got: {:?}",
+            before.failures
+        );
+
+        // 2. A confirmed takeover routes Codex through Headroom and leaves the
+        //    other tool's provider table (and its token) alone.
+        super::apply_client_setup_with_options("codex", true).expect("confirmed takeover");
+        let after_apply = fs::read_to_string(&config).unwrap();
+        eprintln!("[2] takeover diff:\n{}", rehearsal_line_diff(&original, &after_apply));
+        let parsed_apply: toml::Value = after_apply
+            .parse()
+            .unwrap_or_else(|e| panic!("valid toml after takeover: {e}\n{after_apply}"));
+        assert_eq!(
+            parsed_apply.get("model_provider").and_then(|v| v.as_str()),
+            Some("headroom_local_community")
+        );
+        assert!(super::codex_provider_block_matches().unwrap());
+        assert!(
+            parsed_apply
+                .get("model_providers")
+                .and_then(|v| v.get("codex_local_access"))
+                .is_some(),
+            "the displaced provider's table must survive, got:\n{after_apply}"
+        );
+        let after = super::verify_client_setup("codex").expect("verify runs");
+        assert!(
+            after.verified && after.failures.is_empty(),
+            "once Headroom owns the route the connector verifies, got: {:?}",
+            after.failures
+        );
+
+        // 3. Disable hands the route back. Semantic equality, not string
+        //    equality: the renderer may normalize blank lines, and the other
+        //    tool only ever sees parsed TOML.
+        super::disable_client_setup("codex").expect("disable runs");
+        let restored = fs::read_to_string(&config).unwrap();
+        eprintln!("[3] disable diff:\n{}", rehearsal_line_diff(&original, &restored));
+        let parsed_restored: toml::Value = restored
+            .parse()
+            .unwrap_or_else(|e| panic!("valid toml after disable: {e}\n{restored}"));
+        assert!(
+            !restored.contains("headroom-local-community"),
+            "no Headroom marker may survive disable, got:\n{restored}"
+        );
+
+        // The coexistence guarantee, stated as an invariant rather than as
+        // "the files are equal": disable may remove Headroom's own provider
+        // table, and may not add, drop, or rewrite anything else. The seeded
+        // config legitimately carries a leftover Headroom table from an earlier
+        // run, which is exactly what a teardown is supposed to clean up.
+        let mut expected = std::collections::BTreeMap::new();
+        flatten_toml(&parsed_original, "", &mut expected);
+        let mut actual = std::collections::BTreeMap::new();
+        flatten_toml(&parsed_restored, "", &mut actual);
+        for (path, value) in &expected {
+            match actual.get(path) {
+                Some(kept) => assert_eq!(
+                    kept, value,
+                    "{path} must survive the round trip unchanged"
+                ),
+                None => assert!(
+                    path.starts_with("model_providers.headroom_local_community"),
+                    "{path} belongs to another tool and must not be dropped"
+                ),
+            }
+        }
+        for path in actual.keys() {
+            assert!(
+                expected.contains_key(path),
+                "disable must not introduce {path}"
+            );
+        }
+    }
+
     #[test]
     fn strip_codex_managed_toml_keeps_a_foreign_provider_table_wrapped_in_our_block() {
         // Another provider manager (observed: Cockpit Tools' `codex_local_access`)
