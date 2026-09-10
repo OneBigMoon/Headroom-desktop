@@ -1161,6 +1161,22 @@ action = sys.argv[1]
 legacy_ledger = Path(sys.argv[3]) if len(sys.argv) > 3 else None
 failures = []
 
+def registrar_call(registrar, label, call, *args, **kwargs):
+    """Run one registrar call, downgrading an unusable agent CLI to a skip.
+
+    A detected CLI that exec() refuses -- Homebrew leaves a `claude` shim
+    behind when its native binary never downloaded, and a wrong-architecture
+    build or a missing interpreter fails the same way -- raises OSError out of
+    subprocess. Letting it escape aborted the whole addon operation, and the
+    user saw only a cause-free "installation failed". One unusable agent must
+    not block the others.
+    """
+    try:
+        return call(*args, **kwargs)
+    except OSError as exc:
+        print(f"{registrar.name}: {label} skipped, CLI is not runnable ({exc})")
+        return None
+
 def headroom_owns_serena(registrar, current):
     if headroom_installed_matching(registrar.name, current):
         return True
@@ -1199,11 +1215,17 @@ for registrar, context in registrars:
                 "False",
             ),
         )
-        result = registrar.register_server(spec)
+        result = registrar_call(registrar, "register", registrar.register_server, spec)
+        if result is None:
+            continue
         if result.status == RegisterStatus.MISMATCH:
             current = registrar.get_server("serena")
             if headroom_owns_serena(registrar, current):
-                result = registrar.register_server(spec, force=True)
+                result = registrar_call(
+                    registrar, "register", registrar.register_server, spec, force=True
+                )
+                if result is None:
+                    continue
         if result.status == RegisterStatus.REGISTERED:
             record_install(registrar.name, spec)
         elif result.status == RegisterStatus.MISMATCH:
@@ -1219,7 +1241,14 @@ for registrar, context in registrars:
         if not headroom_installed_matching(registrar.name, current):
             print(f"{registrar.name}: serena entry is user-managed, leaving it")
             continue
-        if registrar.unregister_server("serena"):
+        removed = registrar_call(
+            registrar, "unregister", registrar.unregister_server, "serena"
+        )
+        if removed is None:
+            # The agent CLI cannot run, so removal cannot be confirmed.
+            # Report nothing rather than a failure nobody can act on.
+            continue
+        if removed:
             clear_install(registrar.name, "serena")
             print(f"{registrar.name}: removed")
         else:
@@ -1261,6 +1290,22 @@ action = sys.argv[1]
 legacy_ledger = Path(sys.argv[3]) if len(sys.argv) > 3 else None
 failures = []
 
+def registrar_call(registrar, label, call, *args, **kwargs):
+    """Run one registrar call, downgrading an unusable agent CLI to a skip.
+
+    A detected CLI that exec() refuses -- Homebrew leaves a `claude` shim
+    behind when its native binary never downloaded, and a wrong-architecture
+    build or a missing interpreter fails the same way -- raises OSError out of
+    subprocess. Letting it escape aborted the whole addon operation, and the
+    user saw only a cause-free "installation failed". One unusable agent must
+    not block the others.
+    """
+    try:
+        return call(*args, **kwargs)
+    except OSError as exc:
+        print(f"{registrar.name}: {label} skipped, CLI is not runnable ({exc})")
+        return None
+
 def headroom_owns(registrar, current):
     if headroom_installed_matching(registrar.name, current):
         return True
@@ -1278,11 +1323,17 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
             command="npx",
             args=("-y", sys.argv[2]),
         )
-        result = registrar.register_server(spec)
+        result = registrar_call(registrar, "register", registrar.register_server, spec)
+        if result is None:
+            continue
         if result.status == RegisterStatus.MISMATCH:
             current = registrar.get_server("context7")
             if headroom_owns(registrar, current):
-                result = registrar.register_server(spec, force=True)
+                result = registrar_call(
+                    registrar, "register", registrar.register_server, spec, force=True
+                )
+                if result is None:
+                    continue
         if result.status == RegisterStatus.REGISTERED:
             record_install(registrar.name, spec)
         elif result.status == RegisterStatus.MISMATCH:
@@ -1298,7 +1349,14 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
         if not headroom_owns(registrar, current):
             print(f"{registrar.name}: context7 entry is user-managed, leaving it")
             continue
-        if registrar.unregister_server("context7"):
+        removed = registrar_call(
+            registrar, "unregister", registrar.unregister_server, "context7"
+        )
+        if removed is None:
+            # The agent CLI cannot run, so removal cannot be confirmed.
+            # Report nothing rather than a failure nobody can act on.
+            continue
+        if removed:
             clear_install(registrar.name, "context7")
             print(f"{registrar.name}: removed")
         else:
@@ -1332,6 +1390,22 @@ action = sys.argv[1]
 legacy_ledger = Path(sys.argv[4]) if len(sys.argv) > 4 else None
 failures = []
 
+def registrar_call(registrar, label, call, *args, **kwargs):
+    """Run one registrar call, downgrading an unusable agent CLI to a skip.
+
+    A detected CLI that exec() refuses -- Homebrew leaves a `claude` shim
+    behind when its native binary never downloaded, and a wrong-architecture
+    build or a missing interpreter fails the same way -- raises OSError out of
+    subprocess. Letting it escape aborted the whole addon operation, and the
+    user saw only a cause-free "installation failed". One unusable agent must
+    not block the others.
+    """
+    try:
+        return call(*args, **kwargs)
+    except OSError as exc:
+        print(f"{registrar.name}: {label} skipped, CLI is not runnable ({exc})")
+        return None
+
 def headroom_owns(registrar, current):
     if headroom_installed_matching(registrar.name, current):
         return True
@@ -1349,11 +1423,17 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
             command=sys.argv[2],
             env={"CBM_CACHE_DIR": sys.argv[3]},
         )
-        result = registrar.register_server(spec)
+        result = registrar_call(registrar, "register", registrar.register_server, spec)
+        if result is None:
+            continue
         if result.status == RegisterStatus.MISMATCH:
             current = registrar.get_server("codebase-memory")
             if headroom_owns(registrar, current):
-                result = registrar.register_server(spec, force=True)
+                result = registrar_call(
+                    registrar, "register", registrar.register_server, spec, force=True
+                )
+                if result is None:
+                    continue
         if result.status == RegisterStatus.REGISTERED:
             record_install(registrar.name, spec)
         elif result.status == RegisterStatus.MISMATCH:
@@ -1369,7 +1449,14 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
         if not headroom_owns(registrar, current):
             print(f"{registrar.name}: codebase-memory entry is user-managed, leaving it")
             continue
-        if registrar.unregister_server("codebase-memory"):
+        removed = registrar_call(
+            registrar, "unregister", registrar.unregister_server, "codebase-memory"
+        )
+        if removed is None:
+            # The agent CLI cannot run, so removal cannot be confirmed.
+            # Report nothing rather than a failure nobody can act on.
+            continue
+        if removed:
             clear_install(registrar.name, "codebase-memory")
             print(f"{registrar.name}: removed")
         else:
@@ -8330,11 +8417,20 @@ impl ToolManager {
         })();
 
         if let Err(err) = commit {
+            // The cause chain is what makes this actionable; without it the
+            // user (and support) only ever sees the sentence below. Log it
+            // before the rollback swallows the error into a context string.
+            log::error!("codebase-memory install/update failed: {err:#}");
+            // A first install has nothing to restore, so promising the user
+            // their "previous installation" came back is a lie they cannot
+            // check.
+            let restored = if had_destination || had_receipt {
+                "codebase-memory update failed; restored previous installation"
+            } else {
+                "codebase-memory install failed; nothing was installed"
+            };
             return match self.recover_codebase_memory_pending() {
-                Ok(()) => {
-                    Err(err
-                        .context("codebase-memory update failed; restored previous installation"))
-                }
+                Ok(()) => Err(err.context(restored)),
                 Err(rollback_err) => Err(anyhow!(
                     "codebase-memory update failed: {err:#}; rollback also failed: {rollback_err:#}"
                 )),
@@ -18114,12 +18210,14 @@ after
         let preflight_exit = super::SERENA_MCP_HELPER
             .find("    if failures:\n        sys.exit(\"; \".join(failures))")
             .expect("registration preflight exits on conflicts");
+        // The call is wrapped (`registrar_call`) so an agent CLI that cannot
+        // be executed is a per-agent skip instead of a fatal traceback.
         let first_registration = super::SERENA_MCP_HELPER
-            .find("        result = registrar.register_server(spec)")
+            .find("registrar_call(registrar, \"register\", registrar.register_server, spec)")
             .expect("registration runs after preflight");
         assert!(preflight_exit < first_registration);
         assert!(super::SERENA_MCP_HELPER.contains(
-            "if headroom_owns_serena(registrar, current):\n                result = registrar.register_server(spec, force=True)"
+            "if headroom_owns_serena(registrar, current):\n                result = registrar_call(\n                    registrar, \"register\", registrar.register_server, spec, force=True\n                )"
         ));
         assert!(super::SERENA_MCP_HELPER.contains(
             "elif result.status == RegisterStatus.MISMATCH:\n            failures.append(f\"{registrar.name}: serena entry conflicts with user-managed configuration\")"
@@ -18147,6 +18245,52 @@ after
                 "{tool} entry conflicts with user-managed configuration"
             )));
             assert!(helper.contains("elif result.status == RegisterStatus.MISMATCH:"));
+        }
+    }
+
+    #[test]
+    fn addon_helpers_skip_an_agent_cli_that_cannot_be_executed() {
+        // Reproduced on macOS: Homebrew left /opt/homebrew/bin/claude as a
+        // shim whose native binary never downloaded, so exec() failed with
+        // ENOEXEC. ClaudeRegistrar.detect() still saw a CLI on PATH, the
+        // helper died with a traceback, and the whole addon install aborted
+        // as "codebase-memory update failed; restored previous installation"
+        // with no cause. One unusable agent must not block the others.
+        for (helper, tool) in [
+            (super::SERENA_MCP_HELPER, "serena"),
+            (super::CONTEXT7_MCP_HELPER, "context7"),
+            (super::CODEBASE_MEMORY_MCP_HELPER, "codebase-memory"),
+        ] {
+            assert!(
+                helper.contains("def registrar_call(registrar, label, call, *args, **kwargs):"),
+                "{tool}: the guard must exist"
+            );
+            assert!(
+                helper.contains("except OSError as exc:"),
+                "{tool}: an unrunnable CLI raises OSError, not a RegisterResult"
+            );
+            assert!(
+                helper.contains("CLI is not runnable"),
+                "{tool}: the skip must be reported, not swallowed"
+            );
+            // Every CLI-backed call goes through the guard. A bare call site
+            // is exactly what crashed.
+            assert!(
+                !helper.contains("result = registrar.register_server(spec)\n"),
+                "{tool}: register_server must be wrapped"
+            );
+            assert!(
+                !helper.contains("result = registrar.register_server(spec, force=True)\n"),
+                "{tool}: the forced re-register must be wrapped too"
+            );
+            assert!(
+                !helper.contains(&format!("if registrar.unregister_server(\"{tool}\"):\n")),
+                "{tool}: unregister must be wrapped too"
+            );
+            assert!(
+                helper.contains(&format!("registrar.unregister_server, \"{tool}\"")),
+                "{tool}: unregister must still target {tool}"
+            );
         }
     }
 

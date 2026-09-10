@@ -134,6 +134,18 @@ const APP_UPDATE_PROGRESS_EVENT: &str = "app-update://progress";
 
 type AppUpdateProgressEmitter = Arc<dyn Fn(AppUpdateProgress) + Send + Sync + 'static>;
 
+/// Serialize a command failure with its whole cause chain.
+///
+/// `err.to_string()` keeps only the outermost context, so a real failure
+/// reached the UI as "codebase-memory update failed; restored previous
+/// installation" with no cause attached: the user could not act on it, and
+/// neither could support, because the sentence that said *what* broke (the
+/// registrar that refused, the file that was unwritable) never left the
+/// process. anyhow's alternate form joins the chain instead.
+fn command_error(err: impl std::fmt::Display) -> String {
+    format!("{err:#}")
+}
+
 #[cfg(test)]
 fn noop_app_update_progress_emitter() -> AppUpdateProgressEmitter {
     Arc::new(|_| {})
@@ -183,7 +195,7 @@ impl InstallableAppUpdate for TauriPendingUpdate {
                     },
                 )
                 .await
-                .map_err(|err| err.to_string())
+                .map_err(command_error)
         })
     }
 }
@@ -282,7 +294,7 @@ fn begin_runtime_session_at(path: &Path) -> std::io::Result<bool> {
         Utc::now().to_rfc3339()
     );
     crate::client_adapters::atomic_write(path, contents.as_bytes())
-        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err.to_string()))?;
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, command_error(err)))?;
     Ok(previous_unclean)
 }
 
@@ -742,7 +754,7 @@ async fn get_dashboard_state(app: AppHandle) -> Result<DashboardState, String> {
         dashboard
     })
     .await
-    .map_err(|err| err.to_string())
+    .map_err(command_error)
 }
 
 #[tauri::command]
@@ -812,7 +824,7 @@ async fn check_for_app_update(
         .updater_builder()
         .pubkey(config.pubkey)
         .endpoints(config.endpoints)
-        .map_err(|err| err.to_string())?
+        .map_err(command_error)?
         .on_before_exit(move || {
             log::info!("update: stopping the backend before the installer exits the app");
             SHUTTING_DOWN.store(true, Ordering::Release);
@@ -841,7 +853,7 @@ async fn check_for_app_update(
             finish_runtime_session();
         })
         .build()
-        .map_err(|err| err.to_string())?;
+        .map_err(command_error)?;
 
     let checked_update =
         classify_update_check(updater.check().await).map(|update| update.map(TauriPendingUpdate));
@@ -864,7 +876,7 @@ fn classify_update_check<U>(
             tauri_plugin_updater::Error::TargetNotFound(_)
             | tauri_plugin_updater::Error::TargetsNotFound(_),
         ) => Ok(None),
-        Err(err) => Err(err.to_string()),
+        Err(err) => Err(command_error(err)),
     }
 }
 
@@ -1266,7 +1278,7 @@ async fn install_addon(
             state
                 .tool_manager
                 .install_markitdown_version(version.as_deref())
-                .map_err(|err| err.to_string())?;
+                .map_err(command_error)?;
             client_adapters::enable_markitdown_integration(
                 &state.tool_manager.markitdown_entrypoint(),
                 &state.tool_manager.markitdown_shim_path(),
@@ -1280,7 +1292,7 @@ async fn install_addon(
             state
                 .tool_manager
                 .install_rtk_version(version.as_deref())
-                .map_err(|err| err.to_string())?;
+                .map_err(command_error)?;
             client_adapters::set_rtk_enabled(
                 true,
                 &state.tool_manager.rtk_entrypoint(),
@@ -1292,7 +1304,7 @@ async fn install_addon(
             let codex_outdated = state
                 .tool_manager
                 .install_plugin(&id)
-                .map_err(|err| err.to_string())?;
+                .map_err(command_error)?;
             if codex_outdated {
                 let name = match id.as_str() {
                     "caveman" => "Caveman",
@@ -1311,7 +1323,7 @@ async fn install_addon(
             state
                 .tool_manager
                 .install_serena_version(version.as_deref())
-                .map_err(|err| err.to_string())?;
+                .map_err(command_error)?;
             if let Err(err) = client_adapters::enable_serena_integration() {
                 return match state.tool_manager.set_serena_enabled(false) {
                     Ok(()) => Err(format!(
@@ -1327,13 +1339,13 @@ async fn install_addon(
             state
                 .tool_manager
                 .install_context7_version(version.as_deref())
-                .map_err(|err| err.to_string())?;
+                .map_err(command_error)?;
         }
         "codebase-memory" => {
             state
                 .tool_manager
                 .install_codebase_memory_version(version.as_deref())
-                .map_err(|err| err.to_string())?;
+                .map_err(command_error)?;
         }
         other => return Err(format!("unknown addon: {other}")),
     }
@@ -1358,33 +1370,33 @@ async fn set_addon_enabled(
             state
                 .tool_manager
                 .set_markitdown_enabled(enabled)
-                .map_err(|err| err.to_string())?;
+                .map_err(command_error)?;
             if enabled {
                 client_adapters::enable_markitdown_integration(
                     &state.tool_manager.markitdown_entrypoint(),
                     &state.tool_manager.markitdown_shim_path(),
                     &state.tool_manager.managed_python(),
                 )
-                .map_err(|err| err.to_string())?;
+                .map_err(command_error)?;
             } else {
                 client_adapters::disable_markitdown_integration(
                     &state.tool_manager.markitdown_shim_path(),
                 )
-                .map_err(|err| err.to_string())?;
+                .map_err(command_error)?;
             }
         }
         plugin_id if tool_manager::is_plugin_addon(plugin_id) => {
             state
                 .tool_manager
                 .set_plugin_enabled(&id, enabled)
-                .map_err(|err| err.to_string())?;
+                .map_err(command_error)?;
         }
         "serena" => {
             if enabled {
                 state
                     .tool_manager
                     .set_serena_enabled(true)
-                    .map_err(|err| err.to_string())?;
+                    .map_err(command_error)?;
                 if let Err(err) = client_adapters::enable_serena_integration() {
                     return match state.tool_manager.set_serena_enabled(false) {
                         Ok(()) => Err(format!(
@@ -1396,24 +1408,24 @@ async fn set_addon_enabled(
                     };
                 }
             } else {
-                client_adapters::disable_serena_integration().map_err(|err| err.to_string())?;
+                client_adapters::disable_serena_integration().map_err(command_error)?;
                 state
                     .tool_manager
                     .set_serena_enabled(false)
-                    .map_err(|err| err.to_string())?;
+                    .map_err(command_error)?;
             }
         }
         "context7" => {
             state
                 .tool_manager
                 .set_context7_enabled(enabled)
-                .map_err(|err| err.to_string())?;
+                .map_err(command_error)?;
         }
         "codebase-memory" => {
             state
                 .tool_manager
                 .set_codebase_memory_enabled(enabled)
-                .map_err(|err| err.to_string())?;
+                .map_err(command_error)?;
         }
         other => return Err(format!("unknown addon: {other}")),
     }
@@ -1431,7 +1443,7 @@ async fn set_addon_mode(
     state
         .tool_manager
         .set_addon_mode(&id, &mode)
-        .map_err(|err| err.to_string())?;
+        .map_err(command_error)?;
     Ok(state.dashboard())
 }
 
@@ -1446,11 +1458,11 @@ async fn uninstall_addon(
             client_adapters::disable_markitdown_integration(
                 &state.tool_manager.markitdown_shim_path(),
             )
-            .map_err(|err| err.to_string())?;
+            .map_err(command_error)?;
             state
                 .tool_manager
                 .uninstall_markitdown()
-                .map_err(|err| err.to_string())?;
+                .map_err(command_error)?;
         }
         "rtk" => {
             client_adapters::set_rtk_enabled(
@@ -1458,17 +1470,17 @@ async fn uninstall_addon(
                 &state.tool_manager.rtk_entrypoint(),
                 &state.tool_manager.managed_python(),
             )
-            .map_err(|err| err.to_string())?;
+            .map_err(command_error)?;
             state
                 .tool_manager
                 .uninstall_rtk()
-                .map_err(|err| err.to_string())?;
+                .map_err(command_error)?;
         }
         plugin_id if tool_manager::is_plugin_addon(plugin_id) => {
             state
                 .tool_manager
                 .uninstall_plugin(&id)
-                .map_err(|err| err.to_string())?;
+                .map_err(command_error)?;
         }
         "serena" => {
             client_adapters::disable_serena_integration()
@@ -1476,19 +1488,19 @@ async fn uninstall_addon(
             state
                 .tool_manager
                 .uninstall_serena()
-                .map_err(|err| err.to_string())?;
+                .map_err(command_error)?;
         }
         "context7" => {
             state
                 .tool_manager
                 .uninstall_context7()
-                .map_err(|err| err.to_string())?;
+                .map_err(command_error)?;
         }
         "codebase-memory" => {
             state
                 .tool_manager
                 .uninstall_codebase_memory()
-                .map_err(|err| err.to_string())?;
+                .map_err(command_error)?;
         }
         other => return Err(format!("unknown addon: {other}")),
     }
@@ -2917,7 +2929,7 @@ async fn get_runtime_status(app: AppHandle) -> Result<RuntimeStatus, String> {
         state.runtime_status()
     })
     .await
-    .map_err(|err| err.to_string())
+    .map_err(command_error)
 }
 
 /// Debug-only: force the proxy intercept's bypass flag on/off so a developer
@@ -2948,7 +2960,7 @@ fn debug_force_proxy_bypass(state: State<'_, AppState>, on: bool) -> Result<bool
         state.set_runtime_paused(false);
         state
             .ensure_headroom_running()
-            .map_err(|err| err.to_string())?;
+            .map_err(command_error)?;
     }
     Ok(state
         .proxy_bypass
@@ -2970,7 +2982,7 @@ async fn get_headroom_logs(
                 .map(|line| sanitize_headroom_log_line_for_ui(&line))
                 .collect()
         })
-        .map_err(|err| err.to_string())
+        .map_err(command_error)
 }
 
 const UI_LOG_REDACTED: &str = "[redacted]";
@@ -3374,7 +3386,7 @@ async fn get_rtk_activity(
     state
         .tool_manager
         .read_rtk_activity(limit)
-        .map_err(|err| err.to_string())
+        .map_err(command_error)
 }
 
 #[tauri::command]
@@ -3387,7 +3399,7 @@ async fn get_tool_logs(
     state
         .tool_manager
         .read_tool_log_tail(&tool_id, limit)
-        .map_err(|err| err.to_string())
+        .map_err(command_error)
 }
 
 #[tauri::command]
@@ -3396,7 +3408,7 @@ async fn get_claude_code_projects(
 ) -> Result<Vec<ClaudeCodeProject>, String> {
     state
         .list_claude_code_projects()
-        .map_err(|err| err.to_string())
+        .map_err(command_error)
 }
 
 #[tauri::command]
@@ -3905,7 +3917,7 @@ async fn delete_live_learning(state: State<'_, AppState>, memory_id: String) -> 
         .arg(&memory_path)
         .env("PYTHONNOUSERSITE", "1")
         .output()
-        .map_err(|err| err.to_string())?;
+        .map_err(command_error)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!(
@@ -4034,7 +4046,7 @@ fn run_memory_export(entrypoint: &Path, db_path: &Path) -> Result<String, String
         .arg(db_path)
         .env("PYTHONNOUSERSITE", "1")
         .output()
-        .map_err(|err| err.to_string())?;
+        .map_err(command_error)?;
     if !output.status.success() {
         return Err(format!("headroom memory export exited {}", output.status));
     }
@@ -4060,7 +4072,7 @@ fn parse_live_learnings(
         entity_refs: Vec<String>,
     }
 
-    let raws: Vec<Raw> = serde_json::from_str(json.trim()).map_err(|err| err.to_string())?;
+    let raws: Vec<Raw> = serde_json::from_str(json.trim()).map_err(command_error)?;
     let mut out: Vec<crate::models::LiveLearning> = Vec::new();
     for r in raws {
         let source = r
@@ -4166,13 +4178,13 @@ async fn start_headroom_learn(
 #[tauri::command]
 fn show_dashboard_window(app: AppHandle) -> Result<(), String> {
     if !onboarding_complete(&app) {
-        show_launcher_window(&app).map_err(|err| err.to_string())?;
+        show_launcher_window(&app).map_err(command_error)?;
         return Err("Complete onboarding before opening the tray dashboard.".into());
     }
 
     ensure_runtime_ready_for_tray(&app);
-    hide_launcher_window(&app).map_err(|err| err.to_string())?;
-    show_main_window(&app, None).map_err(|err| err.to_string())
+    hide_launcher_window(&app).map_err(command_error)?;
+    show_main_window(&app, None).map_err(command_error)
 }
 
 #[tauri::command]
@@ -4270,7 +4282,7 @@ async fn submit_contact_request(
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|err| err.to_string())?;
+        .map_err(command_error)?;
     let message_owned = message
         .map(|m| m.trim().chars().take(2000).collect::<String>())
         .unwrap_or_default();
@@ -4282,7 +4294,7 @@ async fn submit_contact_request(
         ])
         .send()
         .await
-        .map_err(|err| err.to_string())?;
+        .map_err(command_error)?;
 
     // Rails answers a successful POST with a 302 to /#pricing. Redirect policy
     // is none for SSRF defense, so accept 3xx as success here. 422 and 503 are
@@ -4442,7 +4454,7 @@ async fn apply_client_setup(
             Ok(result)
         }
         Err(err) => {
-            let msg = err.to_string();
+            let msg = command_error(&err);
             // Preparing a Codex setup temporarily puts the stable router in
             // Direct mode. If the file transaction fails while the existing
             // runtime is still healthy, restore its previous automatic proxy
@@ -4485,7 +4497,7 @@ async fn apply_client_setup(
 
 #[tauri::command]
 async fn verify_client_setup(client_id: String) -> Result<ClientSetupVerification, String> {
-    client_adapters::verify_client_setup(&client_id).map_err(|err| err.to_string())
+    client_adapters::verify_client_setup(&client_id).map_err(command_error)
 }
 
 #[tauri::command]
@@ -4497,7 +4509,7 @@ async fn detect_oss_remnants() -> Result<Vec<String>, String> {
 async fn get_client_connectors(
     state: State<'_, AppState>,
 ) -> Result<Vec<ClientConnectorStatus>, String> {
-    client_adapters::list_client_connectors(&state.cached_clients()).map_err(|err| err.to_string())
+    client_adapters::list_client_connectors(&state.cached_clients()).map_err(command_error)
 }
 
 #[tauri::command]
@@ -4505,7 +4517,7 @@ async fn restart_codex_desktop() -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(client_adapters::restart_codex_desktop)
         .await
         .map_err(|err| format!("Codex restart task failed: {err}"))?
-        .map_err(|err| err.to_string())
+        .map_err(command_error)
 }
 
 #[tauri::command]
@@ -4525,7 +4537,7 @@ async fn disable_client_setup(app: AppHandle, client_id: String) -> Result<(), S
             let state: tauri::State<'_, AppState> = app.state();
             activate_codex_router_if_runtime_ready(&state);
         }
-        return Err(err.to_string());
+        return Err(command_error(err));
     }
     analytics::track_event(
         &app,
@@ -4538,7 +4550,7 @@ async fn disable_client_setup(app: AppHandle, client_id: String) -> Result<(), S
 #[tauri::command]
 async fn clear_client_setups() -> Result<(), String> {
     codex_router::stop_heartbeat();
-    client_adapters::clear_client_setups().map_err(|err| err.to_string())
+    client_adapters::clear_client_setups().map_err(command_error)
 }
 
 #[tauri::command]
@@ -4562,7 +4574,7 @@ async fn pause_headroom(app: AppHandle) -> Result<(), String> {
         // 6867 while clients still point at it would create a dead endpoint.
         state.set_runtime_paused(false);
         activate_codex_router_if_runtime_ready(&state);
-        return Err(err.to_string());
+        return Err(command_error(err));
     }
     state.stop_headroom();
     analytics::track_event(&app, "runtime_paused", None);
@@ -4572,7 +4584,7 @@ async fn pause_headroom(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 async fn start_headroom(app: AppHandle) -> Result<(), String> {
     let state: tauri::State<'_, AppState> = app.state();
-    state.resume_runtime().map_err(|err| err.to_string())?;
+    state.resume_runtime().map_err(command_error)?;
     restore_clients_when_runtime_ready(app.clone());
     analytics::track_event(&app, "runtime_resumed", None);
     Ok(())
@@ -4592,11 +4604,11 @@ async fn force_restart_headroom(app: AppHandle) -> Result<(), String> {
         // No backend teardown happened, so restore the proxy route that was
         // active before this failed restart transaction.
         activate_codex_router_if_runtime_ready(&state);
-        return Err(err.to_string());
+        return Err(command_error(err));
     }
     state.stop_headroom();
     state.set_runtime_auto_paused(false);
-    state.resume_runtime().map_err(|err| err.to_string())?;
+    state.resume_runtime().map_err(command_error)?;
     restore_clients_when_runtime_ready(app.clone());
     analytics::track_event(&app, "runtime_force_restarted", None);
     Ok(())
@@ -4645,18 +4657,18 @@ async fn get_autostart_enabled(app: AppHandle) -> Result<bool, String> {
     let Some(manager) = autolaunch(&app) else {
         return Ok(false);
     };
-    manager.is_enabled().map_err(|err| err.to_string())
+    manager.is_enabled().map_err(command_error)
 }
 
 #[tauri::command]
 async fn set_autostart_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
     let manager = autolaunch(&app).ok_or(AUTOSTART_UNAVAILABLE)?;
     if enabled {
-        manager.enable().map_err(|err| err.to_string())?;
+        manager.enable().map_err(command_error)?;
     } else {
-        manager.disable().map_err(|err| err.to_string())?;
+        manager.disable().map_err(command_error)?;
     }
-    manager.is_enabled().map_err(|err| err.to_string())
+    manager.is_enabled().map_err(command_error)
 }
 
 #[tauri::command]
@@ -4667,7 +4679,7 @@ async fn set_rtk_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> 
         &state.tool_manager.rtk_entrypoint(),
         &state.tool_manager.managed_python(),
     )
-    .map_err(|err| err.to_string())?;
+    .map_err(command_error)?;
     state.invalidate_runtime_status_cache();
     let action = if enabled { "enabled" } else { "disabled" };
     analytics::track_event(&app, &format!("rtk_{action}"), None);
@@ -4685,7 +4697,7 @@ fn get_auto_learn_enabled() -> bool {
 #[tauri::command]
 async fn set_auto_learn_enabled(app: AppHandle, enabled: bool) -> Result<bool, String> {
     let state: tauri::State<'_, AppState> = app.state();
-    client_adapters::set_auto_learn_enabled(enabled).map_err(|err| err.to_string())?;
+    client_adapters::set_auto_learn_enabled(enabled).map_err(command_error)?;
     state.invalidate_runtime_status_cache();
     let action = if enabled { "enabled" } else { "disabled" };
     analytics::track_event(&app, &format!("auto_learn_{action}"), None);
@@ -5969,7 +5981,7 @@ fn count_memories_created_today(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<usize, String> {
     let raw: Vec<serde_json::Value> =
-        serde_json::from_str(json.trim()).map_err(|err| err.to_string())?;
+        serde_json::from_str(json.trim()).map_err(command_error)?;
     let today = now.date_naive();
     Ok(raw
         .into_iter()
@@ -6022,13 +6034,13 @@ fn fetch_transformations_feed_from(
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_millis(2000))
         .build()
-        .map_err(|err| err.to_string())?;
+        .map_err(command_error)?;
     let url = format!("{base_url}/transformations/feed?limit={limit}");
-    let response = client.get(url).send().map_err(|err| err.to_string())?;
+    let response = client.get(url).send().map_err(command_error)?;
     if !response.status().is_success() {
         return Err(format!("proxy returned HTTP {}", response.status()));
     }
-    let raw: RawTransformationsFeedResponse = response.json().map_err(|err| err.to_string())?;
+    let raw: RawTransformationsFeedResponse = response.json().map_err(command_error)?;
     Ok(TransformationFeedResponse {
         log_full_messages: raw.log_full_messages,
         transformations: raw.transformations,
@@ -6801,7 +6813,7 @@ fn set_native_tray_locale(locale: String, state: State<'_, AppState>) -> Result<
     let copy = native_tray_copy(locale);
 
     if let Some(item) = TRAY_SHOW_ITEM.get() {
-        item.set_text(copy.show).map_err(|err| err.to_string())?;
+        item.set_text(copy.show).map_err(command_error)?;
     }
     if let Some(item) = TRAY_PAUSE_ITEM.get() {
         let label = if state.runtime_is_paused() {
@@ -6809,10 +6821,10 @@ fn set_native_tray_locale(locale: String, state: State<'_, AppState>) -> Result<
         } else {
             copy.pause
         };
-        item.set_text(label).map_err(|err| err.to_string())?;
+        item.set_text(label).map_err(command_error)?;
     }
     if let Some(item) = TRAY_QUIT_ITEM.get() {
-        item.set_text(copy.quit).map_err(|err| err.to_string())?;
+        item.set_text(copy.quit).map_err(command_error)?;
     }
     Ok(())
 }
@@ -8246,7 +8258,7 @@ mod tests {
         auto_resume_backoff, begin_runtime_session_at, beta_channel_enabled_from,
         build_release_updater_config, build_watchdog_give_up_report, check_headroom_learn_prereqs,
         child_state_fingerprint_key, classify_backend_readyz, classify_bootstrap_failure,
-        classify_update_check, classify_upgrade_error, client_setup_error_kind,
+        classify_update_check, classify_upgrade_error, client_setup_error_kind, command_error,
         compute_panel_corner_position, compute_tray_window_position, count_memories_created_today,
         cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
         empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
@@ -11118,5 +11130,23 @@ Some unrelated content.
             None,
             "a reload must not replay a spent code"
         );
+    }
+
+    #[test]
+    fn command_error_keeps_the_cause_chain() {
+        // The UI renders `error.message` verbatim, so `to_string()` (outermost
+        // context only) is what turned "codebase-memory update failed;
+        // restored previous installation" into a sentence with no cause: the
+        // registrar that refused, the file that was unwritable, the CLI that
+        // could not be executed -- all of it stayed inside the process.
+        let err = anyhow::anyhow!("disk is full")
+            .context("committing codebase-memory update failed");
+        assert_eq!(
+            command_error(err),
+            "committing codebase-memory update failed: disk is full"
+        );
+        // Anything Display-shaped still renders; nothing panics on the path
+        // every command handler now uses.
+        assert_eq!(command_error("plain failure"), "plain failure");
     }
 }
