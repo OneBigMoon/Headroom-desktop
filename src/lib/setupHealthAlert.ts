@@ -92,12 +92,21 @@ export interface SetupStallContext {
 /// Headroom - the same state the Home banner surfaces as "restart it first".
 /// This, not the clock, is what makes a no-traffic alert trustworthy.
 ///
+/// A connector whose route is owned by another tool never counts: Headroom is
+/// standing aside on purpose (see `connectorStatusLine`), so its `verified`
+/// flag is false by design and "restart your terminal" is advice that cannot
+/// work.
+///
 /// Undefined connectors means status hasn't loaded; stay quiet rather than
 /// guess. Empty means nothing is connected, which is not a malfunction and is
 /// already covered by the banner's "No coding tools connected" state.
 function hasUnverifiedConnector(connectors: ClientConnectorStatus[] | undefined): boolean {
   return (connectors ?? []).some(
-    (connector) => connector.installed && connector.enabled && !connector.verified
+    (connector) =>
+      connector.installed &&
+      connector.enabled &&
+      !connector.verified &&
+      !connector.verification?.foreignProvider
   );
 }
 

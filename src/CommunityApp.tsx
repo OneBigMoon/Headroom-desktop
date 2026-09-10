@@ -918,7 +918,7 @@ export function CommunityApp() {
         ) : null}
 
         {activeView === "tools" ? (
-          <div className="community-content">
+          <div className="community-content" role="group" aria-label={t("aria.localTools")}>
             <section className="community-panel community-panel--title">
               <div>
                 <span className="community-kicker">{t("tools.kicker")}</span>

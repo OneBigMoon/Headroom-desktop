@@ -444,6 +444,26 @@ describe("dashboard helpers", () => {
     expect(
       connectorDashboardStatus({ clientId: "codex", name: "Codex", installed: true, enabled: true, verified: false })
     ).toEqual({ label: "Verifying", tone: "pending" });
+    // Coexist state: the connector is on but another tool owns the route, so
+    // `verified` is false by design. Pending amber would claim setup is still
+    // running, and the label has to name whoever is actually routing.
+    expect(
+      connectorDashboardStatus({
+        clientId: "codex",
+        name: "Codex",
+        installed: true,
+        enabled: true,
+        verified: false,
+        verification: {
+          clientId: "codex",
+          verified: false,
+          proxyReachable: true,
+          checks: [],
+          failures: [],
+          foreignProvider: "Cockpit (codex_local_access)",
+        },
+      })
+    ).toEqual({ label: "Routed by Cockpit (codex_local_access)", tone: "off" });
     expect(
       connectorDashboardStatus({ clientId: "codex", name: "Codex", installed: true, enabled: true, verified: true })
     ).toEqual({ label: "Active", tone: "active" });

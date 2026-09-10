@@ -457,6 +457,17 @@ describe("CommunityApp", () => {
     confirmMock.mockRestore();
   });
 
+  it("names the tools view so assistive tech announces the group", async () => {
+    const user = userEvent.setup();
+    renderCommunityApp();
+
+    await screen.findByText("Proxy online");
+    await user.click(screen.getByRole("button", { name: "Tools" }));
+
+    const groups = await screen.findAllByRole("group", { name: "Local tools and add-ons" });
+    expect(groups.length).toBeGreaterThan(0);
+  });
+
   it("installs and toggles a local tool", async () => {
     const user = userEvent.setup();
     renderCommunityApp();

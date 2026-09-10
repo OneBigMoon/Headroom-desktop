@@ -185,6 +185,51 @@ describe("evaluateSetupStall", () => {
         })
       ).toBeNull();
     });
+
+    // Coexist state: another tool owns the route, so Headroom stands aside and
+    // `verified` is false by design. "Restart your terminal" cannot fix that,
+    // and the connector card already names the real owner.
+    it("stays quiet when another tool owns the route", () => {
+      expect(
+        evaluateSetupStall(stalledDashboard(), PAST_WINDOW, {
+          connectors: [
+            connector({
+              clientId: "codex",
+              name: "Codex",
+              verification: {
+                clientId: "codex",
+                verified: false,
+                proxyReachable: true,
+                checks: [],
+                failures: [],
+                foreignProvider: "Cockpit (codex_local_access)",
+              },
+            }),
+          ],
+        })
+      ).toBeNull();
+    });
+
+    it("still fires when a genuine connector sits next to a foreign-routed one", () => {
+      const alert = evaluateSetupStall(stalledDashboard(), PAST_WINDOW, {
+        connectors: [
+          connector({
+            clientId: "codex",
+            name: "Codex",
+            verification: {
+              clientId: "codex",
+              verified: false,
+              proxyReachable: true,
+              checks: [],
+              failures: [],
+              foreignProvider: "Cockpit (codex_local_access)",
+            },
+          }),
+          connector(),
+        ],
+      });
+      expect(alert?.kind).toBe("no_traffic");
+    });
   });
 
   describe("forceKind test override", () => {

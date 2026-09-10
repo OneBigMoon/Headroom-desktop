@@ -397,6 +397,13 @@ function localizeUiText(t: Translate, value: string): string {
   if (foreignProvider) {
     return t("connections.foreignProviderStatus", { provider: foreignProvider[1] });
   }
+  // Status chip for a client whose route another tool owns (see
+  // `connectorDashboardStatus`). The provider is a product label, so it is
+  // interpolated rather than looked up.
+  const routedBy = value.match(/^Routed by (.+)$/);
+  if (routedBy) {
+    return t("connections.status.routedBy", { provider: routedBy[1] });
+  }
   const exact: Record<string, TranslationKey> = {
     "Client was already configured for Headroom.": "connections.setup.alreadyConfigured",
     "Client configuration updated to route through Headroom.": "connections.setup.updated",
@@ -427,6 +434,13 @@ function localizeUiText(t: Translate, value: string): string {
     "Headroom proxy is reachable on 127.0.0.1:6867.": "connections.verification.proxyReachable",
     "Setup is incomplete - open the info panel for the exact checks.": "connections.setupIncomplete",
     "Setup could not be verified - open the info panel and re-check.": "connections.setupUnverified",
+    // Home banner lines from `setupStallBannerLine`, which builds them without a
+    // translator: match them whole so the banner is not the one English-only
+    // sentence in an otherwise translated Home screen.
+    "No request has come through Headroom yet. Your terminal or editor is probably still running with its pre-Headroom settings - restart it and they should pick the new settings up.":
+      "setupStall.bannerNoTraffic",
+    "Requests are reaching Headroom but none are being optimized, so nothing is being saved yet. Check that your coding tool is still connected below.":
+      "setupStall.bannerNoSavings",
     "Configured. Headroom's proxy is not answering on 127.0.0.1:6867 yet.": "connections.configuredProxyOffline",
     "Headroom Learn is unavailable on this platform.": "learn.unsupported",
     "Off": "connections.status.off",
@@ -7095,7 +7109,9 @@ export default function App() {
                   stallBannerLine ? (
                     // Nothing has ever been saved on this install, so the
                     // reassuring "check back later" below would be a lie.
-                    <p className="callout-banner__subtitle">{stallBannerLine}</p>
+                    <p className="callout-banner__subtitle">
+                      {localizeUiText(t, stallBannerLine)}
+                    </p>
                   ) : (
                     <p className="callout-banner__subtitle">{t("home.checkBack")}</p>
                   )
@@ -7769,7 +7785,11 @@ export default function App() {
               />
             </header>
           </article>
-            <div className="addons__groups">
+            <div
+              className="addons__groups"
+              role="group"
+              aria-label={t("aria.localTools")}
+            >
               {TOOL_CATEGORY_ORDER.map((category) => {
                 const categoryTools = groupedAddonTools.get(category) ?? [];
                 const includesRtk = category === "efficiency";

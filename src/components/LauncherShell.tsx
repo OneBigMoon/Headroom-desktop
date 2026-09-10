@@ -1,6 +1,7 @@
 import type { MouseEvent, ReactNode } from "react";
 
 import headroomAvatar from "../assets/headroom-rage-avatar.png";
+import { useI18n } from "../lib/i18n";
 
 export interface LauncherShellProps {
   shellClassName: string;
@@ -23,6 +24,7 @@ export function LauncherShell({
   children,
   showSpinner = true,
 }: LauncherShellProps) {
+  const { t } = useI18n();
   return (
     <main className="app-shell app-shell--launcher">
       <section className={shellClassName} onMouseDown={onMouseDown}>
@@ -31,7 +33,7 @@ export function LauncherShell({
           <span>v{version}</span>
         </div>
         {showSpinner ? (
-          <span className={spinnerClassName} role="status" aria-label="Loading" />
+          <span className={spinnerClassName} role="status" aria-label={t("aria.loading")} />
         ) : null}
         <div className="intro-shell__content">
           <div className={copyClassName}>{children}</div>

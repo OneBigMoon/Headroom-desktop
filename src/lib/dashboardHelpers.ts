@@ -745,6 +745,14 @@ export function connectorDashboardStatus(
   if (opts?.proxyReachable === false) {
     return { label: "Proxy unreachable", tone: "idle" };
   }
+  // Another tool owns this client's route and Headroom stands aside on purpose
+  // (see `connectorStatusLine`). Nothing is in progress and nothing is broken,
+  // so `verified === false` here must not read as "Verifying": neutral tone,
+  // and the label names whoever is actually routing.
+  const foreignProvider = connector.verification?.foreignProvider;
+  if (foreignProvider) {
+    return { label: `Routed by ${foreignProvider}`, tone: "off" };
+  }
   if (!connector.verified) {
     return connector.installed
       ? { label: "Verifying", tone: "pending" }
