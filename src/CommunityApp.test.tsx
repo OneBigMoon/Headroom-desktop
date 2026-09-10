@@ -407,13 +407,13 @@ describe("CommunityApp", () => {
     // "verification pending", which implies Headroom is mid-setup. The card
     // names the tool that is actually routing.
     connectorEnabled = true;
-    connectorForeignProvider = "codex_local_access";
+    connectorForeignProvider = "Cockpit (codex_local_access)";
     const user = userEvent.setup();
     renderCommunityApp();
 
     await screen.findByText("Proxy online");
     await user.click(screen.getByRole("button", { name: "Connections" }));
-    await screen.findByText("Connected; routing is handled by codex_local_access");
+    await screen.findByText("Connected; routing is handled by Cockpit (codex_local_access)");
     expect(screen.queryByText("Connected; verification pending")).toBeNull();
   });
 
