@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { Translate } from "./i18n";
 import {
   aggregateClientConnectors,
   baseUrlTakeoverNotice,
@@ -12,6 +13,7 @@ import {
   outputReductionForWindow,
   compactNumber,
   connectorDashboardStatus,
+  localizeAddonSavingsLabel,
   connectorStatusLine,
   shouldAutoRestartCodex,
   clientSetupNotice,
@@ -697,5 +699,43 @@ describe("outputReductionForWindow", () => {
     expect(
       outputReductionForWindow([{ outputSampledTokensSaved: 0, outputBaselineTokens: 0 }])
     ).toBeNull();
+  });
+});
+
+describe("localizeAddonSavingsLabel", () => {
+  // The stub records which key and values the helper chose, so this test does
+  // not depend on the copy in any one locale.
+  function recorder() {
+    return vi.fn((key: string, values?: Record<string, unknown>) =>
+      `${key}:${JSON.stringify(values ?? {})}`) as unknown as Translate;
+  }
+
+  it("translates the backend's document count with the count kept", () => {
+    const t = recorder();
+
+    expect(localizeAddonSavingsLabel("12 docs converted", t)).toBe(
+      'addons.savings.docsConverted:{"count":"12"}'
+    );
+    expect(localizeAddonSavingsLabel("1 doc converted", t)).toBe(
+      'addons.savings.docsConverted:{"count":"1"}'
+    );
+  });
+
+  it("keeps the benchmark range when translating cost and token claims", () => {
+    const t = recorder();
+
+    expect(localizeAddonSavingsLabel("47-77% lower cost (benchmark)", t)).toBe(
+      'addons.savings.lowerCost:{"range":"47-77%"}'
+    );
+    expect(localizeAddonSavingsLabel("~65% fewer output tokens (benchmark)", t)).toBe(
+      'addons.savings.fewerTokens:{"range":"~65%"}'
+    );
+  });
+
+  it("passes an unrecognized label through untouched", () => {
+    const t = recorder();
+
+    expect(localizeAddonSavingsLabel("Some future label", t)).toBe("Some future label");
+    expect(t).not.toHaveBeenCalled();
   });
 });

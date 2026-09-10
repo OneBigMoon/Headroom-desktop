@@ -65,6 +65,7 @@ import {
   toolCategoryCopy,
   TOOL_CATEGORY_ORDER,
   workflowGroupCopy,
+  workflowSwitchPeers,
 } from "./lib/workflowCatalog";
 import {
   formatAppUpdateProgressCopy,
@@ -151,6 +152,7 @@ import {
   getEnabledSupportedConnectors,
   hasEnabledConnector,
   hasNeverScanned,
+  localizeAddonSavingsLabel,
   hourOfDayTickFormatter,
   mergeProviderSavingsForDisplay,
   percent1,
@@ -193,6 +195,7 @@ import {
   type TrayView
 } from "./lib/trayHelpers";
 import { trackAnalyticsEvent, trackInstallMilestoneOnce } from "./lib/analytics";
+import { withDeadline } from "./lib/asyncDeadline";
 import { ActivityFeed } from "./components/ActivityFeed";
 import { AuthCodeForm } from "./components/AuthCodeForm";
 import { ConnectorIcon, hasConnectorIcon } from "./components/ConnectorIcon";
@@ -203,7 +206,11 @@ import { ProjectIssuesLink } from "./components/ProjectIssuesLink";
 import { TermsGate } from "./components/TermsGate";
 import { ToolModeSelector, localizedToolModeLabel } from "./components/ToolModeSelector";
 import { WindowChrome } from "./components/WindowChrome";
-import { AddonPresetBar, RECOMMENDED_ADDON_PRESET } from "./components/AddonPresetBar";
+import {
+  AddonPresetBar,
+  listPresetDisables,
+  RECOMMENDED_ADDON_PRESET,
+} from "./components/AddonPresetBar";
 import type {
   AppUpdateConfiguration,
   AvailableAppUpdate,
@@ -931,6 +938,39 @@ function delay(ms: number) {
   });
 }
 
+/**
+ * Every addon command already returns the post-action dashboard, so the
+ * follow-up read is a freshness upgrade rather than the action itself. Bound
+ * it: a dashboard build that stops answering must not keep a card's
+ * "Enabling …" line spinning on a state the backend already committed. 20s
+ * covers the backend's own 15s `/stats` ceiling.
+ */
+const ADDON_DASHBOARD_READ_DEADLINE_MS = 20000;
+
+/**
+ * A toggle writes local files (installs and updates take their own, longer
+ * path), so a switch that has not answered in two minutes is stalled, not slow.
+ */
+const ADDON_TOGGLE_DEADLINE_MS = 120000;
+
+/**
+ * Read the dashboard without letting a stalled build wedge the caller. `null`
+ * means "no answer in time", which the caller resolves with the state the
+ * action already returned.
+ */
+async function readDashboardWithinDeadline(): Promise<DashboardState | null> {
+  try {
+    const next = await withDeadline(
+      invoke<DashboardState>("get_dashboard_state"),
+      ADDON_DASHBOARD_READ_DEADLINE_MS
+    );
+    return next && Array.isArray(next.tools) ? next : null;
+  } catch (error) {
+    console.error("Failed to refresh the dashboard after an addon action", error);
+    return null;
+  }
+}
+
 type SavingsChartView = "month" | "day";
 type SavingsChartMode = "usd" | "tokens";
 
@@ -1488,13 +1528,8 @@ function AddonClientChips({
   connectors: ClientConnectorStatus[];
   savings?: string | null;
 }) {
-  const { t, resolvedLocale } = useI18n();
-  const localizedSavings = resolvedLocale === "zh-CN" && savings
-    ? savings
-        .replace(/^(\d+) docs? converted$/i, "已转换 $1 份文档")
-        .replace(/lower cost \(benchmark\)/i, "成本降低（基准数据）")
-        .replace(/fewer output tokens \(benchmark\)/i, "输出 Token 减少（基准数据）")
-    : savings;
+  const { t } = useI18n();
+  const localizedSavings = savings ? localizeAddonSavingsLabel(savings, t) : savings;
   const clients = sortClientConnectors(aggregateClientConnectors(connectors));
   if (clients.length === 0 && !localizedSavings) {
     return null;
@@ -1557,6 +1592,8 @@ function AddonCard({
   busyLabel,
   resultMessage,
   errorMessage,
+  noticeMessage,
+  onDismissNotice,
   upstreamVersion,
   upstreamUpdateAvailable,
   updateRequiresAppUpdate,
@@ -1597,6 +1634,9 @@ function AddonCard({
   busyLabel: string | null;
   resultMessage: string | null;
   errorMessage: string | null;
+  /** An unconfirmed outcome: worth reading, not a failure. */
+  noticeMessage: string | null;
+  onDismissNotice: () => void;
   upstreamVersion?: string | null;
   upstreamUpdateAvailable?: boolean;
   updateRequiresAppUpdate?: boolean;
@@ -1694,6 +1734,18 @@ function AddonCard({
           <p className="addon-card__progress">{busyLabel}</p>
         ) : errorMessage ? (
           <p className="addons__error addon-card__error">{errorMessage}</p>
+        ) : noticeMessage ? (
+          <p className="addon-card__notice addon-card__notice--warning addon-card__notice--dismissable">
+            {noticeMessage}
+            <button
+              type="button"
+              className="addon-card__result-dismiss"
+              aria-label={t("actions.dismiss")}
+              onClick={onDismissNotice}
+            >
+              ×
+            </button>
+          </p>
         ) : resultMessage ? (
           <p className="addon-card__result">
             {resultMessage}
@@ -1888,6 +1940,29 @@ export default function App() {
   const [addonInfoId, setAddonInfoId] = useState<string | null>(null);
   const [addonResultById, setAddonResultById] = useState<AddonOperationMessages>({});
   const [addonErrorById, setAddonErrorById] = useState<AddonOperationMessages>({});
+  // A switch that stopped answering is unconfirmed, not broken. It gets its own
+  // channel so the card can say so in the warning tone instead of the red
+  // failure one, which would claim a failure the backend may not have had.
+  const [addonNoticeById, setAddonNoticeById] = useState<AddonOperationMessages>({});
+  // Enabling a tool in a single-select group disables its active peer in the
+  // backend. Ask first, and name the peer, so a workflow never disappears
+  // without the user seeing why.
+  const [pendingWorkflowSwitch, setPendingWorkflowSwitch] = useState<{
+    kind: "tool" | "preset";
+    id: string;
+    name: string;
+    peers: Array<{ id: string; name: string }>;
+  } | null>(null);
+  // Escape is the keyboard equivalent of the backdrop click, so the prompt
+  // never traps someone who changed their mind.
+  useEffect(() => {
+    if (!pendingWorkflowSwitch) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setPendingWorkflowSwitch(null);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [pendingWorkflowSwitch]);
   const [addonUpdateChecks, setAddonUpdateChecks] = useState<AddonUpdateCheck[]>([]);
   const [addonUpdateBusy, setAddonUpdateBusy] = useState(false);
   const [addonUpdatesChecked, setAddonUpdatesChecked] = useState(false);
@@ -3213,10 +3288,26 @@ export default function App() {
     );
     setAddonResultById((current) => clearAddonOperationMessage(current, id));
     setAddonErrorById((current) => clearAddonOperationMessage(current, id));
+    setAddonNoticeById((current) => clearAddonOperationMessage(current, id));
     try {
-      await invoke<boolean>("set_rtk_enabled", { enabled: nextEnabled });
-      await refreshRuntimeStatus();
-      const message = nextEnabled ? undefined : t("addons.disabled", { name: "RTK" });
+      // RTK's switch is a local profile edit; the runtime read that follows it
+      // is a refresh, so neither may hold the card busy indefinitely.
+      const applied = await withDeadline(
+        invoke<boolean>("set_rtk_enabled", { enabled: nextEnabled }),
+        ADDON_TOGGLE_DEADLINE_MS
+      );
+      if (applied === null) {
+        setAddonNoticeById((current) =>
+          setAddonOperationMessage(
+            current,
+            id,
+            t("addons.actionTimeout", { seconds: ADDON_TOGGLE_DEADLINE_MS / 1000 })
+          )
+        );
+      }
+      await withDeadline(refreshRuntimeStatus(), ADDON_DASHBOARD_READ_DEADLINE_MS);
+      const message =
+        applied === null || nextEnabled ? undefined : t("addons.disabled", { name: "RTK" });
       if (message) {
         setAddonResultById((current) => setAddonOperationMessage(current, id, message));
       }
@@ -4455,8 +4546,11 @@ export default function App() {
     enabled?: boolean,
     // An update reuses install_addon, so only the wording and version differ.
     updateLabels?: { busy: string; done: string },
-    version?: string | null
-  ) {
+    version?: string | null,
+    // Enabling a tool can also switch a same-group peer off, so the success
+    // line sometimes has to name more than the tool that was clicked.
+    enabledMessage?: string
+  ): Promise<DashboardState | null> {
     if (!addonPresetBusy) {
       addonPresetUserSelectedCustomRef.current = true;
       setAddonPresetMode("custom");
@@ -4476,24 +4570,63 @@ export default function App() {
     setAddonBusyById((current) => setAddonOperationMessage(current, id, busyLabel));
     setAddonErrorById((current) => clearAddonOperationMessage(current, id));
     setAddonResultById((current) => clearAddonOperationMessage(current, id));
+    setAddonNoticeById((current) => clearAddonOperationMessage(current, id));
+    const successMessage =
+      command === "install_addon"
+        ? (updateLabels?.done ?? t("addons.installed", { name: toolName }))
+        : command === "uninstall_addon"
+          ? t("addons.uninstalled", { name: toolName })
+          : enabled
+            ? enabledMessage
+            : t("addons.disabled", { name: toolName });
     try {
-      const next = await invoke<DashboardState>(command, {
+      const action = invoke<DashboardState>(command, {
         id,
         enabled,
         ...(command === "install_addon" && version ? { version } : {}),
       });
-      // Re-read the dashboard after both success and failure paths.  The
-      // command result is a useful fallback, but the explicit read also
-      // covers post-install hooks that update state after the command returns.
-      try {
-        const refreshed = await invoke<DashboardState>("get_dashboard_state");
-        if (refreshed && Array.isArray(refreshed.tools)) {
+      // Only a toggle is bounded: an install or update downloads artifacts and
+      // can legitimately run for minutes.
+      const next =
+        command === "install_addon"
+          ? await action
+          : await withDeadline(action, ADDON_TOGGLE_DEADLINE_MS);
+      if (next === null) {
+        // The command is still running and cannot be cancelled from here, so
+        // stop the card from spinning on a state we cannot confirm: report what
+        // the action did to disk, then adopt its result if it lands later.
+        setAddonNoticeById((current) =>
+          setAddonOperationMessage(
+            current,
+            id,
+            t("addons.actionTimeout", { seconds: ADDON_TOGGLE_DEADLINE_MS / 1000 })
+          )
+        );
+        const refreshed = await readDashboardWithinDeadline();
+        if (refreshed) {
           setDashboard(refreshed);
-        } else {
-          setDashboard(next);
         }
-      } catch (refreshError) {
-        console.error("Failed to refresh dashboard after addon action", refreshError);
+        invalidateAddonUpdateChecks();
+        void action
+          .then((late) => {
+            setDashboard(late);
+            setAddonErrorById((current) => clearAddonOperationMessage(current, id));
+            setAddonNoticeById((current) => clearAddonOperationMessage(current, id));
+            if (successMessage) {
+              setAddonResultById((current) =>
+                setAddonOperationMessage(current, id, successMessage)
+              );
+            }
+          })
+          .catch(() => undefined);
+        return null;
+      }
+      // The command's result is already the post-action dashboard; the explicit
+      // read only covers post-install hooks that update state afterwards.
+      const refreshed = await readDashboardWithinDeadline();
+      if (refreshed) {
+        setDashboard(refreshed);
+      } else {
         setDashboard(next);
       }
       // Invalidate again in case a check was started while the operation was
@@ -4502,29 +4635,17 @@ export default function App() {
       if (id === "rtk") {
         await refreshRuntimeStatus();
       }
-      const message =
-        command === "install_addon"
-          ? (updateLabels?.done ?? t("addons.installed", { name: toolName }))
-          : command === "uninstall_addon"
-            ? t("addons.uninstalled", { name: toolName })
-            : enabled
-              ? undefined
-              : t("addons.disabled", { name: toolName });
-      if (message) {
-        setAddonResultById((current) => setAddonOperationMessage(current, id, message));
+      if (successMessage) {
+        setAddonResultById((current) => setAddonOperationMessage(current, id, successMessage));
       }
+      return refreshed ?? next;
     } catch (error) {
       // The command may have changed local state before reporting an error
-      // (for example, a post-install hook can fail). Refresh the dashboard on
-      // a best-effort basis, while preserving the original action error for
-      // the user.
-      try {
-        const recovered = await invoke<DashboardState>("get_dashboard_state");
-        if (recovered && Array.isArray(recovered.tools)) {
-          setDashboard(recovered);
-        }
-      } catch (refreshError) {
-        console.error("Failed to refresh dashboard after addon action error", refreshError);
+      // (for example, a post-install hook can fail). Refresh on a best-effort
+      // basis, while preserving the original action error for the user.
+      const recovered = await readDashboardWithinDeadline();
+      if (recovered) {
+        setDashboard(recovered);
       }
       invalidateAddonUpdateChecks();
       setAddonErrorById((current) =>
@@ -4534,9 +4655,62 @@ export default function App() {
           describeInvokeError(error, t("messages.localOperationFailed"))
         )
       );
+      return recovered;
     } finally {
       setAddonBusyById((current) => clearAddonOperationMessage(current, id));
     }
+  }
+
+  /**
+   * Enable/disable entry point for a tool card. Enabling a tool that shares a
+   * single-select group with an active peer asks for confirmation first;
+   * everything else keeps the one-click behaviour.
+   */
+  async function requestAddonToggle(tool: DashboardState["tools"][number]) {
+    if (tool.enabled) {
+      await runAddonAction("set_addon_enabled", tool.id, false);
+      return;
+    }
+    const peers = workflowSwitchPeers(dashboard.tools, tool.id);
+    if (!peers.length) {
+      await runAddonAction("set_addon_enabled", tool.id, true);
+      return;
+    }
+    setPendingWorkflowSwitch({
+      kind: "tool",
+      id: tool.id,
+      name: tool.name,
+      peers: peers.map((peer) => ({ id: peer.id, name: peer.name })),
+    });
+  }
+
+  async function confirmWorkflowSwitch() {
+    const pending = pendingWorkflowSwitch;
+    if (!pending) return;
+    setPendingWorkflowSwitch(null);
+    if (pending.kind === "preset") {
+      await applyRecommendedAddonPreset({ confirmed: true });
+      return;
+    }
+    const peerNames = pending.peers
+      .map((peer) => peer.name)
+      .join(t("punctuation.listSeparator"));
+    await runAddonAction(
+      "set_addon_enabled",
+      pending.id,
+      true,
+      undefined,
+      undefined,
+      t("addons.switchedExclusive", { name: pending.name, peers: peerNames })
+    );
+    // The peer cards stay on screen after the switch, so explain why they just
+    // went off instead of letting the badge change silently.
+    setAddonResultById((current) =>
+      pending.peers.reduce(
+        (next, peer) => setAddonOperationMessage(next, peer.id, t("addons.disabledByPeer")),
+        current
+      )
+    );
   }
 
   async function runAddonModeAction(id: string, mode: string) {
@@ -4558,8 +4732,28 @@ export default function App() {
     setAddonBusyById((current) => setAddonOperationMessage(current, id, t("tools.savingMode")));
     setAddonResultById((current) => clearAddonOperationMessage(current, id));
     setAddonErrorById((current) => clearAddonOperationMessage(current, id));
+    setAddonNoticeById((current) => clearAddonOperationMessage(current, id));
     try {
-      const next = await invoke<DashboardState>("set_addon_mode", { id, mode });
+      // A mode change is a local config edit, and the command hands back the
+      // post-action dashboard: a stalled answer means stalled, not slow.
+      const next = await withDeadline(
+        invoke<DashboardState>("set_addon_mode", { id, mode }),
+        ADDON_TOGGLE_DEADLINE_MS
+      );
+      if (next === null) {
+        setAddonNoticeById((current) =>
+          setAddonOperationMessage(
+            current,
+            id,
+            t("addons.actionTimeout", { seconds: ADDON_TOGGLE_DEADLINE_MS / 1000 })
+          )
+        );
+        const refreshed = await readDashboardWithinDeadline();
+        if (refreshed) {
+          setDashboard(refreshed);
+        }
+        return;
+      }
       setDashboard(next);
       setAddonResultById((current) =>
         setAddonOperationMessage(
@@ -4593,8 +4787,19 @@ export default function App() {
     setAddonPresetMode(recommendedAddonPresetMatches(dashboard) ? "recommended" : "custom");
   }, [dashboard, addonPresetBusy]);
 
-  async function applyRecommendedAddonPreset() {
+  /**
+   * The preset writes every entry it owns, so it can turn off tools the user
+   * enabled by hand. Ask once, naming them, before anything changes.
+   */
+  async function applyRecommendedAddonPreset(options: { confirmed?: boolean } = {}) {
     if (addonPresetBusy) return;
+    if (!options.confirmed) {
+      const disabled = listPresetDisables(dashboard);
+      if (disabled.length) {
+        setPendingWorkflowSwitch({ kind: "preset", id: "", name: "", peers: disabled });
+        return;
+      }
+    }
     addonPresetUserSelectedCustomRef.current = false;
     setAddonPresetMode("recommended");
     setAddonPresetBusy(true);
@@ -4603,26 +4808,35 @@ export default function App() {
         let tool = dashboard.tools.find((candidate) => candidate.id === id);
         if (!tool) continue;
         if (target.enabled && tool.status === "not_installed") {
-          await runAddonAction("install_addon", id);
-          const refreshed = await invoke<DashboardState>("get_dashboard_state");
-          setDashboard(refreshed);
-          tool = refreshed.tools.find((candidate) => candidate.id === id);
+          // The action already re-reads the dashboard (bounded); reuse that
+          // state instead of a second, unbounded read that could stall the
+          // whole preset on one slow build.
+          const after = await runAddonAction("install_addon", id);
+          if (!after) continue;
+          setDashboard(after);
+          tool = after.tools.find((candidate) => candidate.id === id);
         }
         if (!tool) continue;
         if (tool.enabled !== target.enabled && tool.status !== "not_installed") {
-          await runAddonAction("set_addon_enabled", id, target.enabled);
-          const refreshed = await invoke<DashboardState>("get_dashboard_state");
-          setDashboard(refreshed);
-          tool = refreshed.tools.find((candidate) => candidate.id === id);
+          const after = await runAddonAction("set_addon_enabled", id, target.enabled);
+          if (!after) continue;
+          setDashboard(after);
+          tool = after.tools.find((candidate) => candidate.id === id);
         }
         if (target.enabled && target.mode && tool?.supportedModes?.includes(target.mode) && tool?.defaultMode !== target.mode) {
           await runAddonModeAction(id, target.mode);
         }
       }
-      const refreshed = await invoke<DashboardState>("get_dashboard_state");
-      setDashboard(refreshed);
-      if (!recommendedAddonPresetMatches(refreshed)) {
-        throw new Error("Recommended add-on preset was not fully applied.");
+      const refreshed = await readDashboardWithinDeadline();
+      if (refreshed) {
+        setDashboard(refreshed);
+        if (!recommendedAddonPresetMatches(refreshed)) {
+          throw new Error("Recommended add-on preset was not fully applied.");
+        }
+      } else {
+        console.warn(
+          "Recommended add-on preset could not be verified: the dashboard read did not answer."
+        );
       }
       setAddonPresetMode("recommended");
     } catch (error) {
@@ -7841,6 +8055,12 @@ export default function App() {
                       busyLabel={addonBusyById[tool.id] ?? null}
                       resultMessage={addonResultById[tool.id] ?? null}
                       errorMessage={addonErrorById[tool.id] ?? null}
+                      noticeMessage={addonNoticeById[tool.id] ?? null}
+                      onDismissNotice={() =>
+                        setAddonNoticeById((current) =>
+                          clearAddonOperationMessage(current, tool.id)
+                        )
+                      }
                       upstreamVersion={tool.upstreamVersion ?? null}
                       upstreamUpdateAvailable={tool.upstreamUpdateAvailable ?? false}
                       updateRequiresAppUpdate={tool.updateRequiresAppUpdate ?? false}
@@ -7875,7 +8095,7 @@ export default function App() {
                       }
                       onInstall={() => void runAddonAction("install_addon", tool.id)}
                       onToggleEnabled={() =>
-                        void runAddonAction("set_addon_enabled", tool.id, !tool.enabled)
+                        void requestAddonToggle(tool)
                       }
                       onUninstall={() => void runAddonAction("uninstall_addon", tool.id)}
                     />
@@ -7905,6 +8125,12 @@ export default function App() {
                 busyLabel={addonBusyById.rtk ?? null}
                 resultMessage={addonResultById.rtk ?? null}
                 errorMessage={addonErrorById.rtk ?? null}
+                noticeMessage={addonNoticeById.rtk ?? null}
+                onDismissNotice={() =>
+                  setAddonNoticeById((current) =>
+                    clearAddonOperationMessage(current, "rtk")
+                  )
+                }
                 upstreamVersion={checkedRtkTool?.upstreamVersion ?? null}
                 upstreamUpdateAvailable={checkedRtkTool?.upstreamUpdateAvailable ?? false}
                 updateRequiresAppUpdate={checkedRtkTool?.updateRequiresAppUpdate ?? false}
@@ -8929,6 +9155,56 @@ export default function App() {
               </div>
             </div>
           )}
+
+          {pendingWorkflowSwitch ? (
+            <div
+              className="modal-backdrop"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="workflow-switch-title"
+              onClick={() => setPendingWorkflowSwitch(null)}
+            >
+              <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+                <h3 id="workflow-switch-title">
+                  {pendingWorkflowSwitch.kind === "preset"
+                    ? t("addons.preset.confirmTitle")
+                    : t("addons.switchTitle", { name: pendingWorkflowSwitch.name })}
+                </h3>
+                <p>
+                  {pendingWorkflowSwitch.kind === "preset"
+                    ? t("addons.preset.confirmBody", {
+                        peers: pendingWorkflowSwitch.peers
+                          .map((peer) => peer.name)
+                          .join(t("punctuation.listSeparator")),
+                      })
+                    : t("addons.switchBody", {
+                        name: pendingWorkflowSwitch.name,
+                        peers: pendingWorkflowSwitch.peers
+                          .map((peer) => peer.name)
+                          .join(t("punctuation.listSeparator")),
+                      })}
+                </p>
+                <div className="modal-actions">
+                  <button
+                    className="secondary-button"
+                    onClick={() => setPendingWorkflowSwitch(null)}
+                    type="button"
+                  >
+                    {t("actions.cancel")}
+                  </button>
+                  <button
+                    className="primary-button"
+                    onClick={() => void confirmWorkflowSwitch()}
+                    type="button"
+                  >
+                    {pendingWorkflowSwitch.kind === "preset"
+                      ? t("addons.preset.confirmApply")
+                      : t("addons.switchConfirm", { name: pendingWorkflowSwitch.name })}
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
 
           {showUninstallDialog ? (
             <div

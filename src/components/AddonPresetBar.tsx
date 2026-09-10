@@ -1,3 +1,4 @@
+import { useI18n } from "../lib/i18n";
 import type { DashboardState } from "../lib/types";
 
 export type AddonPresetTarget = { enabled: boolean; mode?: string };
@@ -30,6 +31,30 @@ function matchesPreset(dashboard: DashboardState): boolean {
   return matches && dashboard.tools.every((tool) => tool.required || RECOMMENDED_ADDON_PRESET[tool.id] || !tool.enabled);
 }
 
+/**
+ * Tools that applying the recommended preset would switch off right now.
+ *
+ * The preset writes every entry it owns, so it also turns off tools the user
+ * enabled by hand - including the active peer of a single-select workflow
+ * group. Naming them before the click is the difference between a preset and a
+ * silent regression.
+ */
+export function listPresetDisables(
+  dashboard: DashboardState
+): Array<{ id: string; name: string }> {
+  return dashboard.tools
+    .filter((tool) => {
+      const target = RECOMMENDED_ADDON_PRESET[tool.id];
+      return (
+        target !== undefined &&
+        !target.enabled &&
+        tool.enabled &&
+        tool.status !== "not_installed"
+      );
+    })
+    .map((tool) => ({ id: tool.id, name: tool.name }));
+}
+
 export function AddonPresetBar({
   dashboard,
   busy,
@@ -43,9 +68,10 @@ export function AddonPresetBar({
   onApplyRecommended: () => void;
   onSelectCustom: () => void;
 }) {
+  const { t } = useI18n();
   const recommended = matchesPreset(dashboard);
   return (
-    <div className="addon-preset-bar" role="group" aria-label="工具档位">
+    <div className="addon-preset-bar" role="group" aria-label={t("aria.addonPresets")}>
       <button
         type="button"
         className={`addon-preset-bar__button${mode === "recommended" && recommended ? " is-active" : ""}`}
@@ -53,7 +79,7 @@ export function AddonPresetBar({
         onClick={onApplyRecommended}
         aria-busy={busy}
       >
-        {busy ? "应用中…" : "推荐"}
+        {busy ? t("addons.preset.applying") : t("addons.preset.recommended")}
       </button>
       <button
         type="button"
@@ -62,12 +88,16 @@ export function AddonPresetBar({
         onClick={onSelectCustom}
         aria-pressed={mode === "custom" || !recommended}
       >
-        自定义
+        {t("addons.preset.custom")}
       </button>
       <span className="addon-preset-bar__hint">
-        {mode === "recommended" ? "推荐档位已锁定设置；先点自定义才能调整。" : "自定义档位可单独调整工具和节约强度。"}
+        {mode === "recommended"
+          ? t("addons.preset.lockedHint")
+          : t("addons.preset.customHint")}
       </span>
-      {busy ? <span className="addon-preset-bar__status">正在应用推荐档位并安装缺失工具…</span> : null}
+      {busy ? (
+        <span className="addon-preset-bar__status">{t("addons.preset.busyStatus")}</span>
+      ) : null}
     </div>
   );
 }

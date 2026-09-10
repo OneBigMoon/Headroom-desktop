@@ -1,3 +1,4 @@
+import type { Translate } from "./i18n";
 import type {
   ClientConnectorStatus,
   ClientSetupResult,
@@ -727,6 +728,23 @@ export function hasEnabledConnector(connectors: ClientConnectorStatus[]) {
 }
 
 export type ConnectorDashboardTone = "active" | "pending" | "idle" | "off";
+
+/**
+ * Localizes the short savings line an add-on card chip shows.
+ *
+ * The backend writes these labels in English ("12 docs converted",
+ * "47-77% lower cost (benchmark)"), so they need translating on the way out or
+ * every locale but English shows the raw backend wording.
+ */
+export function localizeAddonSavingsLabel(label: string, t: Translate): string {
+  const docs = label.match(/^(\d+) docs? converted$/i);
+  if (docs) return t("addons.savings.docsConverted", { count: docs[1] });
+  const lowerCost = label.match(/^(.+?) lower cost \(benchmark\)$/i);
+  if (lowerCost) return t("addons.savings.lowerCost", { range: lowerCost[1] });
+  const fewerTokens = label.match(/^(.+?) fewer output tokens \(benchmark\)$/i);
+  if (fewerTokens) return t("addons.savings.fewerTokens", { range: fewerTokens[1] });
+  return label;
+}
 
 export function connectorDashboardStatus(
   connector: ClientConnectorStatus,

@@ -5,7 +5,46 @@ import {
   getActivationScopeCopy,
   groupToolsByCategory,
   TOOL_CATEGORY_ORDER,
+  workflowSwitchPeers,
 } from "./workflowCatalog";
+
+function tool(
+  id: string,
+  workflowGroup: string | null,
+  enabled: boolean,
+  status = "healthy"
+) {
+  return { id, name: id.toUpperCase(), workflowGroup, enabled, status };
+}
+
+describe("workflowSwitchPeers", () => {
+  const tools = [
+    tool("openspec", "primary_workflow", true),
+    tool("superpowers", "primary_workflow", false),
+    // On in the manifest but never installed: nothing to switch off on disk.
+    tool("gstack", "primary_workflow", true, "not_installed"),
+    tool("ralph-loop", "execution_engine", true),
+    tool("serena", null, true),
+  ];
+
+  it("lists the enabled, installed peers of the same group", () => {
+    expect(workflowSwitchPeers(tools, "superpowers").map((peer) => peer.id)).toEqual(["openspec"]);
+  });
+
+  it("ignores the other group, disabled peers, and uninstalled peers", () => {
+    // gstack reads as enabled but was never installed, and serena has no group.
+    expect(workflowSwitchPeers(tools, "gstack").map((peer) => peer.id)).toEqual(["openspec"]);
+    expect(workflowSwitchPeers(tools, "serena")).toEqual([]);
+  });
+
+  it("reports the active peer when the tool is already on", () => {
+    expect(workflowSwitchPeers(tools, "openspec").map((peer) => peer.id)).toEqual([]);
+  });
+
+  it("returns nothing for an unknown id", () => {
+    expect(workflowSwitchPeers(tools, "missing")).toEqual([]);
+  });
+});
 
 describe("groupToolsByCategory", () => {
   it("creates every group in the documented order and maps unknown categories to other", () => {

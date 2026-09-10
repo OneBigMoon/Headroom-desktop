@@ -28,6 +28,12 @@ let cavemanMode = "wenyan-full";
 let ponytailInstalled = true;
 let ponytailEnabled = true;
 let ponytailMode = "ultra";
+// Single-select workflow peers start uninstalled so the other tool tests keep
+// their install-first flow; the switch tests opt them in explicitly.
+let openspecInstalled = false;
+let openspecEnabled = false;
+let superpowersInstalled = false;
+let superpowersEnabled = false;
 let autoLearnEnabled = true;
 let autostartEnabled = false;
 let claudeCliAvailable = true;
@@ -99,12 +105,13 @@ const runtime: RuntimeStatus = {
   },
 };
 
-const additionalTools: DashboardState["tools"] = [
+// Built per read so the workflow flags below can change between tests.
+const additionalTools = (): DashboardState["tools"] => [
   { id: "stop-that-shit", name: "Stop That Shit", description: "Guarded scope checks.", runtime: "plugin", required: false, enabled: false, status: "not_installed", sourceUrl: "https://example.invalid/stop-that-shit", version: "latest", category: "guardrails", activationScope: "new_session" },
   { id: "agent-guard", name: "Agent Guard", description: "Local secret guard.", runtime: "plugin", required: false, enabled: false, status: "not_installed", sourceUrl: "https://example.invalid/agent-guard", version: "latest", category: "guardrails", activationScope: "new_session" },
   { id: "grill-me", name: "Grill Me", description: "Read-only understanding check.", runtime: "plugin", required: false, enabled: false, status: "not_installed", sourceUrl: "https://example.invalid/grill-me", version: "latest", category: "learning", activationScope: "new_session" },
-  { id: "openspec", name: "OpenSpec", description: "Specification workflow.", runtime: "plugin", required: false, enabled: false, status: "not_installed", sourceUrl: "https://github.com/Fission-AI/OpenSpec", version: "latest", category: "workflow", workflowGroup: "primary_workflow", activationScope: "new_session" },
-  { id: "superpowers", name: "Superpowers", description: "Disciplined coding workflow.", runtime: "plugin", required: false, enabled: false, status: "not_installed", sourceUrl: "https://github.com/obra/superpowers", version: "latest", category: "workflow", workflowGroup: "primary_workflow", activationScope: "new_session" },
+  { id: "openspec", name: "OpenSpec", description: "Specification workflow.", runtime: "plugin", required: false, enabled: openspecEnabled, status: openspecInstalled ? "healthy" : "not_installed", sourceUrl: "https://github.com/Fission-AI/OpenSpec", version: "latest", category: "workflow", workflowGroup: "primary_workflow", activationScope: "new_session" },
+  { id: "superpowers", name: "Superpowers", description: "Disciplined coding workflow.", runtime: "plugin", required: false, enabled: superpowersEnabled, status: superpowersInstalled ? "healthy" : "not_installed", sourceUrl: "https://github.com/obra/superpowers", version: "latest", category: "workflow", workflowGroup: "primary_workflow", activationScope: "new_session" },
   { id: "gstack", name: "gstack", description: "Product to ship workflow.", runtime: "plugin", required: false, enabled: false, status: "not_installed", sourceUrl: "https://github.com/garrytan/gstack", version: "latest", category: "workflow", workflowGroup: "primary_workflow", activationScope: "new_session" },
   { id: "ralph-loop", name: "Ralph Loop", description: "Bounded automation loop.", runtime: "plugin", required: false, enabled: false, status: "not_installed", sourceUrl: "https://github.com/SantanderAI/ralph", version: "latest", category: "automation", workflowGroup: "execution_engine", activationScope: "new_session" },
 ];
@@ -118,7 +125,7 @@ function dashboardState(): DashboardState {
     lifetimeEstimatedTokensSaved: 18_500,
     lifetimeEstimatedSavingsUsd: 3.5,
     tools: [
-      ...additionalTools,
+      ...additionalTools(),
       {
         id: "rtk",
         name: "RTK",
@@ -235,6 +242,10 @@ beforeEach(() => {
   ponytailInstalled = true;
   ponytailEnabled = true;
   ponytailMode = "ultra";
+  openspecInstalled = false;
+  openspecEnabled = false;
+  superpowersInstalled = false;
+  superpowersEnabled = false;
   autoLearnEnabled = true;
   autostartEnabled = false;
   claudeCliAvailable = true;
@@ -601,6 +612,60 @@ describe("CommunityApp", () => {
     expect(within(automationHeading.parentElement as HTMLElement).getByText("本组只能启用 1 个 · 自动执行器")).toBeInTheDocument();
     expect(screen.getByText("决定开发任务如何从需求推进到交付：OpenSpec 偏规格与验收，Superpowers 偏计划与 TDD，gstack 偏产品到发布全流程；本组只能启用 1 个。")).toBeInTheDocument();
     expect(screen.getByText("决定由谁持续推动任务执行：All in Luna 负责多代理协作与持久目标，Ralph Loop 负责循环执行到完成条件；本组只能启用 1 个，且都需用户明确启动。")).toBeInTheDocument();
+  });
+
+  it("confirms a single-select switch and leaves the peer alone when cancelled", async () => {
+    openspecInstalled = true;
+    openspecEnabled = true;
+    superpowersInstalled = true;
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const user = userEvent.setup();
+    renderCommunityApp();
+
+    await screen.findByText("Proxy online");
+    await user.click(screen.getByRole("button", { name: "Tools" }));
+
+    const superpowersCard = screen.getByText("Superpowers", { selector: "h3" }).closest("article") as HTMLElement;
+    await user.click(within(superpowersCard).getByRole("button", { name: "Enable" }));
+
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining("OpenSpec"));
+    expect(invokeMock).not.toHaveBeenCalledWith("set_addon_enabled", { id: "superpowers", enabled: true });
+    confirmSpy.mockRestore();
+  });
+
+  it("enables the peer once the single-select switch is confirmed", async () => {
+    openspecInstalled = true;
+    openspecEnabled = true;
+    superpowersInstalled = true;
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const user = userEvent.setup();
+    renderCommunityApp();
+
+    await screen.findByText("Proxy online");
+    await user.click(screen.getByRole("button", { name: "Tools" }));
+
+    const superpowersCard = screen.getByText("Superpowers", { selector: "h3" }).closest("article") as HTMLElement;
+    await user.click(within(superpowersCard).getByRole("button", { name: "Enable" }));
+
+    expect(invokeMock).toHaveBeenCalledWith("set_addon_enabled", { id: "superpowers", enabled: true });
+    confirmSpy.mockRestore();
+  });
+
+  it("enables a lone workflow tool without asking", async () => {
+    superpowersInstalled = true;
+    const confirmSpy = vi.spyOn(window, "confirm");
+    const user = userEvent.setup();
+    renderCommunityApp();
+
+    await screen.findByText("Proxy online");
+    await user.click(screen.getByRole("button", { name: "Tools" }));
+
+    const superpowersCard = screen.getByText("Superpowers", { selector: "h3" }).closest("article") as HTMLElement;
+    await user.click(within(superpowersCard).getByRole("button", { name: "Enable" }));
+
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(invokeMock).toHaveBeenCalledWith("set_addon_enabled", { id: "superpowers", enabled: true });
+    confirmSpy.mockRestore();
   });
 
   it("uses addon controls without restarting the proxy for new-session tools", async () => {

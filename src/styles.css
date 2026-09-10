@@ -6503,6 +6503,9 @@ html.window-hiding {
 .addon-card--unavailable .addon-card__name, .addon-card--unavailable .addon-card__description { color: var(--text-muted); }
 .addon-card__notice { margin: 8px 0 0; padding: 8px 10px; border-radius: 8px; background: var(--surface-sunken); border: 1px solid var(--border-subtle); font-size: var(--text-xs); color: var(--text-secondary); }
 .addon-card__notice--update { border-color: color-mix(in srgb, var(--warning) 35%, var(--border-subtle)); background: color-mix(in srgb, var(--warning) 8%, var(--surface-sunken)); }
+.addon-card__notice--warning { border-color: color-mix(in srgb, var(--warning) 45%, var(--border-subtle)); background: color-mix(in srgb, var(--warning) 12%, var(--surface-sunken)); color: var(--text-primary); }
+.addon-card__notice--dismissable { display: flex; align-items: flex-start; gap: 8px; }
+.addon-card__notice--warning .addon-card__result-dismiss { color: var(--warning); }
 .addon-card__progress { margin: 8px 0 0; font-size: var(--text-xs); color: var(--text-secondary); }
 .addon-card__error { margin-top: 8px; }
 .addon-card__result { display: flex; align-items: flex-start; gap: 8px; margin: 8px 0 0; padding: 8px 10px; border-radius: 8px; background: var(--accent-tint); font-size: var(--text-xs); line-height: 1.4; color: var(--accent); }

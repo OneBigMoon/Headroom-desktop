@@ -18,7 +18,7 @@ import { OptimizePanel } from "./components/OptimizePanel";
 import { RuntimeStatusIndicator } from "./components/RuntimeStatusIndicator";
 import { localeOptions, useI18n, type Locale, type Translate, type TranslationKey } from "./lib/i18n";
 import { LOCAL_COMMUNITY_NAME } from "./lib/localEdition";
-import { conflictHeadingCopy, conflictMatrixCopy, getActivationScopeCopy, groupToolsByCategory, sourceLinkCopy, toolCategoryCopy, toolCopy, TOOL_CATEGORY_ORDER, workflowGroupCopy } from "./lib/workflowCatalog";
+import { conflictHeadingCopy, conflictMatrixCopy, getActivationScopeCopy, groupToolsByCategory, sourceLinkCopy, toolCategoryCopy, toolCopy, TOOL_CATEGORY_ORDER, workflowGroupCopy, workflowSwitchPeers } from "./lib/workflowCatalog";
 import type {
   ActivityFeedResponse,
   ClaudeCodeProject,
@@ -548,6 +548,20 @@ export function CommunityApp() {
         () => t("messages.toolInstalled", { name: tool.name }),
       );
       return;
+    }
+    // Enabling a tool in a single-select group disables its active peer in the
+    // backend, so confirm the switch and name the peer before it happens.
+    if (!tool.enabled) {
+      const peers = workflowSwitchPeers(tools, tool.id);
+      if (peers.length) {
+        const confirmed = window.confirm(
+          `${t("addons.switchTitle", { name: tool.name })}\n${t("addons.switchBody", {
+            name: tool.name,
+            peers: peers.map((peer) => peer.name).join(t("punctuation.listSeparator")),
+          })}`
+        );
+        if (!confirmed) return;
+      }
     }
     void runAction(
       key,

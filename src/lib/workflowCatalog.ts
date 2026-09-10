@@ -320,3 +320,35 @@ export function toolCategory(category?: string | null): ToolCategory {
     ? (category as ToolCategory)
     : "other";
 }
+
+/** Minimal shape the switch rule needs: every tool list in the UI satisfies it. */
+export interface SwitchableTool {
+  id: string;
+  name: string;
+  enabled: boolean;
+  status: string;
+  workflowGroup?: string | null;
+}
+
+/**
+ * Peers that enabling `id` would switch off.
+ *
+ * The backend enforces the single-select rule by silently disabling the active
+ * peer (see `enforce_exclusive_plugin_group`), so the UI asks first instead of
+ * letting a workflow disappear without explanation. Returns an empty list for
+ * tools outside a group, so callers can use the result as the gate itself.
+ */
+export function workflowSwitchPeers<T extends SwitchableTool>(
+  tools: readonly T[],
+  id: string
+): T[] {
+  const group = tools.find((tool) => tool.id === id)?.workflowGroup;
+  if (!group) return [];
+  return tools.filter(
+    (tool) =>
+      tool.id !== id &&
+      tool.workflowGroup === group &&
+      tool.enabled &&
+      tool.status !== "not_installed"
+  );
+}
