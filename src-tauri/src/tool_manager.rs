@@ -338,7 +338,7 @@ still compress -- so the flip stays. tool_result blocks compress
 regardless of this flag (the role gate only guards text blocks), so the
 coding token mass is unaffected.
 
-Also ports four fixes owed upstream (remove each once a wheel ships it),
+Also ports five fixes owed upstream (remove each once a wheel ships it),
 gated on HEADROOM_SDK=headroom-local-community-proxy so only the backend process
 pays the proxy import cost:
 Context-limit guard (upstream PR #2942): compression under-reports
@@ -384,6 +384,21 @@ turn one -- upstream #3194, the 0.36.3 regression from the same lift.
 No version gate: it self-neutralizes when payload["tools"] is already
 present, and 0.36.2 has no additional_tools support either. Kill
 switch: HEADROOM_ADDITIONAL_TOOLS_GUARD=0.
+cc-switch reconciler self-URL guard: server.py builds the reconciler with
+proxy_url=f"http://127.0.0.1:{config.port}", and config.port is the
+BACKEND port (6868), not the desktop ingress (6867) that every client is
+pointed at. The reconciler therefore treats our own ingress as a
+third-party gateway: it captures 6867 as the upstream and rewrites
+env.ANTHROPIC_BASE_URL to 6868, so a request enters the ingress, is
+forwarded to 6868, and is then forwarded back to 6867 as "the provider" --
+a self-loop that never terminates (2026-09-10: /admin/upstream reported
+captured_upstream=http://127.0.0.1:6867 while ~/.claude/settings.json was
+flipped to 6868, and every /v1/messages probe hung; the user's real
+endpoint was silently replaced). The guard re-points the reconciler at the
+URL clients actually use (HEADROOM_INGRESS_URL, default
+http://127.0.0.1:6867), which makes the loop guard branch fire instead of
+the capture branch -- and still captures every genuine third-party
+endpoint. Kill switch: HEADROOM_CC_SWITCH_SELF_URL=0.
 """
 import faulthandler
 import signal
@@ -995,6 +1010,34 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-local-community-proxy":
             _hd_at_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor = (
                 _hd_at_compress
             )
+    except Exception:
+        pass
+
+    # cc-switch reconciler self-URL guard (remove once a wheel ships it).
+    # See the module docstring for the failure mode this breaks.
+    try:
+        if _hd_os.environ.get(
+            "HEADROOM_CC_SWITCH_SELF_URL", "1"
+        ).strip().lower() not in ("0", "false", "no", "off"):
+            import headroom.proxy.cc_switch_reconciler as _hd_cc
+
+            _hd_cc_self = (
+                _hd_os.environ.get("HEADROOM_INGRESS_URL") or "http://127.0.0.1:6867"
+            ).rstrip("/")
+            _hd_cc_orig_init = _hd_cc.CCSwitchReconciler.__init__
+
+            def _hd_cc_init(self, *args, **kwargs):
+                # `proxy_url` is keyword-only upstream, so the kwargs branch is
+                # the live one. The positional branch only fires if a future
+                # wheel relaxes that, and then the first positional is
+                # proxy_url by construction.
+                if args:
+                    args = (_hd_cc_self,) + tuple(args[1:])
+                else:
+                    kwargs["proxy_url"] = _hd_cc_self
+                return _hd_cc_orig_init(self, *args, **kwargs)
+
+            _hd_cc.CCSwitchReconciler.__init__ = _hd_cc_init
     except Exception:
         pass
 "#;
@@ -3425,6 +3468,13 @@ impl ToolManager {
                     // seeds it so boot never needs the network for vocab.
                     .env("TIKTOKEN_CACHE_DIR", self.tiktoken_cache_dir())
                     .env("HEADROOM_SDK", "headroom-local-community-proxy")
+                    // The URL clients actually use. The upstream cc-switch
+                    // reconciler would otherwise treat our own ingress as a
+                    // third-party gateway and rewrite Claude Code's
+                    // base_url to the backend port, looping requests back
+                    // into the ingress (see SITECUSTOMIZE_PY's self-URL
+                    // guard, which consumes this).
+                    .env("HEADROOM_INGRESS_URL", HEADROOM_PROXY_URL)
                     // Community keeps upstream collection disabled. Dashboard
                     // stats come from the local interceptor, never a beacon.
                     .env("HEADROOM_TELEMETRY", "off")
@@ -15189,6 +15239,33 @@ asyncio.run(verify())
         assert!(py.contains("_rewrite_delta"));
         // ...and the kill switch is honored.
         assert!(py.contains("HEADROOM_CONTEXT_GUARD"));
+    }
+
+    /// The desktop spawns the backend on 6868 (backend_port) while clients are
+    /// pointed at the 6867 ingress. The upstream cc-switch reconciler builds
+    /// its own URL from the *backend* port, so it classified the ingress as a
+    /// third-party gateway, captured it as the upstream, and rewrote Claude
+    /// Code's base_url to 6868 -- every request then looped ingress -> backend
+    /// -> ingress and hung (reproduced live 2026-09-10:
+    /// `/admin/upstream` -> `captured_upstream: http://127.0.0.1:6867`).
+    #[test]
+    fn sitecustomize_points_cc_switch_reconciler_at_the_client_facing_url() {
+        let py = super::SITECUSTOMIZE_PY;
+        // Same class the proxy instantiates, and __init__ is the seam (the
+        // name is imported at lifespan time, so the patch must target the
+        // class object, not a module-level alias).
+        assert!(py.contains("import headroom.proxy.cc_switch_reconciler as _hd_cc"));
+        assert!(py.contains("_hd_cc.CCSwitchReconciler.__init__ = _hd_cc_init"));
+        // Keyword-only upstream; the positional branch is defensive only.
+        assert!(py.contains(r#"kwargs["proxy_url"] = _hd_cc_self"#));
+        assert!(py.contains("_hd_cc_orig_init(self, *args, **kwargs)"));
+        // Single source of truth for the ingress, with the same default the
+        // spawn env uses (HEADROOM_PROXY_URL).
+        assert!(py.contains(r#"environ.get("HEADROOM_INGRESS_URL")"#));
+        assert!(py.contains(r#""http://127.0.0.1:6867""#));
+        // Must be off-switchable and must never take the backend down.
+        assert!(py.contains("HEADROOM_CC_SWITCH_SELF_URL"));
+        assert!(py.contains("except Exception:"));
     }
 
     #[test]
