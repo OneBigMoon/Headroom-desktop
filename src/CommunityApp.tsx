@@ -883,11 +883,15 @@ export function CommunityApp() {
                     <p>
                       {!connector.installed
                         ? t("connections.notInstalled")
-                        : connector.enabled && connector.verified
-                          ? t("connections.connectedVerified")
-                          : connector.enabled
-                            ? t("connections.connectedPending")
-                            : t("connections.available")}
+                        : connector.enabled
+                          ? connector.verification?.foreignProvider
+                            ? t("connections.foreignProviderShort", {
+                                provider: connector.verification.foreignProvider,
+                              })
+                            : connector.verified
+                              ? t("connections.connectedVerified")
+                              : t("connections.connectedPending")
+                          : t("connections.available")}
                     </p>
                   </div>
                   <span className={`community-state${connector.enabled ? " is-ready" : ""}`}>

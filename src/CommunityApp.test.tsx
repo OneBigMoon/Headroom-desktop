@@ -402,6 +402,21 @@ describe("CommunityApp", () => {
     });
   });
 
+  it("names the tool that owns the Codex route instead of pending verification", async () => {
+    // A connector that is on while another tool owns the route must not read as
+    // "verification pending", which implies Headroom is mid-setup. The card
+    // names the tool that is actually routing.
+    connectorEnabled = true;
+    connectorForeignProvider = "codex_local_access";
+    const user = userEvent.setup();
+    renderCommunityApp();
+
+    await screen.findByText("Proxy online");
+    await user.click(screen.getByRole("button", { name: "Connections" }));
+    await screen.findByText("Connected; routing is handled by codex_local_access");
+    expect(screen.queryByText("Connected; verification pending")).toBeNull();
+  });
+
   it("asks for confirmation before taking over a Codex route owned by another tool", async () => {
     connectorForeignProvider = "codex_local_access";
     const confirmMock = vi.spyOn(window, "confirm").mockReturnValue(true);
