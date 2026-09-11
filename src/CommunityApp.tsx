@@ -18,7 +18,8 @@ import { OptimizePanel } from "./components/OptimizePanel";
 import { RuntimeStatusIndicator } from "./components/RuntimeStatusIndicator";
 import { localeOptions, useI18n, type Locale, type Translate, type TranslationKey } from "./lib/i18n";
 import { connectorForeignProvider, connectorLabel } from "./lib/dashboardHelpers";
-import { TakeoverConfirmDialog } from "./components/TakeoverConfirmDialog";
+import { ConfirmDialog } from "./components/ConfirmDialog";
+import { useConfirmDialog } from "./lib/confirmDialog";
 import { useTakeoverConfirm } from "./lib/takeoverConfirm";
 import { LOCAL_COMMUNITY_NAME } from "./lib/localEdition";
 import { conflictHeadingCopy, conflictMatrixCopy, getActivationScopeCopy, groupToolsByCategory, sourceLinkCopy, toolCategoryCopy, toolCopy, TOOL_CATEGORY_ORDER, workflowGroupCopy, workflowSwitchPeers } from "./lib/workflowCatalog";
@@ -251,6 +252,7 @@ function DashboardMetric({ label, value, detail }: { label: string; value: strin
 export function CommunityApp() {
   const { locale, resolvedLocale, setLocale, t } = useI18n();
   const takeoverConfirm = useTakeoverConfirm();
+  const confirmDialog = useConfirmDialog();
   const [activeView, setActiveView] = useState<CommunityView>("overview");
   const [dashboard, setDashboard] = useState<DashboardState | null>(null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
@@ -544,7 +546,7 @@ export function CommunityApp() {
     );
   };
 
-  const handleTool = (tool: ManagedTool) => {
+  const handleTool = async (tool: ManagedTool) => {
     const key = `tool:${tool.id}`;
     if (tool.status === "not_installed") {
       void runAction(
@@ -559,12 +561,15 @@ export function CommunityApp() {
     if (!tool.enabled) {
       const peers = workflowSwitchPeers(tools, tool.id);
       if (peers.length) {
-        const confirmed = window.confirm(
-          `${t("addons.switchTitle", { name: tool.name })}\n${t("addons.switchBody", {
+        const confirmed = await confirmDialog.request({
+          title: t("addons.switchTitle", { name: tool.name }),
+          body: t("addons.switchBody", {
             name: tool.name,
             peers: peers.map((peer) => peer.name).join(t("punctuation.listSeparator")),
-          })}`
-        );
+          }),
+          confirmLabel: t("addons.switchConfirm", { name: tool.name }),
+          cancelLabel: t("actions.cancel"),
+        });
         if (!confirmed) return;
       }
     }
@@ -663,8 +668,13 @@ export function CommunityApp() {
       });
   };
 
-  const handleUninstall = () => {
-    const confirmed = window.confirm(t("confirm.remove"));
+  const handleUninstall = async () => {
+    const confirmed = await confirmDialog.request({
+      title: t("uninstall.title"),
+      body: t("confirm.remove"),
+      confirmLabel: t("uninstall.action"),
+      cancelLabel: t("actions.cancel"),
+    });
     if (!confirmed) return;
     void runAction(
       "uninstall",
@@ -1423,10 +1433,10 @@ export function CommunityApp() {
         ) : null}
       </section>
       {takeoverConfirm.prompt ? (
-        <TakeoverConfirmDialog
-          prompt={takeoverConfirm.prompt}
-          onAnswer={takeoverConfirm.answer}
-        />
+        <ConfirmDialog prompt={takeoverConfirm.prompt} onAnswer={takeoverConfirm.answer} />
+      ) : null}
+      {confirmDialog.prompt ? (
+        <ConfirmDialog prompt={confirmDialog.prompt} onAnswer={confirmDialog.answer} />
       ) : null}
     </main>
   );

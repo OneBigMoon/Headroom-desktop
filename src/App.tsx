@@ -58,7 +58,7 @@ import {
 } from "./lib/addonUpdates";
 import { localeOptions, useI18n, type Locale, type Translate, type TranslationKey } from "./lib/i18n";
 import { RuntimeStatusIndicator } from "./components/RuntimeStatusIndicator";
-import { TakeoverConfirmDialog } from "./components/TakeoverConfirmDialog";
+import { ConfirmDialog } from "./components/ConfirmDialog";
 import { useTakeoverConfirm } from "./lib/takeoverConfirm";
 import {
   getActivationScopeCopy,
@@ -9200,10 +9200,7 @@ export default function App() {
           )}
 
           {takeoverPrompt ? (
-            <TakeoverConfirmDialog
-              prompt={takeoverPrompt}
-              onAnswer={answerTakeoverConfirm}
-            />
+            <ConfirmDialog prompt={takeoverPrompt} onAnswer={answerTakeoverConfirm} />
           ) : null}
 
           {pendingWorkflowSwitch ? (

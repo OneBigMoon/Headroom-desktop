@@ -624,11 +624,10 @@ describe("CommunityApp", () => {
     expect(screen.getByText("决定由谁持续推动任务执行：All in Luna 负责多代理协作与持久目标，Ralph Loop 负责循环执行到完成条件；本组只能启用 1 个，且都需用户明确启动。")).toBeInTheDocument();
   });
 
-  it("confirms a single-select switch and leaves the peer alone when cancelled", async () => {
+  it("confirms a single-select switch in-app and leaves the peer alone when cancelled", async () => {
     openspecInstalled = true;
     openspecEnabled = true;
     superpowersInstalled = true;
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
     const user = userEvent.setup();
     renderCommunityApp();
 
@@ -638,16 +637,23 @@ describe("CommunityApp", () => {
     const superpowersCard = screen.getByText("Superpowers", { selector: "h3" }).closest("article") as HTMLElement;
     await user.click(within(superpowersCard).getByRole("button", { name: "Enable" }));
 
-    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining("OpenSpec"));
+    // The question is a real dialog, not `window.confirm`: this shell's WebKit
+    // answers the native call with "cancel" without drawing anything, which is
+    // why the switch used to happen with no prompt at all.
+    const dialog = await screen.findByRole("dialog", { name: "Switch to Superpowers?" });
+    expect(dialog).toHaveTextContent("OpenSpec");
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
     expect(invokeMock).not.toHaveBeenCalledWith("set_addon_enabled", { id: "superpowers", enabled: true });
-    confirmSpy.mockRestore();
   });
 
   it("enables the peer once the single-select switch is confirmed", async () => {
     openspecInstalled = true;
     openspecEnabled = true;
     superpowersInstalled = true;
-    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     const user = userEvent.setup();
     renderCommunityApp();
 
@@ -657,13 +663,16 @@ describe("CommunityApp", () => {
     const superpowersCard = screen.getByText("Superpowers", { selector: "h3" }).closest("article") as HTMLElement;
     await user.click(within(superpowersCard).getByRole("button", { name: "Enable" }));
 
-    expect(invokeMock).toHaveBeenCalledWith("set_addon_enabled", { id: "superpowers", enabled: true });
-    confirmSpy.mockRestore();
+    const dialog = await screen.findByRole("dialog", { name: "Switch to Superpowers?" });
+    await user.click(within(dialog).getByRole("button", { name: "Switch to Superpowers" }));
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("set_addon_enabled", { id: "superpowers", enabled: true });
+    });
   });
 
   it("enables a lone workflow tool without asking", async () => {
     superpowersInstalled = true;
-    const confirmSpy = vi.spyOn(window, "confirm");
     const user = userEvent.setup();
     renderCommunityApp();
 
@@ -673,9 +682,48 @@ describe("CommunityApp", () => {
     const superpowersCard = screen.getByText("Superpowers", { selector: "h3" }).closest("article") as HTMLElement;
     await user.click(within(superpowersCard).getByRole("button", { name: "Enable" }));
 
-    expect(confirmSpy).not.toHaveBeenCalled();
-    expect(invokeMock).toHaveBeenCalledWith("set_addon_enabled", { id: "superpowers", enabled: true });
-    confirmSpy.mockRestore();
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("set_addon_enabled", { id: "superpowers", enabled: true });
+    });
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("asks in-app before removing this edition, and does nothing when declined", async () => {
+    const user = userEvent.setup();
+    renderCommunityApp();
+
+    await screen.findByText("Proxy online");
+    await user.click(screen.getByRole("button", { name: "Local settings" }));
+    await user.click(screen.getByRole("button", { name: "Remove and quit" }));
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Uninstall Headroom Local Community?",
+    });
+    expect(dialog).toHaveTextContent("This does not change the official Headroom app.");
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+    expect(invokeMock.mock.calls.some(([command]) => command === "uninstall_and_quit")).toBe(false);
+  });
+
+  it("removes this edition once the in-app question is accepted", async () => {
+    const user = userEvent.setup();
+    renderCommunityApp();
+
+    await screen.findByText("Proxy online");
+    await user.click(screen.getByRole("button", { name: "Local settings" }));
+    await user.click(screen.getByRole("button", { name: "Remove and quit" }));
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Uninstall Headroom Local Community?",
+    });
+    await user.click(within(dialog).getByRole("button", { name: "Uninstall and quit" }));
+
+    await waitFor(() => {
+      expect(invokeMock.mock.calls.some(([command]) => command === "uninstall_and_quit")).toBe(true);
+    });
   });
 
   it("uses addon controls without restarting the proxy for new-session tools", async () => {
