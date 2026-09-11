@@ -36,7 +36,7 @@ use crate::models::{ManagedTool, RtkTodayStats, ToolStatus};
 /// per-platform axis still matters, which `headroom_wheel_artifact` handles —
 /// when bumping this pin, re-pick every platform's wheel URL/sha256 from
 /// https://pypi.org/pypi/headroom-ai/<version>/json.
-pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.36.5";
+pub(crate) const HEADROOM_PINNED_VERSION: &str = "0.37.0";
 const HEADROOM_SMOKE_TEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// markitdown's `--help` cold-imports a much heavier converter stack
 /// (onnxruntime, magika, pdfminer, …) than the core `import headroom`. On
@@ -13296,11 +13296,11 @@ fn fetch_headroom_release(version: &str) -> Result<HeadroomRelease> {
 
 fn pinned_headroom_release() -> Result<HeadroomRelease> {
     let (url, sha256) = match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => ("https://files.pythonhosted.org/packages/1b/99/410b64a578f36d249b76915d733873192537e986b2bc911373e6d72839e9/headroom_ai-0.36.5-cp310-abi3-macosx_11_0_arm64.whl", "0190c55f022760d49f6268f3c0970438f9bdd5a72bc0288e2788ff7e8b8ce730"),
-        ("macos", "x86_64") => ("https://files.pythonhosted.org/packages/3a/79/8db10dd06c45c942c2f293b3748d70c8ac53ba048b7796b947f78fcdf952/headroom_ai-0.36.5-cp310-abi3-macosx_10_12_x86_64.whl", "c62f18e261909a3de43c32113ec76c9ad6580e8fac6dc83347a71403d66094bf"),
-        ("linux", "aarch64") => ("https://files.pythonhosted.org/packages/68/58/97538fcca4505a130e7f65e5a736e1672f3b339f34dde0b86f07a9220edc/headroom_ai-0.36.5-cp310-abi3-manylinux_2_28_aarch64.whl", "378ac86ea3d188014be8c98e5af2d5b64b4ac6ad566bcdc95714dcdf02851932"),
-        ("linux", "x86_64") => ("https://files.pythonhosted.org/packages/15/c9/650195df8133b0f2ae5156bd9780fd70e17d8cead361016983e72d629697/headroom_ai-0.36.5-cp310-abi3-manylinux_2_28_x86_64.whl", "56954b76cd10b5312061725e7470575598a4bde3fa7f80f77d82a08a71fceae8"),
-        ("windows", "x86_64") => ("https://files.pythonhosted.org/packages/87/55/4f68afd415361200c9339ac98ee30ed2ceae573136d852b17f1b276e1c36/headroom_ai-0.36.5-cp310-abi3-win_amd64.whl", "f842990c69e39d967982ef9bd1da20c12b9a7f39507e4f76d638b44f93114986"),
+        ("macos", "aarch64") => ("https://files.pythonhosted.org/packages/47/21/8a87b66e83498da89404cdba4ced6397e84331047df9e11a9ea6f3510b29/headroom_ai-0.37.0-cp310-abi3-macosx_11_0_arm64.whl", "b4392f68a8d02d74c62c1734cf5bf327511dcc72678f01669f44f0612944d59c"),
+        ("macos", "x86_64") => ("https://files.pythonhosted.org/packages/56/cc/385712352911b7a482514902745cba802e03947850689a784b2d40764e06/headroom_ai-0.37.0-cp310-abi3-macosx_10_12_x86_64.whl", "d89fd5858e701ada53d01849f73039d891fad84d9eb370f952d56581962d9cf8"),
+        ("linux", "aarch64") => ("https://files.pythonhosted.org/packages/c6/2e/8d1c60683c74ae2871270789e0af1acc93727a51189799e74529679d795c/headroom_ai-0.37.0-cp310-abi3-manylinux_2_28_aarch64.whl", "bc30d31a6b9336155d62bbdd99f3c2f6c5a1ed3882a8730ea0cd8ede4c40fa19"),
+        ("linux", "x86_64") => ("https://files.pythonhosted.org/packages/72/b8/16878cf4fe6fc390a0d22025b671468619db690ff14c1b103ace4b5e35f9/headroom_ai-0.37.0-cp310-abi3-manylinux_2_28_x86_64.whl", "2efc5cdf681a10c5fc7a2a271a471179c409074537045f682b10e4d724976f46"),
+        ("windows", "x86_64") => ("https://files.pythonhosted.org/packages/c9/84/6803f3cc069dc8a6843c7ed8b155d1cf0c603a7467f58ffa24c5c399b8c9/headroom_ai-0.37.0-cp310-abi3-win_amd64.whl", "e961f892786f7577e75f2c26229f11e2609fc007083dae24d336e76fc4c72e58"),
         (os, arch) => bail!("unsupported headroom-ai wheel target: {os}/{arch}"),
     };
     Ok(HeadroomRelease {

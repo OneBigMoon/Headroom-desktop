@@ -26,10 +26,11 @@ export interface CheckedManagedTool extends ManagedTool {
 /// (`HEADROOM_PINNED_VERSION`) and shipped with a verified per-platform wheel
 /// plus a dependency lock, so this Community build can only install the
 /// version it was packed against -- the upgrade path resolves the pin, not
-/// upstream's latest. Listing it here advertised the raw PyPI latest (0.37.0)
-/// while the build supports 0.36.5, which is why the "Update to v0.37.0"
-/// button could never actually start an update. It now falls through to the
-/// supported-version gate and names the gap instead.
+/// upstream's latest. Listing it here advertised the raw PyPI latest while the
+/// build pinned an older runtime, so the button promised a version its click
+/// could never install. It falls through to the supported-version gate, which
+/// offers the pin while the runtime is behind it and names the gap once
+/// upstream moves ahead again.
 const DIRECT_UPSTREAM_UPDATE_IDS = new Set([
   "rtk",
   "markitdown",

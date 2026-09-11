@@ -1,13 +1,19 @@
 # Reviewed known-good Headroom runtime lock.
-# Source: headroom-ai[all,vector]==0.36.5 dependency resolution for cp312 /
+# Source: headroom-ai[all,vector]==0.37.0 dependency resolution for cp312 /
 # macOS 14 arm64 (min deployment target 14.0). Base pins captured on 2026-06-30,
 # carried forward and topped up per bump (see lineage).
 #
 # Resolution lineage: 0.25.0 freeze -> carried to 0.26.0/0.27.0 -> regenerated
 # for 0.28.0 (base of the current pin set) -> carried through 0.29.0-0.31.0
 # point-version churn -> 0.32.0 -> carried unchanged to 0.33.0 -> 0.34.0
-# CVE top-up -> 0.35.0 CVE top-up -> carried to 0.36.5.
-# - 0.36.5: runtime requires_dist only raises the Python >=3.11
+# CVE top-up -> 0.35.0 CVE top-up -> carried to 0.36.5 -> carried to 0.37.0.
+# - 0.37.0: requires_dist is byte-identical to 0.36.5 (every base pin and
+#   every extra, compared line by line against the PyPI metadata), so the
+#   resolution does not move: no pin is added, raised, or dropped. The
+#   shipped pins already satisfy every floor it names (litellm 1.90.1 >=
+#   1.86.2, mcp 1.28.1, torch 2.12.1, transformers 5.12.1 within <6.0,>=5.5.0).
+#   Comment-only edit, so the lock's stripped sha is unchanged.
+#   - 0.36.5: runtime requires_dist only raises the Python >=3.11
 #   onnxruntime floor to 1.24.0. arm64 already pins 1.27.0. Intel macOS
 #   remains on 1.23.2 because upstream publishes no newer x86_64 wheel;
 #   Headroom CLI smoke and boot validation remain the authoritative gate.
