@@ -403,7 +403,7 @@ function localizeUiText(t: Translate, value: string): string {
   const verifyPrompt = value.match(/^Run one (.+) prompt and verify activity appears in Headroom\.$/);
   if (verifyPrompt) return t("connections.setup.verifyPrompt", { name: verifyPrompt[1] });
   const foreignProvider = value.match(
-    /^Codex routing is currently handled by (.+), so Headroom is not intercepting\. Turn this connector off and on to route Codex through Headroom\.$/
+    /^Codex routing is currently handled by (.+), so Headroom is not intercepting\. Reclaim the route to send Codex through Headroom\.$/
   );
   if (foreignProvider) {
     return t("connections.foreignProviderStatus", { provider: foreignProvider[1] });
@@ -6244,6 +6244,20 @@ export default function App() {
                       <span className="connector-switch__thumb" />
                     </button>
                     {connector.clientId === "codex" &&
+                    connector.enabled &&
+                    connectorForeignProvider(connector) ? (
+                      <button
+                        className="secondary-button secondary-button--small"
+                        disabled={connectorsBusy || codexRestartBusy || gateBlocksEnable}
+                        onClick={() => void toggleConnector(connector, true)}
+                        type="button"
+                      >
+                        {connectorsBusy
+                          ? t("connections.reclaimingRoute")
+                          : t("connections.reclaimRoute")}
+                      </button>
+                    ) : null}
+                    {connector.clientId === "codex" &&
                     connector.restartRequired === true &&
                     statusLine?.tone === "restart" ? (
                       <button
@@ -8754,6 +8768,20 @@ export default function App() {
                           >
                             <span className="connector-switch__thumb" />
                           </button>
+                          {connector.clientId === "codex" &&
+                          connector.enabled &&
+                          connectorForeignProvider(connector) ? (
+                            <button
+                              className="secondary-button secondary-button--small"
+                              disabled={toggleDisabled}
+                              onClick={() => void toggleConnector(connector, true)}
+                              type="button"
+                            >
+                              {connectorsBusy
+                                ? t("connections.reclaimingRoute")
+                                : t("connections.reclaimRoute")}
+                            </button>
+                          ) : null}
                           {connector.clientId === "codex" &&
                           connector.restartRequired === true &&
                           statusLine?.tone === "restart" ? (

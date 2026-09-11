@@ -433,6 +433,31 @@ describe("CommunityApp", () => {
     expect(screen.queryByText("Connected; verification pending")).toBeNull();
   });
 
+  it("reclaims the Codex route without turning the connector off first", async () => {
+    // Any provider manager can take the route back after Headroom enabled it.
+    // The card must offer the way back in one step instead of asking the user
+    // to toggle the connector off and on and hoping the takeover is offered.
+    connectorEnabled = true;
+    connectorForeignProvider = "Cockpit (codex_local_access)";
+    const user = userEvent.setup();
+    renderCommunityApp();
+
+    await screen.findByText("Proxy online");
+    await user.click(screen.getByRole("button", { name: "Connections" }));
+    await user.click(await screen.findByRole("button", { name: "Reclaim route" }));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent("Cockpit (codex_local_access)");
+    await user.click(within(dialog).getByRole("button", { name: "Continue" }));
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("apply_client_setup", {
+        clientId: "codex",
+        allowTakeover: true,
+      });
+    });
+  });
+
   it("asks for confirmation before taking over a Codex route owned by another tool", async () => {
     connectorForeignProvider = "codex_local_access";
     const user = userEvent.setup();

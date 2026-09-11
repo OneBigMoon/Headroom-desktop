@@ -333,7 +333,7 @@ describe("dashboard helpers", () => {
         now
       )
     ).toEqual({
-      text: "Codex routing is currently handled by codex_local_access, so Headroom is not intercepting. Turn this connector off and on to route Codex through Headroom.",
+      text: "Codex routing is currently handled by codex_local_access, so Headroom is not intercepting. Reclaim the route to send Codex through Headroom.",
       tone: "note"
     });
 

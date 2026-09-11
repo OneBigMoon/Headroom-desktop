@@ -4028,26 +4028,76 @@ fn codex_foreign_model_provider(content: &str) -> Option<String> {
 pub fn codex_external_provider() -> Option<String> {
     let path = codex_config_toml_path();
     let content = std::fs::read_to_string(path).ok()?;
-    codex_foreign_model_provider(&content).map(|id| codex_provider_display_name(&id))
+    codex_foreign_model_provider(&content).map(|id| codex_provider_display_name(&id, &content))
 }
 
-/// Human label for another tool's Codex provider id.
+/// Product names for the provider managers Headroom recognizes on sight.
+///
+/// *Which* tool owns the Codex route is a class, not a product: any manager
+/// that rewrites the root `model_provider` gets the same treatment -- Headroom
+/// names the owner, refuses to clobber it without consent, records it, and
+/// restores it exactly on disable. Nothing else in that path keys off a
+/// specific tool, so supporting a new one is a label at most.
+const CODEX_FOREIGN_OWNER_NAMES: &[(&str, &str)] = &[("codex_local_access", "Cockpit")];
+
+/// Human label for whoever owns Codex's route.
 ///
 /// Both the coexist note and the takeover confirmation interpolate this value
 /// into a sentence, so a raw TOML table key (`codex_local_access`) reads as
-/// jargon where the user expects the name of the tool they installed. Unknown
-/// ids are shown verbatim: the user may have written that provider by hand, and
-/// guessing a product name for it would misattribute their own configuration.
-fn codex_provider_display_name(id: &str) -> String {
+/// jargon where the user expects the name of the tool they installed. Ids we do
+/// not recognize are still *named* -- from the `name` the other tool declared
+/// for its own provider table in the same config -- rather than guessed at: a
+/// hand-written provider keeps its own id, and the id always stays in the label
+/// because it is the string support has to grep for.
+fn codex_provider_display_name(id: &str, config: &str) -> String {
     match id {
-        // Written by Cockpit Tools; its table carries
-        // `x-openai-actor-authorization = "cockpit-tools"`. The provider id is
-        // kept in the label: it is the string support has to grep for.
-        "codex_local_access" => "Cockpit (codex_local_access)".to_string(),
-        CODEX_OFFICIAL_PROVIDER => "Headroom (official)".to_string(),
-        CODEX_NATIVE_PROVIDER => "OpenAI".to_string(),
+        CODEX_OFFICIAL_PROVIDER => return "Headroom (official)".to_string(),
+        CODEX_NATIVE_PROVIDER => return "OpenAI".to_string(),
+        CODEX_HEADROOM_PROVIDER => return "Headroom".to_string(),
+        _ => {}
+    }
+    let known = CODEX_FOREIGN_OWNER_NAMES
+        .iter()
+        .find(|(candidate, _)| *candidate == id)
+        .map(|(_, name)| (*name).to_string());
+    match known.or_else(|| codex_provider_table_name(config, id)) {
+        Some(name) if name != id => format!("{name} ({id})"),
         _ => id.to_string(),
     }
+}
+
+/// The `name` another tool declared for its own Codex provider table.
+///
+/// Hand-rolled for the same reason as `codex_root_model_provider`: a table
+/// another manager owns may be schema-invalid for our parser while being
+/// exactly what Codex reads, and *naming* the owner must never be the step that
+/// fails. Values that would not read as a name in a one-line status string
+/// (multi-line or runaway) are dropped so the id is shown instead.
+fn codex_provider_table_name(config: &str, provider_id: &str) -> Option<String> {
+    let header = format!("[model_providers.{provider_id}]");
+    let mut in_table = false;
+    for raw in config.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_table = line == header;
+            continue;
+        }
+        if !in_table {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "name" {
+            continue;
+        }
+        let name = value.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+        if name.is_empty() || name.len() > 64 {
+            return None;
+        }
+        return Some(name.to_string());
+    }
+    None
 }
 
 fn codex_takeover_provider_allowed(provider: &str) -> bool {
@@ -12712,17 +12762,18 @@ keep rtk\n\
         // The note and the takeover confirmation print this string verbatim.
         // A raw table key ("codex_local_access") beside the tool the user
         // installed is what made the card read as a machine error.
+        let config = "model_provider = \"codex_local_access\"\n";
         assert_eq!(
-            super::codex_provider_display_name("codex_local_access"),
+            super::codex_provider_display_name("codex_local_access", config),
             "Cockpit (codex_local_access)"
         );
         assert_eq!(
-            super::codex_provider_display_name("headroom"),
+            super::codex_provider_display_name("headroom", config),
             "Headroom (official)"
         );
-        assert_eq!(super::codex_provider_display_name("openai"), "OpenAI");
+        assert_eq!(super::codex_provider_display_name("openai", config), "OpenAI");
         assert_eq!(
-            super::codex_provider_display_name("corp-gateway"),
+            super::codex_provider_display_name("corp-gateway", config),
             "corp-gateway",
             "a hand-written provider id must not be renamed"
         );
@@ -12745,6 +12796,64 @@ keep rtk\n\
         assert!(
             !verification.verified,
             "Headroom is not intercepting, so the connector is not verified"
+        );
+    }
+
+    /// Which manager owns the Codex route is a class, not a product, so naming
+    /// the owner cannot depend on having heard of that product. A tool Headroom
+    /// has never seen is named from the `name` it wrote into its own provider
+    /// table; the id stays in the label because that is what support greps for.
+    #[test]
+    fn unknown_route_owners_are_named_from_their_own_provider_table() {
+        let declared = "model_provider = \"acme-switch\"\n\
+                        \n\
+                        [model_providers.acme-switch]\n\
+                        name = \"Acme Provider Switch\"\n\
+                        base_url = \"http://127.0.0.1:8123/v1\"\n";
+        assert_eq!(
+            super::codex_provider_display_name("acme-switch", declared),
+            "Acme Provider Switch (acme-switch)"
+        );
+
+        // A name we cannot print must fall back to the id rather than leak a
+        // broken or runaway value into a status line.
+        let empty = "model_provider = \"acme-switch\"\n\
+                     \n\
+                     [model_providers.acme-switch]\n\
+                     name = \"\"\n";
+        assert_eq!(
+            super::codex_provider_display_name("acme-switch", empty),
+            "acme-switch"
+        );
+
+        let runaway = format!(
+            "model_provider = \"acme-switch\"\n\n[model_providers.acme-switch]\nname = \"{}\"\n",
+            "x".repeat(200)
+        );
+        assert_eq!(
+            super::codex_provider_display_name("acme-switch", &runaway),
+            "acme-switch"
+        );
+
+        // The name must come from the owning table, not from a neighbour.
+        let elsewhere = "model_provider = \"acme-switch\"\n\
+                         \n\
+                         [model_providers.other]\n\
+                         name = \"Other\"\n";
+        assert_eq!(
+            super::codex_provider_display_name("acme-switch", elsewhere),
+            "acme-switch"
+        );
+
+        // Single-quoted TOML literals are read the same way, and a tool that
+        // names itself exactly like its id is not printed twice.
+        let literal = "model_provider = \"acme-switch\"\n\
+                       \n\
+                       [model_providers.acme-switch]\n\
+                       name = 'acme-switch'\n";
+        assert_eq!(
+            super::codex_provider_display_name("acme-switch", literal),
+            "acme-switch"
         );
     }
 

@@ -671,7 +671,7 @@ export function connectorStatusLine(
   const foreignProvider = connectorForeignProvider(connector);
   if (foreignProvider) {
     return {
-      text: `Codex routing is currently handled by ${foreignProvider}, so Headroom is not intercepting. Turn this connector off and on to route Codex through Headroom.`,
+      text: `Codex routing is currently handled by ${foreignProvider}, so Headroom is not intercepting. Reclaim the route to send Codex through Headroom.`,
       tone: "note"
     };
   }

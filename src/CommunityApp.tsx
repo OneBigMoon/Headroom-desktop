@@ -546,6 +546,32 @@ export function CommunityApp() {
     );
   };
 
+  /// Take the Codex route back from whichever manager holds it now.
+  ///
+  /// Any provider manager can rewrite the root `model_provider` after Headroom
+  /// enabled the connector, which leaves the card in the coexist state. This is
+  /// the way back in one step -- same confirmation as a first enable, and the
+  /// displaced provider is still recorded for restore-on-disable.
+  const handleReclaimRoute = async (connector: ClientConnectorStatus) => {
+    const foreignProvider = connectorForeignProvider(connector);
+    if (
+      foreignProvider &&
+      !(await takeoverConfirm.request(connectorLabel(t, connector), foreignProvider))
+    ) {
+      return;
+    }
+
+    void runAction(
+      `connector:${connector.clientId}`,
+      () =>
+        invoke<ClientSetupResult>("apply_client_setup", {
+          clientId: connector.clientId,
+          allowTakeover: Boolean(foreignProvider),
+        }),
+      () => t("messages.connectorConfigured", { name: connector.name }),
+    );
+  };
+
   const handleTool = async (tool: ManagedTool) => {
     const key = `tool:${tool.id}`;
     if (tool.status === "not_installed") {
@@ -940,6 +966,16 @@ export function CommunityApp() {
                         ? t("connections.disconnect")
                         : t("connections.connect")}
                   </button>
+                  {connector.clientId === "codex" && connector.enabled && foreignProvider ? (
+                    <button
+                      className="community-button community-button--secondary"
+                      disabled={controlsDisabled}
+                      onClick={() => void handleReclaimRoute(connector)}
+                      type="button"
+                    >
+                      {t("connections.reclaimRoute")}
+                    </button>
+                  ) : null}
                 </article>
                 );
               }) : (
