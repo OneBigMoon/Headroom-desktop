@@ -13226,17 +13226,34 @@ fn parse_headroom_release(value: &Value, requested_version: &str) -> Result<Head
     }
     let platform = headroom_wheel_platform_tag()?;
     let prefix = format!("headroom_ai-{requested}-");
-    let mut wheels = response.urls.into_iter().filter(|file| {
-        file.packagetype == "bdist_wheel"
-            && file.filename.starts_with(&prefix)
-            && file.filename.ends_with(".whl")
-            && file.filename.contains(platform)
-    });
-    let file = wheels
-        .clone()
+    let candidates: Vec<PyPiFile> = response
+        .urls
+        .into_iter()
+        .filter(|file| {
+            file.packagetype == "bdist_wheel"
+                && file.filename.starts_with(&prefix)
+                && file.filename.ends_with(".whl")
+                && file.filename.contains(platform)
+        })
+        .collect();
+    // Most specific ABI wins, and every lookup needs its OWN iterator: a
+    // `Filter` is stateful, so a second `find` on the same one resumes where
+    // the first stopped. The first lookup always ran the list dry before
+    // returning `None`, so the ABI fallbacks were dead and every version whose
+    // wheels are not `cp312-cp312` was reported "no compatible wheel" even
+    // with the right file sitting right there. That is what made the
+    // "Update to v0.37.0" button (wheels are `cp310-abi3-`) impossible to
+    // satisfy: the fetch failed, the failure was logged, and the panel showed
+    // nothing at all.
+    let file = candidates
+        .iter()
         .find(|file| file.filename.contains("cp312-cp312-"))
-        .or_else(|| wheels.find(|file| file.filename.contains("cp312-abi3-")))
-        .or_else(|| wheels.find(|file| file.filename.contains("abi3-")))
+        .or_else(|| {
+            candidates
+                .iter()
+                .find(|file| file.filename.contains("cp312-abi3-"))
+        })
+        .or_else(|| candidates.iter().find(|file| file.filename.contains("abi3-")))
         .ok_or_else(|| anyhow!("PyPI has no compatible headroom-ai wheel for this platform"))?;
     let parsed = reqwest::Url::parse(&file.url).context("invalid PyPI wheel URL")?;
     if parsed.scheme() != "https"
@@ -13258,7 +13275,7 @@ fn parse_headroom_release(value: &Value, requested_version: &str) -> Result<Head
     }
     Ok(HeadroomRelease {
         version: requested.into(),
-        wheel_url: file.url,
+        wheel_url: file.url.clone(),
         sha256: file.digests.sha256.to_ascii_lowercase(),
     })
 }
@@ -15051,11 +15068,13 @@ mod tests {
         explain_host_marketplace_missing_plugin, extract_required_pydantic_core_version,
         format_all_foreign_bail,
         format_already_running_bail, headroom_entrypoint_startup_args,
+        headroom_wheel_platform_tag,
         headroom_python_startup_args, httpx_ca_bundle_bridge_from, is_checksum_mismatch,
         is_outdated_codex, learned_openai_ttl_seconds, ledger_bytes_without_control,
         looks_like_corrupt_venv_error, parse_lsof_listener, parse_major_minor_patch,
         parse_netstat_listener, parse_pid_from_lsof_detail, parse_ss_listener,
-        parse_tasklist_image, pending_addon_update, pinned_headroom_release, pip_failure_category,
+        parse_headroom_release, parse_tasklist_image, pending_addon_update, pinned_headroom_release,
+        pip_failure_category,
         plugin_install_failure_category, pre_upstream_concurrency, probe_backend_readyz_ok,
         proxy_argv_contains_expected_flags, purge_legacy_output_savings_control_arm_once,
         read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
@@ -16031,6 +16050,104 @@ asyncio.run(verify())
             release.wheel_url
         );
         assert_eq!(release.sha256.len(), 64, "sha256 must be pinned");
+    }
+
+    /// Minimal `/pypi/<project>/<version>/json` payload: only the two fields
+    /// `parse_headroom_release` reads (`info.version` and `urls[]`), with a
+    /// trusted `files.pythonhosted.org` URL per file.
+    fn pypi_release_json(version: &str, files: &[&str]) -> serde_json::Value {
+        const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        serde_json::json!({
+            "info": { "version": version },
+            "urls": files
+                .iter()
+                .map(|filename| {
+                    serde_json::json!({
+                        "filename": filename,
+                        "url": format!("https://files.pythonhosted.org/packages/aa/bb/{filename}"),
+                        "packagetype": if filename.ends_with(".whl") {
+                            "bdist_wheel"
+                        } else {
+                            "sdist"
+                        },
+                        "digests": { "sha256": SHA },
+                    })
+                })
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// Regression for the "Update to v0.37.0" button: headroom-ai publishes
+    /// `cp310-abi3` wheels, so the ABI fallback chain has to actually reach
+    /// them. It could not -- each lookup reused one stateful `Filter`, and the
+    /// first lookup drained it before returning `None`, so every `abi3`-only
+    /// release resolved to "no compatible wheel". The 0.37.0 offer was
+    /// therefore an update that no click could ever start.
+    #[test]
+    fn parse_headroom_release_finds_an_abi3_wheel_for_this_platform() {
+        let platform = headroom_wheel_platform_tag().expect("platform tag");
+        let files = [
+            "headroom_ai-0.37.0-cp310-abi3-manylinux_2_28_x86_64.whl".to_string(),
+            format!("headroom_ai-0.37.0-cp310-abi3-{platform}.whl"),
+            "headroom_ai-0.37.0.tar.gz".to_string(),
+        ];
+        let files: Vec<&str> = files.iter().map(String::as_str).collect();
+
+        let release = parse_headroom_release(&pypi_release_json("0.37.0", &files), "0.37.0")
+            .expect("the platform's abi3 wheel is found through the fallback chain");
+
+        assert_eq!(release.version, "0.37.0");
+        assert!(
+            release.wheel_url.ends_with(&format!("cp310-abi3-{platform}.whl")),
+            "picked {} instead of this platform's abi3 wheel",
+            release.wheel_url
+        );
+        assert_eq!(release.sha256.len(), 64);
+    }
+
+    /// The most specific ABI still wins: a cp312-cp312 build is preferred over
+    /// the abi3 fallback when the publisher ships both.
+    #[test]
+    fn parse_headroom_release_prefers_the_exact_cp312_wheel() {
+        let platform = headroom_wheel_platform_tag().expect("platform tag");
+        let files = [
+            format!("headroom_ai-0.37.0-cp310-abi3-{platform}.whl"),
+            format!("headroom_ai-0.37.0-cp312-cp312-{platform}.whl"),
+        ];
+        let files: Vec<&str> = files.iter().map(String::as_str).collect();
+
+        let release = parse_headroom_release(&pypi_release_json("0.37.0", &files), "0.37.0")
+            .expect("release resolves");
+
+        assert!(
+            release.wheel_url.contains("cp312-cp312-"),
+            "expected the cp312 wheel, got {}",
+            release.wheel_url
+        );
+    }
+
+    /// A release whose wheels are all built for another platform must stay a
+    /// hard error: installing macOS' native `_core` on Windows is RUST-6E.
+    #[test]
+    fn parse_headroom_release_refuses_a_foreign_platform_only_release() {
+        let platform = headroom_wheel_platform_tag().expect("platform tag");
+        let foreign = if platform.contains("macosx") {
+            "manylinux_2_28_x86_64"
+        } else {
+            "macosx_11_0_arm64"
+        };
+        let files = [format!("headroom_ai-0.37.0-cp310-abi3-{foreign}.whl")];
+        let files: Vec<&str> = files.iter().map(String::as_str).collect();
+
+        let err = match parse_headroom_release(&pypi_release_json("0.37.0", &files), "0.37.0") {
+            Ok(release) => panic!("expected no compatible wheel, got {}", release.wheel_url),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("no compatible headroom-ai wheel"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Downloads keep PyPI's filename so pip's own platform check stays a
@@ -20986,7 +21103,12 @@ exit 0
 
     /// Read-only dump of the live connector table the Connections cards render:
     /// installed / enabled / verified and, for Codex, whose provider owns the
-    /// route. `cargo test --lib connector_status_live -- --ignored --nocapture`.
+    /// route. Also asserts the contract the enable toggle depends on -- the
+    /// route owner is reported from `~/.codex/config.toml` even while our
+    /// connector is off, or the toggle has nothing to confirm and sends
+    /// `allowTakeover: false` into "refusing to replace custom Codex
+    /// model_provider". `cargo test --lib connector_status_live -- --ignored
+    /// --nocapture`.
     #[test]
     #[ignore = "reads the real machine's client configs; run with --ignored"]
     fn connector_status_live() {
@@ -20995,14 +21117,36 @@ exit 0
             .expect("connector table");
         for connector in connectors {
             let foreign = connector
-                .verification
-                .as_ref()
-                .and_then(|verification| verification.foreign_provider.clone())
+                .foreign_provider
+                .clone()
+                .or_else(|| {
+                    connector
+                        .verification
+                        .as_ref()
+                        .and_then(|verification| verification.foreign_provider.clone())
+                })
                 .unwrap_or_else(|| "-".into());
             eprintln!(
                 "{}: installed={} enabled={} verified={} owner={foreign}",
                 connector.client_id, connector.installed, connector.enabled, connector.verified
             );
+            if connector.client_id == "codex" {
+                let owner_in_config = crate::client_adapters::codex_external_provider();
+                assert_eq!(
+                    connector.foreign_provider, owner_in_config,
+                    "the Codex row must name the current route owner while on OR off"
+                );
+                if connector.enabled {
+                    assert_eq!(
+                        connector
+                            .verification
+                            .as_ref()
+                            .and_then(|verification| verification.foreign_provider.clone()),
+                        owner_in_config,
+                        "an enabled connector's verification agrees with config.toml"
+                    );
+                }
+            }
         }
         for client in clients {
             eprintln!(

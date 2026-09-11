@@ -626,6 +626,33 @@ export function shouldShowConnectorDetectionWarning(
   return connector.enabled && !connector.installed;
 }
 
+/**
+ * Whoever currently owns the Codex route, when that is not Headroom.
+ *
+ * The connector-level field wins because the backend reports it whether or not
+ * our connector is on -- the enable toggle needs the owner's name *before* it
+ * can ask to replace them. `verification` only exists for an enabled
+ * connector and stays as a fallback for older payloads.
+ */
+export function connectorForeignProvider(
+  connector: ClientConnectorStatus
+): string | null {
+  return (
+    connector.foreignProvider ?? connector.verification?.foreignProvider ?? null
+  );
+}
+
+/// The name a client row goes by. The two clients Headroom ships a localized
+/// label for get theirs; anything else falls back to the backend's own name.
+export function connectorLabel(
+  t: Translate,
+  connector: ClientConnectorStatus
+): string {
+  if (connector.clientId === "claude_code") return t("connections.claudeConnection");
+  if (connector.clientId === "codex") return t("connections.codexConnection");
+  return connector.name;
+}
+
 // A client picks up routing only when it restarts, and nothing local tells us
 // whether the user did. Rather than nag forever, the hint rides the configure
 // timestamp: relevant right after enabling, gone by the next day.
@@ -641,7 +668,7 @@ export function connectorStatusLine(
   // Another tool owns Codex routing through its own root `model_provider`.
   // Headroom stands aside on purpose, so this is a coexist state the user can
   // resolve by re-enabling the connector, not a setup failure.
-  const foreignProvider = connector.verification?.foreignProvider;
+  const foreignProvider = connectorForeignProvider(connector);
   if (foreignProvider) {
     return {
       text: `Codex routing is currently handled by ${foreignProvider}, so Headroom is not intercepting. Turn this connector off and on to route Codex through Headroom.`,
@@ -767,7 +794,7 @@ export function connectorDashboardStatus(
   // (see `connectorStatusLine`). Nothing is in progress and nothing is broken,
   // so `verified === false` here must not read as "Verifying": neutral tone,
   // and the label names whoever is actually routing.
-  const foreignProvider = connector.verification?.foreignProvider;
+  const foreignProvider = connectorForeignProvider(connector);
   if (foreignProvider) {
     return { label: `Routed by ${foreignProvider}`, tone: "off" };
   }

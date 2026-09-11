@@ -193,10 +193,15 @@ function connectorsState(): ClientConnectorStatus[] {
       installed: true,
       enabled: connectorEnabled,
       verified: connectorEnabled && !connectorForeignProvider,
-      verification: connectorForeignProvider
+      // The backend reads the Codex route owner out of `~/.codex/config.toml`,
+      // so it reports it while the connector is OFF too -- which is exactly
+      // when the enable toggle needs it. `verification` still only exists for
+      // an enabled connector.
+      foreignProvider: connectorForeignProvider,
+      verification: connectorEnabled
         ? {
             clientId: "codex",
-            verified: false,
+            verified: !connectorForeignProvider,
             proxyReachable: true,
             checks: [],
             failures: [],
@@ -430,13 +435,19 @@ describe("CommunityApp", () => {
 
   it("asks for confirmation before taking over a Codex route owned by another tool", async () => {
     connectorForeignProvider = "codex_local_access";
-    const confirmMock = vi.spyOn(window, "confirm").mockReturnValue(true);
     const user = userEvent.setup();
     renderCommunityApp();
 
     await screen.findByText("Proxy online");
     await user.click(screen.getByRole("button", { name: "Connections" }));
     await user.click(await screen.findByRole("button", { name: "Connect" }));
+
+    // The prompt is an in-app dialog, not `window.confirm`: WebKit answers the
+    // native call with "cancel" when the UI delegate does not implement the
+    // panel (wry's does not), which silently swallowed every enable.
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent("codex_local_access");
+    await user.click(within(dialog).getByRole("button", { name: "Continue" }));
 
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("apply_client_setup", {
@@ -444,13 +455,10 @@ describe("CommunityApp", () => {
         allowTakeover: true,
       });
     });
-    expect(confirmMock).toHaveBeenCalledTimes(1);
-    confirmMock.mockRestore();
   });
 
   it("leaves another tool's Codex route untouched when the takeover is declined", async () => {
     connectorForeignProvider = "codex_local_access";
-    const confirmMock = vi.spyOn(window, "confirm").mockReturnValue(false);
     const user = userEvent.setup();
     renderCommunityApp();
 
@@ -458,14 +466,16 @@ describe("CommunityApp", () => {
     await user.click(screen.getByRole("button", { name: "Connections" }));
     await user.click(await screen.findByRole("button", { name: "Connect" }));
 
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
     await waitFor(() => {
-      expect(confirmMock).toHaveBeenCalledTimes(1);
+      expect(screen.queryByRole("dialog")).toBeNull();
     });
     expect(invokeMock).not.toHaveBeenCalledWith("apply_client_setup", {
       clientId: "codex",
       allowTakeover: true,
     });
-    confirmMock.mockRestore();
   });
 
   it("names the tools view so assistive tech announces the group", async () => {

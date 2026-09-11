@@ -18,8 +18,19 @@ export interface CheckedManagedTool extends ManagedTool {
   updateRequiresAppUpdate?: boolean;
 }
 
+/// Addons whose update is driven by upstream's own latest version: whatever
+/// the source publishes is what the installer pulls, so any newer version is
+/// deliverable.
+///
+/// `headroom` is deliberately absent. Its runtime is pinned
+/// (`HEADROOM_PINNED_VERSION`) and shipped with a verified per-platform wheel
+/// plus a dependency lock, so this Community build can only install the
+/// version it was packed against -- the upgrade path resolves the pin, not
+/// upstream's latest. Listing it here advertised the raw PyPI latest (0.37.0)
+/// while the build supports 0.36.5, which is why the "Update to v0.37.0"
+/// button could never actually start an update. It now falls through to the
+/// supported-version gate and names the gap instead.
 const DIRECT_UPSTREAM_UPDATE_IDS = new Set([
-  "headroom",
   "rtk",
   "markitdown",
   "serena",
@@ -185,6 +196,32 @@ export function applyAddonUpdateChecks(
     const supportedVersion = tool.supportedVersion;
     const beyondSupported =
       !supportedVersion || compareAddonVersions(check.latestVersion, supportedVersion) === 1;
+    if (beyondSupported) {
+      // Upstream has moved past what this build was packed against. The
+      // upgrade path installs the version the build supports, never upstream's
+      // latest, so only that pin is a real offer: a `availableVersion` above
+      // `supportedVersion` can only have been computed from upstream's latest,
+      // and its click resolves the pin and looks dead (that is exactly how
+      // "更新到 v0.37.0" behaved). Keep the pin, drop everything the build
+      // cannot deliver, and hand the caller both versions to explain the gap.
+      const offered = tool.availableVersion ?? null;
+      const offerDeliverable =
+        tool.updateAvailable === true &&
+        offered !== null &&
+        (supportedVersion === undefined ||
+          compareAddonVersions(offered, supportedVersion) !== 1);
+      return {
+        ...tool,
+        updateActionAvailable: offerDeliverable,
+        repairActionAvailable,
+        updateCheckFailed: false,
+        updateAvailable: offerDeliverable,
+        availableVersion: offerDeliverable ? offered : null,
+        upstreamVersion: check.latestVersion,
+        upstreamUpdateAvailable: true,
+        updateRequiresAppUpdate: true,
+      };
+    }
     return {
       ...tool,
       updateActionAvailable,
@@ -192,7 +229,7 @@ export function applyAddonUpdateChecks(
       updateCheckFailed: false,
       upstreamVersion: check.latestVersion,
       upstreamUpdateAvailable: true,
-      updateRequiresAppUpdate: beyondSupported,
+      updateRequiresAppUpdate: false,
     };
   });
 }

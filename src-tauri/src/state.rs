@@ -1580,7 +1580,17 @@ impl AppState {
         let plan =
             self.runtime_maintenance_plan_for_app_version_target(&app_version, target_version);
         if !matches!(plan, Some(RuntimeMaintenancePlan::Upgrade(_))) {
-            return Err("Headroom CLI is already up to date.".into());
+            // "already up to date" was a lie whenever the caller named a
+            // version: the target passed the newer-than-installed check, so
+            // the plan came back empty because the release itself could not be
+            // resolved (no compatible wheel for this platform). Say so -- this
+            // string reaches the user through the update panel.
+            return Err(match target_version {
+                Some(version) => format!(
+                    "Headroom CLI {version} could not be installed: no compatible release is available for this platform."
+                ),
+                None => "Headroom CLI is already up to date.".into(),
+            });
         }
 
         self.run_upgrade_with_ui(app, false, target_version);
@@ -1828,6 +1838,49 @@ impl AppState {
 
     pub fn runtime_upgrade_progress(&self) -> RuntimeUpgradeProgress {
         self.runtime_upgrade_progress.lock().clone()
+    }
+
+    /// Claim the running state for a user-initiated Headroom CLI update before
+    /// the worker resolves the release.
+    ///
+    /// Resolving a non-pinned target fetches PyPI (up to a 30s timeout) before
+    /// any upgrade work starts, and the settings panel stops polling the moment
+    /// it reads `running: false`. Without this the click looked like it did
+    /// nothing at all for the whole fetch, and then quietly finished without
+    /// an error. Publishing `running` up front keeps the panel watching; the
+    /// worker either republishes its own progress or reports the failure.
+    pub fn begin_runtime_upgrade_progress(
+        &self,
+        from_version: Option<String>,
+        to_version: Option<String>,
+    ) {
+        self.set_upgrade_progress(|p| {
+            p.running = true;
+            p.complete = false;
+            p.failed = false;
+            p.current_step = "Preparing update".into();
+            p.message = "Resolving the Headroom CLI release.".into();
+            p.overall_percent = 0;
+            p.from_version = from_version;
+            p.to_version = to_version;
+        });
+    }
+
+    /// Report a user-initiated update that never reached the upgrade worker.
+    ///
+    /// The worker runs detached (the IPC call has to return immediately), so a
+    /// resolution failure has no other way back to the panel: it used to be
+    /// written to the log only, and the button simply did nothing.
+    pub fn fail_runtime_upgrade(&self, message: impl Into<String>) {
+        let message = message.into();
+        self.set_upgrade_progress(|p| {
+            p.running = false;
+            p.complete = false;
+            p.failed = true;
+            p.overall_percent = 100;
+            p.message = message.clone();
+            p.current_step = message;
+        });
     }
 
     pub fn runtime_upgrade_failure(&self) -> Option<RuntimeUpgradeFailure> {

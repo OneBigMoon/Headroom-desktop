@@ -17,6 +17,9 @@ import { LearnScanStatusLine } from "./components/LearnScanStatusLine";
 import { OptimizePanel } from "./components/OptimizePanel";
 import { RuntimeStatusIndicator } from "./components/RuntimeStatusIndicator";
 import { localeOptions, useI18n, type Locale, type Translate, type TranslationKey } from "./lib/i18n";
+import { connectorForeignProvider, connectorLabel } from "./lib/dashboardHelpers";
+import { TakeoverConfirmDialog } from "./components/TakeoverConfirmDialog";
+import { useTakeoverConfirm } from "./lib/takeoverConfirm";
 import { LOCAL_COMMUNITY_NAME } from "./lib/localEdition";
 import { conflictHeadingCopy, conflictMatrixCopy, getActivationScopeCopy, groupToolsByCategory, sourceLinkCopy, toolCategoryCopy, toolCopy, TOOL_CATEGORY_ORDER, workflowGroupCopy, workflowSwitchPeers } from "./lib/workflowCatalog";
 import type {
@@ -247,6 +250,7 @@ function DashboardMetric({ label, value, detail }: { label: string; value: strin
 
 export function CommunityApp() {
   const { locale, resolvedLocale, setLocale, t } = useI18n();
+  const takeoverConfirm = useTakeoverConfirm();
   const [activeView, setActiveView] = useState<CommunityView>("overview");
   const [dashboard, setDashboard] = useState<DashboardState | null>(null);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
@@ -506,7 +510,7 @@ export function CommunityApp() {
     void runAction(key, () => invoke<void>(command), () => success);
   };
 
-  const handleConnector = (connector: ClientConnectorStatus) => {
+  const handleConnector = async (connector: ClientConnectorStatus) => {
     const key = `connector:${connector.clientId}`;
     if (connector.enabled) {
       void runAction(
@@ -519,11 +523,12 @@ export function CommunityApp() {
 
     // Another tool may own the Codex route right now. Taking it over replaces
     // that tool's provider, so ask first; Headroom records the displaced
-    // provider and restores it when the connector is disabled again.
-    const foreignProvider = connector.verification?.foreignProvider ?? null;
+    // provider and restores it when the connector is disabled again. The
+    // prompt is in-app on purpose -- see `useTakeoverConfirm`.
+    const foreignProvider = connectorForeignProvider(connector);
     if (
       foreignProvider &&
-      !window.confirm(t("connections.setup.takeoverConfirm", { provider: foreignProvider }))
+      !(await takeoverConfirm.request(connectorLabel(t, connector), foreignProvider))
     ) {
       return;
     }
@@ -887,7 +892,9 @@ export function CommunityApp() {
               </div>
             </section>
             <section className="community-list" aria-label={t("aria.clientConnectors")}>
-              {connectors.length ? connectors.map((connector) => (
+              {connectors.length ? connectors.map((connector) => {
+                const foreignProvider = connectorForeignProvider(connector);
+                return (
                 <article className="community-connector" key={connector.clientId}>
                   <div className="community-connector__icon" aria-hidden="true">
                     <ConnectorIcon clientId={connector.clientId} size={19} />
@@ -898,9 +905,9 @@ export function CommunityApp() {
                       {!connector.installed
                         ? t("connections.notInstalled")
                         : connector.enabled
-                          ? connector.verification?.foreignProvider
+                          ? foreignProvider
                             ? t("connections.foreignProviderShort", {
-                                provider: connector.verification.foreignProvider,
+                                provider: foreignProvider,
                               })
                             : connector.verified
                               ? t("connections.connectedVerified")
@@ -924,7 +931,8 @@ export function CommunityApp() {
                         : t("connections.connect")}
                   </button>
                 </article>
-              )) : (
+                );
+              }) : (
                 <p className="community-empty">{t("connections.empty")}</p>
               )}
             </section>
@@ -1414,6 +1422,12 @@ export function CommunityApp() {
           </div>
         ) : null}
       </section>
+      {takeoverConfirm.prompt ? (
+        <TakeoverConfirmDialog
+          prompt={takeoverConfirm.prompt}
+          onAnswer={takeoverConfirm.answer}
+        />
+      ) : null}
     </main>
   );
 }

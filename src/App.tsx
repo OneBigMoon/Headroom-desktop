@@ -58,6 +58,8 @@ import {
 } from "./lib/addonUpdates";
 import { localeOptions, useI18n, type Locale, type Translate, type TranslationKey } from "./lib/i18n";
 import { RuntimeStatusIndicator } from "./components/RuntimeStatusIndicator";
+import { TakeoverConfirmDialog } from "./components/TakeoverConfirmDialog";
+import { useTakeoverConfirm } from "./lib/takeoverConfirm";
 import {
   getActivationScopeCopy,
   groupToolsByCategory,
@@ -137,6 +139,8 @@ import {
   cacheHitPair,
   outputReductionForWindow,
   compactNumber,
+  connectorForeignProvider,
+  connectorLabel,
   connectorDashboardStatus,
   connectorStatusLine,
   currency,
@@ -1963,6 +1967,13 @@ export default function App() {
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [pendingWorkflowSwitch]);
+  // Taking over another tool's route is confirmed in-app; see
+  // `useTakeoverConfirm` for why the native `window.confirm` cannot be used.
+  const {
+    prompt: takeoverPrompt,
+    request: requestTakeoverConfirm,
+    answer: answerTakeoverConfirm,
+  } = useTakeoverConfirm();
   const [addonUpdateChecks, setAddonUpdateChecks] = useState<AddonUpdateCheck[]>([]);
   const [addonUpdateBusy, setAddonUpdateBusy] = useState(false);
   const [addonUpdatesChecked, setAddonUpdatesChecked] = useState(false);
@@ -3401,6 +3412,16 @@ export default function App() {
       invalidateAddonUpdateChecks();
     } catch (error) {
       setCliUpdateError(describeInvokeError(error, t("messages.localOperationFailed")));
+      // The command rejected before any worker started, so the optimistic
+      // "running" state set above has no owner: leaving it up disables the
+      // button as "Updating …" forever. Re-read the authoritative state.
+      try {
+        setRuntimeUpgradeProgress(
+          await invoke<RuntimeUpgradeProgress>("get_runtime_upgrade_progress")
+        );
+      } catch {
+        setRuntimeUpgradeProgress(idleRuntimeUpgradeProgress);
+      }
     }
   }
 
@@ -4399,7 +4420,31 @@ export default function App() {
 
       if (step.kind === "apply") {
         for (const clientId of step.clientIds) {
-          const result = await invoke<ClientSetupResult>("apply_client_setup", { clientId });
+          // The launcher must not silently steal another tool's Codex route:
+          // without the explicit confirmation the backend refuses, and the
+          // whole auto-configure run dies on an error banner. Ask the same
+          // question the settings toggle asks, and leave a declined connector
+          // on the manual setup screen instead of failing the whole flow.
+          const connector = aggregateClientConnectors(latestConnectors).find(
+            (candidate) => candidate.clientId === clientId
+          );
+          const foreignProvider = connector
+            ? connectorForeignProvider(connector)
+            : null;
+          if (
+            connector &&
+            foreignProvider &&
+            !(await requestTakeoverConfirm(
+              connectorLabel(t, connector),
+              foreignProvider
+            ))
+          ) {
+            continue;
+          }
+          const result = await invoke<ClientSetupResult>("apply_client_setup", {
+            clientId,
+            allowTakeover: Boolean(foreignProvider)
+          });
           if (result.replacedBaseUrl) {
             setConnectorsNotice(
               t("connections.baseUrlTakeover", { address: result.replacedBaseUrl })
@@ -5340,11 +5385,14 @@ export default function App() {
     // first: Headroom records the displaced provider and restores it when the
     // connector is disabled again.
     const foreignProvider = nextEnabled
-      ? connector.verification?.foreignProvider ?? null
+      ? connectorForeignProvider(connector)
       : null;
     if (
       foreignProvider &&
-      !window.confirm(t("connections.setup.takeoverConfirm", { provider: foreignProvider }))
+      !(await requestTakeoverConfirm(
+        connectorLabel(t, connector),
+        foreignProvider
+      ))
     ) {
       return;
     }
@@ -8585,12 +8633,7 @@ export default function App() {
                 </div>
                 <div className="connector-list">
                   {sortClientConnectors(aggregateClientConnectors(connectors)).map((connector) => {
-                    const connectorLabel =
-                      connector.clientId === "claude_code"
-                        ? t("connections.claudeConnection")
-                        : connector.clientId === "codex"
-                          ? t("connections.codexConnection")
-                          : connector.name;
+                    const connectorName = connectorLabel(t, connector);
                     const unavailableReason = getConnectorUnavailableReason(connector);
                     const detectionWarning = getConnectorDetectionWarning(connector);
                     const gateBlocksEnable =
@@ -8608,7 +8651,7 @@ export default function App() {
                             <span className="client-logo" aria-hidden="true">
                               {renderConnectorLogo(connector.clientId)}
                             </span>
-                            {connectorLabel}
+                            {connectorName}
                             <button
                               className="connector-help"
                               onClick={() =>
@@ -9155,6 +9198,13 @@ export default function App() {
               </div>
             </div>
           )}
+
+          {takeoverPrompt ? (
+            <TakeoverConfirmDialog
+              prompt={takeoverPrompt}
+              onAnswer={answerTakeoverConfirm}
+            />
+          ) : null}
 
           {pendingWorkflowSwitch ? (
             <div

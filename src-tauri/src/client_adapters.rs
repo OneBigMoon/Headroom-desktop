@@ -890,6 +890,20 @@ pub fn list_client_connectors(
                 || setup_state
                     .remembered_clients
                     .contains_key(normalized_setup_id(spec.id));
+            // Which tool owns the Codex route is a property of the machine's
+            // `~/.codex/config.toml`, not of our connector state: report it
+            // while the connector is off too, or the settings toggle cannot
+            // warn the user before it replaces another manager's provider (it
+            // read `verification`, which is deliberately absent while off, and
+            // therefore sent `allowTakeover: false` straight into the
+            // backend's refusal). A single small file read -- it never drags
+            // `verify_client_setup`'s blocking probes along for a disabled
+            // connector.
+            let foreign_provider = if spec.id == "codex" {
+                codex_external_provider()
+            } else {
+                None
+            };
             let verification = if enabled {
                 verify_client_setup(spec.id).ok()
             } else {
@@ -911,6 +925,7 @@ pub fn list_client_connectors(
                 verified,
                 last_configured_at,
                 restart_required,
+                foreign_provider,
                 verification,
             }
         })
@@ -10816,6 +10831,76 @@ keep rtk\n\
             .expect("grok connector listed");
         assert!(!grok.enabled);
         assert!(grok.verification.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_client_connectors_names_a_foreign_codex_owner_while_disabled() {
+        // Regression: the Codex route can be owned by another tool while our
+        // connector is *off* (Cockpit Tools writes root `model_provider =
+        // "codex_local_access"`). `verification` is deliberately absent when
+        // disabled, so the panel read `undefined`, skipped the takeover
+        // confirmation, and sent `allowTakeover: false` straight into the
+        // backend's "refusing to replace custom Codex model_provider" error --
+        // the toggle looked broken with no way to say yes. The owner must be
+        // reported independently of our own on/off state.
+        let home = TestHome::new();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join("config.toml"),
+            "model_provider = \"codex_local_access\"\n\n[model_providers.codex_local_access]\nname = \"Cockpit\"\n",
+        )
+        .unwrap();
+
+        let detected = vec![crate::models::ClientStatus {
+            id: "codex".to_string(),
+            name: "Codex".to_string(),
+            installed: true,
+            configured: false,
+            health: crate::models::ClientHealth::Healthy,
+            notes: Vec::new(),
+        }];
+        let connectors = super::list_client_connectors(&detected).expect("listing succeeds");
+
+        let codex = connectors
+            .iter()
+            .find(|connector| connector.client_id == "codex")
+            .expect("codex connector listed");
+        assert!(!codex.enabled, "connector starts disabled");
+        assert!(
+            codex.verification.is_none(),
+            "a disabled connector still carries no verification"
+        );
+        assert_eq!(
+            codex.foreign_provider.as_deref(),
+            Some("Cockpit (codex_local_access)"),
+            "the off connector must still name whoever owns the Codex route"
+        );
+
+        // Non-Codex connectors share no route with `~/.codex/config.toml`.
+        let grok = connectors
+            .iter()
+            .find(|connector| connector.client_id == "grok_build")
+            .expect("grok connector listed");
+        assert!(grok.foreign_provider.is_none());
+
+        // Once Headroom owns the route the field empties out, so the toggle
+        // stops asking for a takeover nobody needs.
+        super::apply_client_setup_with_options("codex", true)
+            .expect("confirmed takeover succeeds");
+        let connectors = super::list_client_connectors(&detected).expect("listing succeeds");
+        let codex = connectors
+            .iter()
+            .find(|connector| connector.client_id == "codex")
+            .expect("codex connector listed");
+        assert!(codex.enabled);
+        assert!(codex.verified);
+        assert!(
+            codex.foreign_provider.is_none(),
+            "Headroom's own provider is not foreign, got: {:?}",
+            codex.foreign_provider
+        );
     }
 
     #[test]

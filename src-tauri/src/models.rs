@@ -420,6 +420,14 @@ pub struct ClientConnectorStatus {
     #[serde(default)]
     pub restart_required: Option<bool>,
     #[serde(default)]
+    /// Who owns the Codex route in `~/.codex/config.toml` right now, when that
+    /// is not Headroom. Read from the file rather than from our connector
+    /// state, so the panel knows about the other tool *before* the user flips
+    /// the toggle on -- the toggle has to ask before it replaces that route,
+    /// and the confirm copy needs the owner's name. Always `None` for non-Codex
+    /// connectors.
+    pub foreign_provider: Option<String>,
+    #[serde(default)]
     pub verification: Option<ClientSetupVerification>,
 }
 

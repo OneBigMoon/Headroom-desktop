@@ -2884,6 +2884,15 @@ fn update_headroom_cli(app: AppHandle, version: Option<String>) -> Result<(), St
         } else if state.tool_manager.check_headroom_upgrade().is_none() {
             return Err("Headroom CLI is already up to date.".into());
         }
+        // The worker below resolves the release (a PyPI round-trip for any
+        // non-pinned target) before it can publish progress, and the settings
+        // panel gives up on a click as soon as it reads `running: false`.
+        // Claim the running state now so the button stays honest for the whole
+        // fetch instead of appearing to do nothing.
+        state.begin_runtime_upgrade_progress(
+            state.tool_manager.installed_headroom_version(),
+            version.clone(),
+        );
     }
 
     let app_clone = app.clone();
@@ -2891,6 +2900,9 @@ fn update_headroom_cli(app: AppHandle, version: Option<String>) -> Result<(), St
         let state: tauri::State<'_, AppState> = app_clone.state();
         if let Err(err) = state.request_runtime_upgrade(&app_clone, version.as_deref()) {
             log::warn!("manual Headroom CLI update did not start: {err}");
+            // Same channel the panel is already polling: a detached worker
+            // that never starts the upgrade used to fail silently.
+            state.fail_runtime_upgrade(err);
         }
     });
     Ok(())

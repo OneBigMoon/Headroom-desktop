@@ -13,6 +13,8 @@ import {
   outputReductionForWindow,
   compactNumber,
   connectorDashboardStatus,
+  connectorForeignProvider,
+  connectorLabel,
   localizeAddonSavingsLabel,
   connectorStatusLine,
   shouldAutoRestartCodex,
@@ -446,6 +448,39 @@ describe("dashboard helpers", () => {
     expect(
       connectorDashboardStatus({ clientId: "codex", name: "Codex", installed: true, enabled: true, verified: false })
     ).toEqual({ label: "Verifying", tone: "pending" });
+    // The "off" connector still knows who owns the Codex route: the backend
+    // reports it from ~/.codex/config.toml, not from our own verification
+    // (which is deliberately absent while the connector is off). Without this
+    // the enable toggle had nothing to warn about, skipped its confirm, and
+    // sent `allowTakeover: false` straight into the backend's refusal.
+    const offCodex = {
+      clientId: "codex",
+      name: "Codex",
+      installed: true,
+      enabled: false,
+      verified: false,
+      foreignProvider: "Cockpit (codex_local_access)",
+    } as const;
+    expect(connectorForeignProvider(offCodex)).toBe("Cockpit (codex_local_access)");
+    // Older payloads that only carry the verification field still work.
+    expect(
+      connectorForeignProvider({
+        ...offCodex,
+        foreignProvider: null,
+        verification: {
+          clientId: "codex",
+          verified: false,
+          proxyReachable: true,
+          checks: [],
+          failures: [],
+          foreignProvider: "Cockpit (codex_local_access)",
+        },
+      })
+    ).toBe("Cockpit (codex_local_access)");
+    // Headroom's own route is not foreign, so nothing asks for a takeover.
+    expect(connectorForeignProvider({ ...offCodex, foreignProvider: null })).toBeNull();
+    expect(connectorDashboardStatus(offCodex)).toEqual({ label: "Off", tone: "off" });
+
     // Coexist state: the connector is on but another tool owns the route, so
     // `verified` is false by design. Pending amber would claim setup is still
     // running, and the label has to name whoever is actually routing.
@@ -479,6 +514,24 @@ describe("dashboard helpers", () => {
         { proxyReachable: false }
       )
     ).toEqual({ label: "Proxy unreachable", tone: "idle" });
+  });
+
+  it("labels a client row the way the panel does", () => {
+    const t = vi.fn((key: string) => key) as unknown as Translate;
+
+    // The dialog title reuses the row's name, so both have to agree: the two
+    // clients Headroom ships localized labels for get theirs, and anything
+    // else falls back to the backend's own name.
+    expect(connectorLabel(t, { clientId: "codex", name: "Codex" } as ClientConnectorStatus)).toBe(
+      "connections.codexConnection"
+    );
+    expect(
+      connectorLabel(t, { clientId: "claude_code", name: "Claude Code" } as ClientConnectorStatus)
+    ).toBe("connections.claudeConnection");
+    expect(connectorLabel(t, { clientId: "grok", name: "Grok Build" } as ClientConnectorStatus)).toBe(
+      "Grok Build"
+    );
+    expect(t).not.toHaveBeenCalledWith("connections.codexConnection", expect.anything());
   });
 
   it("formats timestamps and learn recency with clear fallbacks", () => {

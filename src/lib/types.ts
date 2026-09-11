@@ -271,6 +271,13 @@ export interface ClientConnectorStatus {
   verified: boolean;
   lastConfiguredAt?: string | null;
   restartRequired?: boolean | null;
+  /**
+   * Whoever owns the Codex route in `~/.codex/config.toml` right now, when
+   * that is not Headroom. Reported even while this connector is off, because
+   * the enable toggle has to warn about -- and confirm -- taking the route
+   * over before it can succeed. Always null for non-Codex connectors.
+   */
+  foreignProvider?: string | null;
   verification?: ClientSetupVerification | null;
 }
 

@@ -20,7 +20,6 @@ function tool(overrides: Partial<CheckedManagedTool>): CheckedManagedTool {
 }
 
 const DIRECT_UPSTREAM_UPDATE_IDS = [
-  "headroom",
   "rtk",
   "markitdown",
   "serena",
@@ -353,4 +352,67 @@ describe("addon update checks", () => {
       updateRequiresAppUpdate: false,
     });
   });
+
+  /// Regression: this row once advertised the raw PyPI latest ("更新到
+  /// v0.37.0") while the build pins the runtime it was packed against, so the
+  /// click resolved the PIN -- no newer version to install -- and the button
+  /// looked dead. It has to come back with nothing actionable no matter what
+  /// the incoming payload claimed, because `...tool` carries the backend's own
+  /// offer through the function.
+  it("never advertises a Headroom CLI version this build cannot install", () => {
+    const [checked] = applyAddonUpdateChecks(
+      [
+        tool({
+          id: "headroom",
+          name: "Headroom CLI",
+          runtime: "python",
+          required: true,
+          version: "0.36.5",
+          supportedVersion: "0.36.5",
+          updateAvailable: true,
+          availableVersion: "0.37.0",
+          updateActionAvailable: true,
+        }),
+      ],
+      [{ id: "headroom", latestVersion: "0.37.0", error: null }],
+    );
+
+    expect(checked).toMatchObject({
+      updateAvailable: false,
+      availableVersion: null,
+      updateActionAvailable: false,
+      upstreamVersion: "0.37.0",
+      upstreamUpdateAvailable: true,
+      updateRequiresAppUpdate: true,
+    });
+  });
+
+  /// The pin still has to be installable: an older on-disk runtime is exactly
+  /// what the transactional upgrade exists for, and it is the only Headroom
+  /// offer this build can actually deliver.
+  it("keeps offering the pinned Headroom CLI when the runtime is behind", () => {
+    const [checked] = applyAddonUpdateChecks(
+      [
+        tool({
+          id: "headroom",
+          name: "Headroom CLI",
+          runtime: "python",
+          required: true,
+          version: "0.35.0",
+          supportedVersion: "0.36.5",
+          updateAvailable: true,
+          availableVersion: "0.36.5",
+        }),
+      ],
+      [{ id: "headroom", latestVersion: "0.37.0", error: null }],
+    );
+
+    expect(checked).toMatchObject({
+      updateAvailable: true,
+      availableVersion: "0.36.5",
+      updateRequiresAppUpdate: true,
+      upstreamVersion: "0.37.0",
+    });
+  });
+
 });
