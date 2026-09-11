@@ -18387,8 +18387,11 @@ after
             "Headroom-managed Python >= 3.11"
         };
         assert!(body.contains(required_python));
-        assert!(body.contains("allinluna/runtime"));
-        assert!(body.contains("allinluna_runtime/__main__.py"));
+        // The two paths below are spelled with the host's separator: the batch
+        // launcher writes `...\allinluna\runtime`, the shell one `.../allinluna/runtime`.
+        let sep = if cfg!(windows) { '\\' } else { '/' };
+        assert!(body.contains(&format!("allinluna{sep}runtime")));
+        assert!(body.contains(&format!("allinluna_runtime{sep}__main__.py")));
         assert!(body.contains("PYTHONPATH"));
         assert!(body.contains("PYTHONNOUSERSITE=1"));
         assert!(body.contains("-m allinluna_runtime"));
