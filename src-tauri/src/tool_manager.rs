@@ -17765,6 +17765,30 @@ after
         }
     }
 
+    /// A fake user-installed CLI has to be the platform's *own* flavour of
+    /// program. `probe_known_paths` and `is_runnable` refuse to hand back
+    /// anything the host cannot spawn, so a `#!/bin/sh` script left under the
+    /// bare name reads as "not installed" on Windows: detection rejects it,
+    /// and the caller reports "Codex CLI ('codex') was not found on PATH".
+    /// The `.cmd` arm is the shape a real npm-installed `codex.cmd` takes
+    /// there, so the Windows half exercises the same path a user's box does.
+    ///
+    /// Returns the path the caller should expect the host to resolve.
+    fn write_cli_shim(
+        dir: &std::path::Path,
+        name: &str,
+        unix_body: &str,
+        windows_body: &str,
+    ) -> PathBuf {
+        let path = if cfg!(windows) {
+            dir.join(format!("{name}.cmd"))
+        } else {
+            dir.join(name)
+        };
+        write_executable(&path, if cfg!(windows) { windows_body } else { unix_body });
+        path
+    }
+
     fn seed_test_runtime(prefix: &str) -> (PathBuf, ManagedRuntime, ToolManager) {
         let root = unique_temp_dir(prefix);
         let runtime = ManagedRuntime::bootstrap_root(&root);
@@ -18345,8 +18369,12 @@ after
         let body = fs::read_to_string(&launcher).expect("launcher contents");
         assert!(body.contains(&runtime.managed_python().display().to_string()));
         if cfg!(target_os = "windows") {
-            assert!(body.contains(r".codex\.tmp\marketplaces\allinluna"));
-            assert!(body.contains(r".claude\plugins\marketplaces\allinluna"));
+            // The batch launcher reaches Codex's checkout through
+            // `%CODEX_ROOT%` (itself `%USERPROFILE%\.codex`), not through a
+            // literal `.codex\...` prefix, so assert the variables the script
+            // actually switches on.
+            assert!(body.contains(r"%CODEX_ROOT%\.tmp\marketplaces\allinluna"));
+            assert!(body.contains(r"%USERPROFILE%\.claude\plugins\marketplaces\allinluna"));
         } else {
             assert!(body.contains("CODEX_HOME"));
             assert!(body.contains("codex_root"));
@@ -20506,12 +20534,25 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
         // `plugin add` is allowed to drop an existing disabled flag, so the fake
         // CLI re-enables the plugin on every call: the update path has to put the
         // user's choice back.
-        write_executable(
-            &root.join(".local/bin/codex"),
+        write_cli_shim(
+            &root.join(".local/bin"),
+            "codex",
             &format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{invoked}'\n\
                  printf '[plugins.\"superpowers@openai-curated\"]\\nsource = \"managed\"\\nenabled = true\\n' > '{config}'\n\
                  exit 0\n",
+                invoked = invoked.display(),
+                config = config.display()
+            ),
+            &format!(
+                "@echo off\r\n\
+                 >> \"{invoked}\" echo %*\r\n\
+                 (\r\n\
+                 echo [plugins.\"superpowers@openai-curated\"]\r\n\
+                 echo source = \"managed\"\r\n\
+                 echo enabled = true\r\n\
+                 )> \"{config}\"\r\n\
+                 exit /b 0\r\n",
                 invoked = invoked.display(),
                 config = config.display()
             ),
@@ -20629,11 +20670,20 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
         let before = b"[plugins.\"allinluna@allinluna\"]\nsource = \"user\"\n";
         fs::write(&config, before).expect("user plugin registration");
         let invoked = root.join("codex-invoked");
-        let codex = root.join(".local/bin/codex");
-        write_executable(
-            &codex,
+        // The fake CLI answers the `--version` smoke test so detection accepts
+        // it, and any other call proves the preflight refused too late.
+        write_cli_shim(
+            &root.join(".local/bin"),
+            "codex",
             &format!(
                 "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\ntouch '{}'\nexit 99\n",
+                invoked.display()
+            ),
+            &format!(
+                "@echo off\r\n\
+                 if \"%~1\"==\"--version\" exit /b 0\r\n\
+                 type nul > \"{}\"\r\n\
+                 exit /b 99\r\n",
                 invoked.display()
             ),
         );
@@ -21791,11 +21841,19 @@ exit 0
     }
 
     #[test]
-    fn codebase_memory_release_parser_requires_exact_version_url_and_digest() {
+    fn codebase_memory_version_validation_rejects_tags_and_paths() {
         assert!(valid_codebase_memory_version("0.10.8"));
         for version in ["v0.10.8", "0.10", "0.10.8-rc.1", "0.10.8/evil"] {
             assert!(!valid_codebase_memory_version(version));
         }
+    }
+
+    /// The asset contract belongs to the targets upstream publishes for:
+    /// codebase-memory has no Windows build, so `codebase_memory_release_target`
+    /// refuses there and there is no release asset name to check.
+    #[test]
+    #[cfg(unix)]
+    fn codebase_memory_release_parser_requires_exact_version_url_and_digest() {
         let asset_name = format!(
             "codebase-memory-mcp-{}.tar.gz",
             codebase_memory_release_target().unwrap()
@@ -21869,8 +21927,12 @@ exit 0
 
     #[test]
     fn newer_rtk_receipt_is_not_downgraded_to_pin() {
-        let (root, runtime, manager) = seed_test_runtime("rtk-newer-no-downgrade");
-        write_executable(&runtime.bin_dir.join("rtk"), "#!/bin/sh\nexit 0\n");
+        let (root, _runtime, manager) = seed_test_runtime("rtk-newer-no-downgrade");
+        // `rtk_needs_install` compares a receipt against the platform's own
+        // entrypoint name, so the stub has to sit where the host looks for it
+        // (`rtk` beside `rtk.exe`). Nothing executes it here -- these two calls
+        // stop at existence and version.
+        write_executable(&manager.rtk_entrypoint(), "#!/bin/sh\nexit 0\n");
         manager
             .write_tool_receipt("rtk", json!({ "version": "99.0.0" }))
             .unwrap();
