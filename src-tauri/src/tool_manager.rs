@@ -2097,6 +2097,109 @@ fn bin_subdir() -> &'static str {
     }
 }
 
+/// Re-home a venv that was built in one directory and renamed into another.
+///
+/// `python -m venv` bakes the absolute interpreter path into every launcher it
+/// writes, so the managed venvs -- both built in a `*.staging-<uuid>` directory
+/// and renamed into place once their install smoke test passes -- kept pointing
+/// at that staging path after the rename. Every launcher in both of them then
+/// died with exit 126 ("no such file or directory") while the tool receipt
+/// still read `healthy`: MarkItDown conversions and the Serena MCP server were
+/// both dead on disk, and the only trace was a warn line.
+///
+/// Rewrite each launcher that names a missing interpreter to this venv's own
+/// one. Written in place so the executable bits survive; binaries are left
+/// alone (magika ships a real executable in `bin/`).
+fn rehome_venv_launchers(venv: &Path) -> Result<usize> {
+    let bin = venv.join(bin_subdir());
+    let own_root = venv.to_string_lossy().into_owned();
+    let mut rewritten = 0;
+    let entries = match std::fs::read_dir(&bin) {
+        Ok(entries) => entries,
+        // No bin dir means no launchers to re-home, not a failure.
+        Err(_) => return Ok(0),
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|kind| kind.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        let Some(contents) = read_launcher_text(&path) else {
+            continue;
+        };
+        let Some(stale_root) = stale_launcher_root(&contents, venv) else {
+            continue;
+        };
+        let fixed = contents.replace(&stale_root, &own_root);
+        if fixed == contents {
+            continue;
+        }
+        std::fs::write(&path, fixed.as_bytes())
+            .with_context(|| format!("re-homing launcher {}", path.display()))?;
+        rewritten += 1;
+    }
+    Ok(rewritten)
+}
+
+/// Launcher scripts are a few KB of text. Anything with a NUL byte in its head
+/// is a real binary we must not rewrite, and a large file is not a launcher.
+fn read_launcher_text(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() > 1024 * 1024 || bytes[..bytes.len().min(8192)].contains(&0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// The venv root a launcher was written with, when that interpreter is gone.
+///
+/// `python -m venv` writes two shapes: a `#!<python>` shebang, or `#!/bin/sh`
+/// followed by `'''exec' "<python>" "$0" "$@"`. Both name the interpreter, so
+/// take the first one the file names and drop the `bin/python3` tail.
+/// The `activate` scripts are left alone: they name the venv directory for a
+/// human to source, no launcher reads them, and Python does not rewrite them
+/// for a relocated venv either.
+fn stale_launcher_root(contents: &str, venv: &Path) -> Option<String> {
+    for line in contents.lines() {
+        let line = line.trim_end();
+        if let Some(rest) = line.trim_start().strip_prefix("#!") {
+            let rest = rest.trim();
+            if !rest.is_empty() && rest != "/bin/sh" {
+                if let Some(root) = stale_root_around_interpreter(rest, venv) {
+                    return Some(root);
+                }
+            }
+        }
+        if let Some(index) = line.find("exec' \"") {
+            let rest = &line[index + "exec' \"".len()..];
+            if let Some(end) = rest.find('"') {
+                if let Some(root) = stale_root_around_interpreter(&rest[..end], venv) {
+                    return Some(root);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `<venv>/bin/python3` (or `Scripts\python.exe`) names the venv two levels up.
+fn stale_root_around_interpreter(interpreter: &str, venv: &Path) -> Option<String> {
+    let interpreter = Path::new(interpreter);
+    if interpreter.exists() {
+        return None;
+    }
+    stale_venv_dir(&interpreter.parent()?.parent()?, venv)
+}
+
+/// The directory a candidate names, when it is gone and is not this venv --
+/// the staging directory a venv was built in, which no longer exists.
+fn stale_venv_dir(candidate: &Path, venv: &Path) -> Option<String> {
+    if candidate.as_os_str().is_empty() || candidate == venv || candidate.exists() {
+        return None;
+    }
+    Some(candidate.to_string_lossy().into_owned())
+}
+
 #[derive(Debug, Clone)]
 pub struct BootstrapStepUpdate {
     pub step: &'static str,
@@ -7681,6 +7784,30 @@ impl ToolManager {
         self.runtime.root_dir.join("markitdown-venv")
     }
 
+    /// Re-home the launchers of every managed venv that is present. Cheap: a
+    /// launcher is only rewritten when it names an interpreter that is gone.
+    /// Run on launch so an install activated before `rehome_venv_launchers`
+    /// existed repairs itself instead of staying silently dead.
+    pub fn repair_managed_venvs(&self) -> Result<()> {
+        for (name, venv) in [
+            ("markitdown", self.markitdown_venv_dir()),
+            ("serena", self.serena_venv_dir()),
+        ] {
+            if !venv.exists() {
+                continue;
+            }
+            match rehome_venv_launchers(&venv) {
+                Ok(0) => {}
+                Ok(count) => log::info!(
+                    "{name}: re-homed {count} launcher(s) that still pointed at the \
+                     staging directory this venv was built in"
+                ),
+                Err(err) => log::warn!("{name} venv repair failed: {err:#}"),
+            }
+        }
+        Ok(())
+    }
+
     /// Shim in the Headroom-managed bin dir. The Office nudge and the Bash
     /// permission both reference this absolute path, so it works whether or not
     /// the bin dir is on PATH (RTK, which exports it, is now opt-in).
@@ -7857,6 +7984,7 @@ impl ToolManager {
         }
         if let Err(err) = std::fs::rename(&staging, &final_venv)
             .context("activating MarkItDown venv")
+            .and_then(|_| rehome_venv_launchers(&final_venv))
             .and_then(|_| self.ensure_markitdown_shim())
             .and_then(|_| {
                 let enabled = self.tool_enabled("markitdown");
@@ -8056,6 +8184,10 @@ impl ToolManager {
         }
         let activate = || -> Result<()> {
             std::fs::rename(&staging, &final_venv).context("activating Serena venv")?;
+            // The venv was built in the staging directory, and `python -m venv`
+            // baked that path into every launcher; re-home them now that the
+            // directory has its real name or nothing in the venv can start.
+            rehome_venv_launchers(&final_venv)?;
             self.register_serena_mcp()?;
             set_serena_global_gitignore(true);
             let enabled = self.tool_enabled("serena");
@@ -15041,7 +15173,9 @@ impl std::error::Error for HeadroomStartupFailure {}
 mod tests {
     use super::{
         codebase_memory_release_target, context7_package_spec_for, parse_codebase_memory_release,
+        bin_subdir,
         fetch_rtk_release, github_api_token_uncached, github_rate_limit_message,
+        python_exe_name,
         github_api_json, parse_rtk_release, rtk_release_asset_name, rtk_version_is_downgrade,
         rtk_version_output_matches, stable_package_version, valid_codebase_memory_version,
         valid_rtk_version,
@@ -15079,6 +15213,7 @@ mod tests {
         proxy_argv_contains_expected_flags, purge_legacy_output_savings_control_arm_once,
         read_headroom_learn_metadata_from_path, receipt_requires_atomic_rebuild,
         reclaim_orphan_proxy, redact_sensitive, render_codex_plugin_enabled, requirements_lock_sha,
+        rehome_venv_launchers,
         rtk_distribution_artifact, run_command, sanitize_log_variant, savings_profile_for_runtime,
         set_codex_plugin_enabled, settle_unowned_port, sha256_bytes,
         summarize_kompress_prefetch_failure, verify_sha256_file, wait_for_port_free,
@@ -20747,6 +20882,119 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
         manager
             .smoke_test_markitdown_with_timeout(Duration::from_secs(2))
             .expect_err("smoke test should fail");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Both managed venvs are built in `*.staging-<uuid>` and renamed into
+    /// place, but `python -m venv` writes the staging path into every launcher
+    /// it creates. Renaming therefore left the whole venv unrunnable -- exit
+    /// 126, "no such file or directory" -- while the tool receipt still said
+    /// healthy, which is how MarkItDown and the Serena MCP server were both
+    /// dead on disk with nothing but a warn line to show for it.
+    #[test]
+    #[cfg(unix)]
+    fn rehome_venv_launchers_rewrites_launchers_stuck_on_the_staging_dir() {
+        let root = unique_temp_dir("rehome-leftovers");
+        let venv = root.join("markitdown-venv");
+        let bin = venv.join("bin");
+        fs::create_dir_all(&bin).expect("bin");
+        let python = bin.join("python3");
+        write_executable(&python, "#!/bin/sh\nexit 0\n");
+        let staging = root.join("markitdown-venv.staging-bbf0cf96");
+
+        // The `/bin/sh` + `exec` shape pip writes for console scripts.
+        let launcher = bin.join("markitdown");
+        write_executable(
+            &launcher,
+            &format!(
+                "#!/bin/sh\n'''exec' \"{}/bin/python3\" \"$0\" \"$@\"\n' '''\n",
+                staging.display()
+            ),
+        );
+        // The plain shebang shape distlib writes for vendored scripts.
+        let script = bin.join("pdf2txt.py");
+        write_executable(
+            &script,
+            &format!("#!{}/bin/python3\nprint('hi')\n", staging.display()),
+        );
+        // The activation scripts name the venv directory rather than an
+        // interpreter, and nothing a launcher spawns reads them, so they stay
+        // as Python wrote them.
+        let activate = bin.join("activate");
+        fs::write(&activate, format!("VIRTUAL_ENV={}\n", staging.display())).expect("activate");
+
+        let rewritten = rehome_venv_launchers(&venv).expect("rehome");
+
+        assert_eq!(rewritten, 2, "both launchers name the staging interpreter");
+        let text = fs::read_to_string(&launcher).expect("launcher");
+        assert!(text.contains(&python.to_string_lossy().into_owned()), "{text}");
+        assert!(!text.contains(".staging-"), "{text}");
+        let text = fs::read_to_string(&script).expect("script");
+        assert!(text.starts_with(&format!("#!{}", python.display())), "{text}");
+        let text = fs::read_to_string(&activate).expect("activate");
+        assert!(text.contains(".staging-"), "activation script left alone: {text}");
+        // In-place rewrite, so the launcher is still executable.
+        let _ = rehome_venv_launchers(&venv).expect("second pass");
+        assert_eq!(rehome_venv_launchers(&venv).expect("idempotent"), 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn rehome_venv_launchers_leaves_healthy_launchers_and_binaries_alone() {
+        let root = unique_temp_dir("rehome-healthy");
+        let venv = root.join("serena-venv");
+        let bin = venv.join("bin");
+        fs::create_dir_all(&bin).expect("bin");
+        let python = bin.join("python3");
+        write_executable(&python, "#!/bin/sh\nexit 0\n");
+        let launcher = bin.join("serena");
+        let healthy = format!(
+            "#!/bin/sh\n'''exec' \"{}\" \"$0\" \"$@\"\n' '''\n",
+            python.display()
+        );
+        write_executable(&launcher, &healthy);
+        // magika ships a real executable in `bin/`; rewriting it would corrupt
+        // the tool, so the re-homer has to skip it.
+        let binary = bin.join("magika");
+        let mut bytes = format!("#!/bin/sh\n# {}\n", root.display()).into_bytes();
+        bytes.insert(4, 0);
+        fs::write(&binary, &bytes).expect("binary");
+
+        assert_eq!(rehome_venv_launchers(&venv).expect("rehome"), 0);
+        assert_eq!(fs::read_to_string(&launcher).expect("launcher"), healthy);
+        assert_eq!(fs::read(&binary).expect("binary"), bytes);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn repair_managed_venvs_heals_an_installed_tools_venv() {
+        let (root, _runtime, manager) = seed_test_runtime("repair-managed-venvs");
+        let venv = manager.markitdown_venv_dir();
+        let bin = venv.join(bin_subdir());
+        fs::create_dir_all(&bin).expect("bin");
+        fs::write(bin.join(python_exe_name()), b"").expect("python");
+        let launcher = manager.markitdown_entrypoint();
+        let staging_root = root.join("markitdown-venv.staging-deadbeef");
+        fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\n'''exec' \"{}\" \"$0\" \"$@\"\n' '''\n",
+                staging_root.join(bin_subdir()).join(python_exe_name()).display()
+            ),
+        )
+        .expect("launcher");
+
+        manager.repair_managed_venvs().expect("repair");
+
+        let text = fs::read_to_string(&launcher).expect("launcher");
+        assert!(
+            text.contains(&venv.to_string_lossy().into_owned()),
+            "launcher still points at the staging dir: {text}"
+        );
 
         let _ = fs::remove_dir_all(root);
     }

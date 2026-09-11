@@ -844,6 +844,16 @@ impl AppState {
 
         // Pre-wrapper installs still have a bare symlink shim; refresh it so
         // the conversion counter starts recording without a reinstall.
+        //
+        // Both managed venvs are built in a `*.staging-<uuid>` directory and
+        // renamed into place, which leaves every launcher they wrote pointing
+        // at that staging path (see `rehome_venv_launchers`). An install
+        // activated before that rename was repaired cannot start at all, so
+        // heal whatever is on disk before anything tries to run it.
+        if let Err(err) = self.tool_manager.repair_managed_venvs() {
+            log::warn!("managed venv repair failed during warm_runtime_on_launch: {err:#}");
+        }
+
         if self.tool_manager.markitdown_installed() {
             if let Err(err) = self.tool_manager.ensure_markitdown_shim() {
                 log::warn!("markitdown shim refresh failed during warm_runtime_on_launch: {err:#}");
