@@ -6839,6 +6839,10 @@ impl ToolManager {
 
             let _ = crate::client_adapters::pin_codex_mcp_command(&entrypoint);
             let _ = crate::client_adapters::pin_grok_mcp_command(&entrypoint);
+            // ZCode has no registrar in headroom.mcp_registry; its connector
+            // owns the entry from Rust. Repin-only, so a disabled connector is
+            // never resurrected by a runtime reinstall.
+            let _ = crate::client_adapters::repin_zcode_mcp_command(&entrypoint);
             return Ok(McpInstallMethod::CommunityRegistry);
         }
 

@@ -374,7 +374,9 @@ const connectorSetupDetails: Record<string, string> = {
   grok_build:
     "Headroom writes a managed proxy block to ~/.grok/config.toml and exports GROK_CLI_CHAT_PROXY_BASE_URL in your shell profiles so Grok Build connects through Headroom.",
   opencode:
-    "Headroom points the anthropic and openai provider base URLs in OpenCode's config file (usually ~/.config/opencode/opencode.json) at its localhost proxy and registers a transport plugin that routes every other provider through it too. Anthropic and OpenAI traffic is optimized; other providers pass through for visibility. A project-level opencode.json can override this for that project."
+    "Headroom points the anthropic and openai provider base URLs in OpenCode's config file (usually ~/.config/opencode/opencode.json) at its localhost proxy and registers a transport plugin that routes every other provider through it too. Anthropic and OpenAI traffic is optimized; other providers pass through for visibility. A project-level opencode.json can override this for that project.",
+  zcode:
+    "Headroom registers its local MCP server (compression, retrieval, and stats tools) in ~/.zcode/cli/config.json so ZCode shares the plugin toolset Claude Code and Codex get. Provider, model, and account settings are not touched."
 };
 
 const CONNECTOR_SETUP_KEYS: Record<string, TranslationKey> = {
@@ -382,6 +384,7 @@ const CONNECTOR_SETUP_KEYS: Record<string, TranslationKey> = {
   codex: "connections.details.codex",
   grok_build: "connections.details.grok",
   opencode: "connections.details.opencode",
+  zcode: "connections.details.zcode",
 };
 
 function localizeLearnStatus(t: Translate, value: string): string {
@@ -442,6 +445,8 @@ function localizeUiText(t: Translate, value: string): string {
     "Grok Build GROK_CLI_CHAT_PROXY_BASE_URL export was not found in shell profiles.": "connections.verification.grokShellMissing",
     "Found Headroom proxy base URLs for the anthropic and openai providers in OpenCode's config.": "connections.verification.opencodeProxyFound",
     "Headroom proxy base URLs were not found for the anthropic and openai providers in OpenCode's config.": "connections.verification.opencodeProxyMissing",
+    "Found the Headroom MCP server entry in ~/.zcode/cli/config.json.": "connections.verification.zcodeMcpFound",
+    "The Headroom MCP server entry was not found in ~/.zcode/cli/config.json.": "connections.verification.zcodeMcpMissing",
     "Headroom proxy is reachable on 127.0.0.1:6867.": "connections.verification.proxyReachable",
     "Setup is incomplete - open the info panel for the exact checks.": "connections.setupIncomplete",
     "Setup could not be verified - open the info panel and re-check.": "connections.setupUnverified",
@@ -528,7 +533,8 @@ const connectorMonograms: Record<string, string> = {
   claude_code: "CC",
   codex: "CX",
   grok_build: "GK",
-  opencode: "OC"
+  opencode: "OC",
+  zcode: "ZC"
 };
 
 const connectorUnavailableReasons: Record<string, string> = {
@@ -542,7 +548,9 @@ const connectorUnavailableReasons: Record<string, string> = {
   grok_build:
     "Grok Build was not detected. Install Grok Build and restart Headroom.",
   opencode:
-    "OpenCode was not detected. Install OpenCode and restart Headroom."
+    "OpenCode was not detected. Install OpenCode and restart Headroom.",
+  zcode:
+    "ZCode was not detected. Install ZCode and restart Headroom."
 };
 
 // Grok routing: UA-classified in the intercept, forwarded to api.x.ai via
@@ -564,8 +572,9 @@ function withoutHiddenConnectors(list: ClientConnectorStatus[]) {
 // Connectors the Claude pricing gate neither auto-disables nor blocks
 // enabling while the user is authenticated: Codex has its own proxy-side
 // gate (codex_bypass); OpenCode bills against the user's own provider API
-// keys, so the Claude gate has nothing to meter (no dedicated bypass).
-const GATE_EXEMPT_CONNECTOR_IDS = new Set(["codex", "opencode", "grok_build"]);
+// keys, so the Claude gate has nothing to meter (no dedicated bypass);
+// ZCode's connector registers an MCP server and never touches routing.
+const GATE_EXEMPT_CONNECTOR_IDS = new Set(["codex", "opencode", "grok_build", "zcode"]);
 
 const launcherConnectorFallback: ClientConnectorStatus[] = withoutHiddenConnectors([
   {
@@ -592,6 +601,13 @@ const launcherConnectorFallback: ClientConnectorStatus[] = withoutHiddenConnecto
   {
     clientId: "opencode",
     name: "OpenCode",
+    installed: false,
+    enabled: false,
+    verified: false
+  },
+  {
+    clientId: "zcode",
+    name: "ZCode",
     installed: false,
     enabled: false,
     verified: false
@@ -4082,12 +4098,15 @@ export default function App() {
     // binary isn't on the app's PATH (same rationale as claude_code).
     // opencode's default install (~/.opencode/bin) is likewise invisible to
     // the GUI app's PATH while its config is a dotfile we can always write.
+    // zcode is the same story: ~/.zcode/cli/config.json is a dotfile we can
+    // always write, and ZCode reads it on its next launch.
     return (
       connector.installed ||
       connector.clientId === "claude_code" ||
       connector.clientId === "codex" ||
       connector.clientId === "grok_build" ||
-      connector.clientId === "opencode"
+      connector.clientId === "opencode" ||
+      connector.clientId === "zcode"
     );
   }
 
@@ -5998,7 +6017,8 @@ export default function App() {
             ["claude_code", "Claude Code"],
             ["codex", "Codex"],
             ["grok_build", "Grok Build"],
-            ["opencode", "OpenCode"]
+            ["opencode", "OpenCode"],
+            ["zcode", "ZCode"]
           ].map(([clientId, label]) => (
             <span className="intro-shell__agent" key={clientId}>
               <ConnectorIcon clientId={clientId} size={14} />

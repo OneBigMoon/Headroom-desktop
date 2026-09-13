@@ -597,7 +597,8 @@ const SUPPORTED_CONNECTOR_IDS = new Set([
   "claude_code",
   "codex",
   "grok_build",
-  "opencode"
+  "opencode",
+  "zcode"
 ]);
 
 export function baseUrlTakeoverNotice(replaced: string): string {

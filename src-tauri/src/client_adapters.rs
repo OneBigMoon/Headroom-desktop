@@ -87,7 +87,7 @@ struct ManagedClientSpec {
     name: &'static str,
 }
 
-const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 4] = [
+const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 5] = [
     ManagedClientSpec {
         id: "claude_code",
         name: "Claude Code",
@@ -103,6 +103,10 @@ const MANAGED_CLIENT_SPECS: [ManagedClientSpec; 4] = [
     ManagedClientSpec {
         id: "opencode",
         name: "OpenCode",
+    },
+    ManagedClientSpec {
+        id: "zcode",
+        name: "ZCode",
     },
 ];
 
@@ -128,6 +132,7 @@ pub fn detect_clients() -> Vec<ClientStatus> {
         detect_codex_client(is_configured(&setup_state, "codex")),
         detect_grok_build_client(is_configured(&setup_state, "grok_build")),
         detect_opencode_client(is_configured(&setup_state, "opencode")),
+        detect_zcode_client(is_configured(&setup_state, "zcode")),
     ]
 }
 
@@ -568,6 +573,14 @@ fn apply_client_setup_once(client_id: &str, allow_takeover: bool) -> Result<Clie
             changed_files.extend(updates.0);
             backup_files.extend(updates.1);
         }
+        "zcode" => {
+            // Plugin-line integration only: register the Headroom MCP server
+            // in ZCode's user config. No base URLs, no shell blocks, no
+            // provider or account state.
+            let updates = configure_zcode_mcp_entry()?;
+            changed_files.extend(updates.0);
+            backup_files.extend(updates.1);
+        }
         other => return Err(anyhow!("Automatic setup is not supported yet for {other}.",)),
     }
 
@@ -618,6 +631,7 @@ fn apply_client_setup_once(client_id: &str, allow_takeover: bool) -> Result<Clie
                     "codex_cli" => "Codex",
                     "grok_build" => "Grok Build",
                     "opencode" => "OpenCode",
+                    "zcode" => "ZCode",
                     _ => "Claude Code",
                 }
             ));
@@ -819,6 +833,18 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
                 );
             }
         }
+        "zcode" => {
+            if zcode_mcp_entry_matches()? {
+                checks.push(
+                    "Found the Headroom MCP server entry in ~/.zcode/cli/config.json.".into(),
+                );
+            } else {
+                failures.push(
+                    "The Headroom MCP server entry was not found in ~/.zcode/cli/config.json."
+                        .into(),
+                );
+            }
+        }
         other => return Err(anyhow!("Verification is not supported yet for {other}.",)),
     }
 
@@ -863,11 +889,17 @@ pub fn is_opencode_enabled() -> bool {
     is_configured(&load_setup_state(), "opencode")
 }
 
+pub fn is_zcode_enabled() -> bool {
+    is_configured(&load_setup_state(), "zcode")
+}
+
 /// True when an enabled connector bills against the user's own provider keys
 /// (or ChatGPT plan), so the Claude pricing gate must neither stop the Python
-/// backend nor bypass the proxy for it.
+/// backend nor bypass the proxy for it. ZCode is exempt twice over: it keeps
+/// its own provider settings, and its connector writes an MCP registration
+/// rather than a route.
 pub fn any_gate_exempt_client_enabled() -> bool {
-    is_codex_enabled() || is_opencode_enabled() || is_grok_build_enabled()
+    is_codex_enabled() || is_opencode_enabled() || is_grok_build_enabled() || is_zcode_enabled()
 }
 
 pub fn list_client_connectors(
@@ -1205,6 +1237,7 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
         }
         "grok_build" => disable_grok_build()?,
         "opencode" => disable_opencode(&state)?,
+        "zcode" => disable_zcode()?,
         other => {
             return Err(anyhow!(
                 "Automatic setup disable is not supported yet for {other}.",
@@ -5072,6 +5105,300 @@ fn disable_opencode(state: &ClientSetupState) -> Result<()> {
     }
     let _ = std::fs::remove_file(opencode_plugin_install_path());
     Ok(())
+}
+
+// ===== ZCode connector (plugin line) =====
+//
+// The ZCode integration is deliberately MCP-only: register Headroom's local
+// MCP server in ZCode's officially documented user config
+// (`~/.zcode/cli/config.json`, `mcp.servers`, hand-editable per ZCode's own
+// documentation) so ZCode shares the plugin toolset Claude Code and Codex
+// already have. No provider, baseURL, or account state is touched -- model
+// routing stays entirely under ZCode's own provider settings.
+
+fn zcode_home() -> PathBuf {
+    home_dir().join(".zcode")
+}
+
+fn zcode_cli_config_path() -> PathBuf {
+    zcode_home().join("cli").join("config.json")
+}
+
+/// The exact entry Headroom writes for ZCode. Mirrors what the community
+/// install helper registers for Claude/Codex/Grok: `headroom mcp serve` from
+/// the managed venv plus the five HEADROOM_* env vars.
+fn zcode_mcp_entry(entrypoint: &Path) -> serde_json::Value {
+    serde_json::json!({
+        "command": entrypoint.to_string_lossy(),
+        "args": ["mcp", "serve"],
+        "env": {
+            "HEADROOM_PROXY_URL": HEADROOM_PROXY_URL,
+            "HEADROOM_WORKSPACE_DIR": crate::edition::workspace_dir().to_string_lossy(),
+            "HEADROOM_CONFIG_DIR": crate::edition::config_dir().to_string_lossy(),
+            "HEADROOM_TELEMETRY": "off",
+            "HEADROOM_BEACON": "0",
+        }
+    })
+}
+
+fn zcode_servers_pointer() -> String {
+    format!("/mcp/servers/{}", crate::edition::MCP_SERVER_NAME)
+}
+
+fn read_zcode_config(path: &Path) -> Result<serde_json::Value> {
+    if !path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    let value: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "parsing {} failed; refusing to overwrite potentially valid user config",
+            path.display()
+        )
+    })?;
+    if !value.is_object() {
+        return Err(anyhow!("{} is not a JSON object", path.display()));
+    }
+    Ok(value)
+}
+
+fn write_zcode_config(path: &Path, config: &serde_json::Value) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let mut body = serde_json::to_string_pretty(config)
+        .with_context(|| format!("serializing {}", path.display()))?;
+    body.push('\n');
+    atomic_write(path, body.as_bytes())
+}
+
+/// The canonical community `headroom` CLI entrypoint, derived from the same
+/// [`crate::tool_manager::ManagedRuntime::bootstrap_root`] layout the
+/// installer uses, so connector setup never needs ToolManager state.
+fn community_headroom_entrypoint() -> PathBuf {
+    let binary = if cfg!(target_os = "windows") {
+        "headroom.exe"
+    } else {
+        "headroom"
+    };
+    let bin_dir = if cfg!(target_os = "windows") {
+        "Scripts"
+    } else {
+        "bin"
+    };
+    crate::tool_manager::ManagedRuntime::bootstrap_root(&app_data_dir())
+        .venv_dir
+        .join(bin_dir)
+        .join(binary)
+}
+
+/// Insert or replace Headroom's MCP entry in ZCode's user config. An
+/// identical entry is a no-op so re-running setup stays idempotent; any other
+/// shape of the same file survives untouched around the one key we own.
+fn configure_zcode_mcp_entry() -> Result<(Vec<String>, Vec<String>)> {
+    let entrypoint = community_headroom_entrypoint();
+    if !entrypoint.exists() {
+        bail!(
+            "Headroom runtime entrypoint {} was not found; let the Headroom runtime finish installing before connecting ZCode.",
+            entrypoint.display()
+        );
+    }
+    let path = zcode_cli_config_path();
+    let mut config = read_zcode_config(&path)?;
+    let entry = zcode_mcp_entry(&entrypoint);
+    if config.pointer(&zcode_servers_pointer()) == Some(&entry) {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    {
+        let mcp = config
+            .as_object_mut()
+            .expect("read_zcode_config checked is_object")
+            .entry("mcp")
+            .or_insert_with(|| serde_json::json!({}));
+        if !mcp.is_object() {
+            bail!(
+                "{}: \"mcp\" is not a JSON object; refusing to edit",
+                path.display()
+            );
+        }
+        let servers = mcp
+            .as_object_mut()
+            .expect("checked is_object")
+            .entry("servers")
+            .or_insert_with(|| serde_json::json!({}));
+        if !servers.is_object() {
+            bail!(
+                "{}: \"mcp.servers\" is not a JSON object; refusing to edit",
+                path.display()
+            );
+        }
+        servers
+            .as_object_mut()
+            .expect("checked is_object")
+            .insert(crate::edition::MCP_SERVER_NAME.to_string(), entry);
+    }
+
+    let backup = backup_if_exists(&path)?;
+    write_zcode_config(&path, &config)?;
+    let mut backup_files = Vec::new();
+    if let Some(backup_path) = backup {
+        backup_files.push(backup_path.display().to_string());
+    }
+    Ok((vec![path.display().to_string()], backup_files))
+}
+
+fn zcode_mcp_entry_matches() -> Result<bool> {
+    let path = zcode_cli_config_path();
+    if !path.exists() {
+        return Ok(false);
+    }
+    let config = read_zcode_config(&path)?;
+    Ok(
+        config.pointer(&zcode_servers_pointer())
+            == Some(&zcode_mcp_entry(&community_headroom_entrypoint())),
+    )
+}
+
+fn disable_zcode() -> Result<()> {
+    let path = zcode_cli_config_path();
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut config = read_zcode_config(&path)?;
+    // Only remove an entry structurally identical to what we write; a
+    // customized entry is the user's, same contract as the OpenCode base URLs.
+    if config.pointer(&zcode_servers_pointer())
+        != Some(&zcode_mcp_entry(&community_headroom_entrypoint()))
+    {
+        return Ok(());
+    }
+    if let Some(servers) = config
+        .pointer_mut("/mcp/servers")
+        .and_then(|value| value.as_object_mut())
+    {
+        servers.remove(crate::edition::MCP_SERVER_NAME);
+    }
+    // When the file now holds nothing but the empty scaffolding our first
+    // write created, remove it outright so an uninstall leaves no husk.
+    let only_our_scaffolding = config
+        .as_object()
+        .is_some_and(|object| {
+            object.len() == 1
+                && object
+                    .get("mcp")
+                    .and_then(|value| value.as_object())
+                    .is_some_and(|mcp| {
+                        mcp.len() == 1
+                            && mcp.get("servers")
+                                .and_then(|value| value.as_object())
+                                .is_some_and(|servers| servers.is_empty())
+                    })
+        });
+    if only_our_scaffolding {
+        std::fs::remove_file(&path)
+            .with_context(|| format!("removing {}", path.display()))?;
+        return Ok(());
+    }
+    let _ = backup_if_exists(&path)?;
+    write_zcode_config(&path, &config)
+}
+
+/// Rewrite only the `command` of an existing Headroom entry in ZCode's config.
+/// Mirrors [`pin_codex_mcp_command`] / [`pin_grok_mcp_command`]: it never
+/// creates the entry (a disabled connector must not be resurrected by a
+/// runtime reinstall) and never touches the user's other fields.
+pub fn repin_zcode_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
+    let path = zcode_cli_config_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let mut config: serde_json::Value = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "parsing {} failed; refusing to edit potentially valid user config",
+            path.display()
+        )
+    })?;
+    let Some(entry) = config
+        .pointer_mut(&zcode_servers_pointer())
+        .and_then(|value| value.as_object_mut())
+    else {
+        return Ok(None);
+    };
+    if entry.get("command").and_then(|value| value.as_str())
+        == Some(&entrypoint.to_string_lossy())
+    {
+        return Ok(None);
+    }
+    entry.insert(
+        "command".to_string(),
+        serde_json::Value::String(entrypoint.to_string_lossy().into_owned()),
+    );
+    let _ = backup_if_exists(&path)?;
+    write_zcode_config(&path, &config)?;
+    Ok(Some(path.display().to_string()))
+}
+
+/// Whether ZCode itself is present on this machine. Deliberately excludes
+/// `~/.zcode/cli/config.json` -- setup writes that file, so counting it would
+/// make detection self-fulfilling after an uninstall (the grok_build bug).
+fn zcode_installed_on_machine() -> bool {
+    let zcode = zcode_home();
+    if zcode.join("v2").exists() {
+        return true;
+    }
+    if let Ok(entries) = std::fs::read_dir(zcode.join("cli")) {
+        for entry in entries.flatten() {
+            if entry.file_name() != "config.json" {
+                return true;
+            }
+        }
+    }
+    find_on_path(&["zcode"]).is_some()
+}
+
+fn detect_zcode_client(configured: bool) -> ClientStatus {
+    if zcode_installed_on_machine() {
+        let detected_note = format!("Detected ZCode data in {}.", zcode_home().display());
+        return ClientStatus {
+            id: "zcode".into(),
+            name: "ZCode".into(),
+            installed: true,
+            configured,
+            health: if configured {
+                ClientHealth::Healthy
+            } else {
+                ClientHealth::Attention
+            },
+            notes: if configured {
+                vec![detected_note, "Configured by Headroom.".into()]
+            } else {
+                vec![
+                    detected_note,
+                    "Register Headroom's local MCP server in ZCode so it shares the same plugin toolset.".into(),
+                ]
+            },
+        };
+    }
+
+    ClientStatus {
+        id: "zcode".into(),
+        name: "ZCode".into(),
+        installed: false,
+        configured: false,
+        health: ClientHealth::NotDetected,
+        notes: vec!["Not detected on this machine yet.".into()],
+    }
 }
 
 fn detect_opencode_client(configured: bool) -> ClientStatus {
@@ -14268,6 +14595,233 @@ keep rtk\n\
         assert_eq!(
             health.codebase_memory,
             super::ManagedMcpRegistrationState::Missing
+        );
+    }
+
+    // ---- ZCode connector ----
+
+    /// Seed the managed entrypoint the connector requires, inside the temp
+    /// test home (TestHome pins HEADROOM_DATA_DIR there).
+    fn seed_zcode_entrypoint() -> PathBuf {
+        let entrypoint = super::community_headroom_entrypoint();
+        fs::create_dir_all(entrypoint.parent().unwrap()).expect("create venv bin dir");
+        fs::write(&entrypoint, "#!/bin/sh\n").expect("seed entrypoint");
+        entrypoint
+    }
+
+    fn read_zcode_config_json(home: &TestHome) -> serde_json::Value {
+        serde_json::from_str(
+            &fs::read_to_string(home.path().join(".zcode/cli/config.json"))
+                .expect("zcode config exists"),
+        )
+        .expect("zcode config parses")
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn zcode_apply_verify_disable_round_trip() {
+        let home = TestHome::new();
+        seed_zcode_entrypoint();
+
+        let result = super::apply_client_setup("zcode").expect("apply succeeds");
+        assert!(result.applied);
+        assert_eq!(result.client_id, "zcode");
+
+        let config = read_zcode_config_json(&home);
+        let entry = &config["mcp"]["servers"]["headroom_local_community"];
+        assert_eq!(entry["args"][0], "mcp", "entry runs the mcp subcommand");
+        assert_eq!(entry["args"][1], "serve");
+        assert!(
+            entry["command"].as_str().is_some_and(|command| !command.is_empty()),
+            "entry pins an absolute command"
+        );
+        assert_eq!(entry["env"]["HEADROOM_TELEMETRY"], "off");
+        assert!(super::zcode_mcp_entry_matches().expect("entry matches"));
+
+        // Re-apply is a no-op: the entry is already canonical.
+        let second = super::apply_client_setup("zcode").expect("second apply succeeds");
+        assert!(second.already_configured, "re-apply detects no changes");
+
+        let verification =
+            super::verify_client_setup("zcode").expect("verify succeeds");
+        assert!(
+            verification
+                .checks
+                .iter()
+                .any(|check| check.contains("~/.zcode/cli/config.json")),
+            "verification reports the config check, got: {:?}",
+            verification.checks
+        );
+        assert!(verification.verified, "verification passes: {verification:?}");
+
+        super::disable_client_setup("zcode").expect("disable succeeds");
+        assert!(
+            !home.path().join(".zcode/cli/config.json").exists(),
+            "husk file created by setup is removed on disable"
+        );
+        assert!(!super::zcode_mcp_entry_matches().expect("entry gone"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn zcode_setup_preserves_sibling_config_content() {
+        let home = TestHome::new();
+        seed_zcode_entrypoint();
+
+        let config_path = home.path().join(".zcode/cli/config.json");
+        fs::create_dir_all(config_path.parent().unwrap()).expect("create cli dir");
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&json!({
+                "mcp": {"servers": {"context7": {"command": "npx"}}},
+                "theme": "dark"
+            }))
+            .unwrap(),
+        )
+        .expect("seed user config");
+
+        super::apply_client_setup("zcode").expect("apply succeeds");
+        let config = read_zcode_config_json(&home);
+        assert_eq!(
+            config["mcp"]["servers"]["context7"]["command"], "npx",
+            "sibling MCP server survives"
+        );
+        assert_eq!(config["theme"], "dark", "sibling top-level key survives");
+        assert!(
+            config["mcp"]["servers"]["headroom_local_community"].is_object(),
+            "Headroom entry added alongside"
+        );
+
+        super::disable_client_setup("zcode").expect("disable succeeds");
+        let config = read_zcode_config_json(&home);
+        assert_eq!(
+            config["mcp"]["servers"]["context7"]["command"], "npx",
+            "sibling MCP server still present after disable"
+        );
+        assert_eq!(config["theme"], "dark");
+        assert!(
+            config["mcp"]["servers"]["headroom_local_community"].is_null(),
+            "Headroom entry removed"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn zcode_disable_leaves_customized_entry_alone() {
+        let home = TestHome::new();
+        seed_zcode_entrypoint();
+
+        super::apply_client_setup("zcode").expect("apply succeeds");
+        // The user edits the entry after enabling: disable must treat it as
+        // theirs and leave it alone (same contract as the OpenCode URLs).
+        let config_path = home.path().join(".zcode/cli/config.json");
+        let mut config: serde_json::Value = read_zcode_config_json(&home);
+        config["mcp"]["servers"]["headroom_local_community"]["env"]["HEADROOM_BEACON"] =
+            json!("1");
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap())
+            .expect("customize entry");
+
+        super::disable_client_setup("zcode").expect("disable succeeds");
+        let config = read_zcode_config_json(&home);
+        assert_eq!(
+            config["mcp"]["servers"]["headroom_local_community"]["env"]["HEADROOM_BEACON"],
+            json!("1"),
+            "customized entry is not touched"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn zcode_repins_only_existing_entry_command() {
+        let home = TestHome::new();
+        let entrypoint = seed_zcode_entrypoint();
+
+        // No config file yet: a repin must not create one (a disabled
+        // connector is not resurrected by a runtime reinstall).
+        assert!(
+            super::repin_zcode_mcp_command(&entrypoint)
+                .expect("repin on absent file")
+                .is_none(),
+            "nothing to repin"
+        );
+        assert!(!home.path().join(".zcode/cli/config.json").exists());
+
+        super::apply_client_setup("zcode").expect("apply succeeds");
+        // Same command: no write at all.
+        assert!(
+            super::repin_zcode_mcp_command(&entrypoint)
+                .expect("repin with same command")
+                .is_none()
+        );
+
+        // Relocated runtime: only the command moves; args and env stay.
+        let relocated = home.path().join("relocated/venv/bin/headroom");
+        fs::create_dir_all(relocated.parent().unwrap()).expect("create relocated bin dir");
+        fs::write(&relocated, "#!/bin/sh\n").expect("seed relocated entrypoint");
+        assert!(
+            super::repin_zcode_mcp_command(&relocated)
+                .expect("repin after move")
+                .is_some(),
+            "relocation is written"
+        );
+        let config = read_zcode_config_json(&home);
+        assert_eq!(
+            config["mcp"]["servers"]["headroom_local_community"]["command"],
+            serde_json::Value::String(relocated.to_string_lossy().into_owned()),
+            "command repinned"
+        );
+        assert_eq!(
+            config["mcp"]["servers"]["headroom_local_community"]["args"][1],
+            "serve",
+            "args untouched"
+        );
+        assert_eq!(
+            config["mcp"]["servers"]["headroom_local_community"]["env"]["HEADROOM_TELEMETRY"],
+            "off",
+            "env untouched"
+        );
+        // A backup of the pre-repin file exists, matching the pin contract.
+        let cli_dir = home.path().join(".zcode/cli");
+        let has_backup = fs::read_dir(&cli_dir)
+            .expect("list cli dir")
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains("backup"));
+        assert!(has_backup, "repin leaves a backup beside the config");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn zcode_detection_ignores_config_only_installs() {
+        let home = TestHome::new();
+        // Only the file setup itself writes: not an install (the
+        // self-fulfilling detection bug).
+        let config_path = home.path().join(".zcode/cli/config.json");
+        fs::create_dir_all(config_path.parent().unwrap()).expect("create cli dir");
+        fs::write(&config_path, "{}\n").expect("write husk config");
+        assert!(
+            !super::zcode_installed_on_machine(),
+            "config husk alone must not read as installed"
+        );
+
+        // Real desktop footprint: detected.
+        fs::create_dir_all(home.path().join(".zcode/v2")).expect("create v2 dir");
+        assert!(super::zcode_installed_on_machine());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn zcode_setup_refuses_missing_runtime_entrypoint() {
+        let _home = TestHome::new();
+        // No seeded entrypoint: setup must fail loudly instead of writing an
+        // entry that points at nothing.
+        let err = super::apply_client_setup("zcode").unwrap_err();
+        assert!(
+            format!("{err:#}").contains("entrypoint"),
+            "error names the missing entrypoint: {err:#}"
+        );
+        assert!(
+            !_home.path().join(".zcode/cli/config.json").exists(),
+            "failed setup writes no config"
         );
     }
 }
