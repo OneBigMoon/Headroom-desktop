@@ -133,6 +133,7 @@ from headroom.mcp_registry.claude import ClaudeRegistrar
 from headroom.mcp_registry.install import get_all_registrars
 
 entrypoint, proxy_url, workspace_dir, config_dir = sys.argv[1:5]
+zcode_configured = len(sys.argv) > 5 and sys.argv[5] == "zcode-configured"
 spec = ServerSpec(
     name="headroom_local_community",
     command=entrypoint,
@@ -176,7 +177,7 @@ def file_backed(registrar):
         return ClaudeRegistrar(claude_cli=None)
     return None
 
-attempted = 0
+attempted = 1 if zcode_configured else 0
 skipped = []
 failures = []
 for registrar in get_all_registrars():
@@ -6827,6 +6828,13 @@ impl ToolManager {
                 .to_string_lossy()
                 .into_owned();
             let config_arg = crate::edition::config_dir().to_string_lossy().into_owned();
+            // Rust owns the ZCode entry; the Python registry has no ZCode
+            // registrar. Count an existing valid entry when it is the only client.
+            if let Err(err) = crate::client_adapters::repin_zcode_mcp_command(&entrypoint) {
+                log::warn!("ZCode MCP repin skipped: {err:#}");
+            }
+            let zcode_configured = crate::client_adapters::is_zcode_enabled()
+                && crate::client_adapters::zcode_mcp_entry_matches().unwrap_or(false);
             self.run_mcp_helper(&[
                 "-c",
                 COMMUNITY_MCP_INSTALL_HELPER,
@@ -6834,15 +6842,12 @@ impl ToolManager {
                 HEADROOM_PROXY_URL,
                 &workspace_arg,
                 &config_arg,
+                if zcode_configured { "zcode-configured" } else { "" },
             ])
             .context("registering isolated Community MCP server")?;
 
             let _ = crate::client_adapters::pin_codex_mcp_command(&entrypoint);
             let _ = crate::client_adapters::pin_grok_mcp_command(&entrypoint);
-            // ZCode has no registrar in headroom.mcp_registry; its connector
-            // owns the entry from Rust. Repin-only, so a disabled connector is
-            // never resurrected by a runtime reinstall.
-            let _ = crate::client_adapters::repin_zcode_mcp_command(&entrypoint);
             return Ok(McpInstallMethod::CommunityRegistry);
         }
 
@@ -13654,8 +13659,8 @@ fn github_api_client() -> Result<reqwest::blocking::Client> {
 /// Everything here is best-effort: a token is an optimization, so a missing,
 /// logged-out, or slow `gh` means "no token" rather than a failed update.
 fn github_api_token() -> Option<String> {
-    static TOKEN: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    TOKEN.get_or_init(github_api_token_uncached).clone()
+    // Re-read on retry so logging in does not require restarting Headroom.
+    github_api_token_uncached()
 }
 
 fn github_api_token_uncached() -> Option<String> {
@@ -13668,7 +13673,7 @@ fn github_api_token_uncached() -> Option<String> {
             }
         }
     }
-    let gh = crate::claude_cli::probe_on_path("gh")?;
+    let gh = crate::claude_cli::detect_gh_cli()?;
     let mut command = crate::proc::command(&gh);
     command
         .args(["auth", "token"])
@@ -19179,6 +19184,20 @@ except SystemExit as exc:
     assert "config is not valid JSON" in str(exc), str(exc)
 else:
     raise AssertionError("a failed file fallback must not be reported as success")
+
+# ZCode is registered by Rust rather than the Python registry. An explicitly
+# verified ZCode entry is sufficient on a machine with no other agents.
+REGISTRARS[:] = []
+sys.argv.append("zcode-configured")
+run()
+assert STATE["calls"] == []
+sys.argv.pop()
+try:
+    run()
+except SystemExit as exc:
+    assert "no supported MCP clients" in str(exc), str(exc)
+else:
+    raise AssertionError("an absent ZCode entry cannot count as configured")
 print("ok")
 "#
         );

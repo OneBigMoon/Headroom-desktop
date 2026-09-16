@@ -147,6 +147,16 @@ describe("launcher helpers", () => {
     ]);
   });
 
+  it("checks MCP configuration without waiting for model proxy traffic", () => {
+    const zcode = { clientId: "zcode", name: "ZCode", installed: true, enabled: true, verified: true };
+    const codex = { clientId: "codex", name: "Codex", installed: true, enabled: true, verified: true };
+    expect(buildInitialProxyVerificationRows([zcode])[0].state).toBe("verified");
+    expect(buildInitialProxyVerificationRows([{ ...zcode, verified: false }])[0].state).toBe("waiting");
+    const mixed = buildInitialProxyVerificationRows([zcode, codex]);
+    expect(mixed.find((row) => row.clientId === "codex")?.state).toBe("processing");
+    expect(mixed.find((row) => row.clientId === "zcode")?.state).toBe("verified");
+  });
+
   describe("magicLinkScreenCopy", () => {
     it("names the account while verifying", () => {
       expect(magicLinkScreenCopy("verifying", "a@b.com", null).body).toContain("a@b.com");

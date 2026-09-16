@@ -194,25 +194,40 @@ fn rtk_codex_agents_path() -> PathBuf {
     codex_home().join("AGENTS.md")
 }
 
+/// Template catalog shared by installation and instruction audit. Only existing
+/// managed blocks are eligible for refresh; auditing never enables an addon.
+pub(crate) fn instruction_targets() -> Vec<(String, PathBuf, Vec<(String, String)>)> {
+    let converter = default_headroom_root_dir().join("bin").join(if cfg!(windows) {
+        "markitdown.cmd"
+    } else {
+        "markitdown"
+    });
+    vec![
+        ("codex".into(), rtk_codex_agents_path(), vec![
+            ("rtk".into(), build_rtk_codex_nudge(&default_headroom_rtk_path())),
+            ("markitdown".into(), build_markitdown_codex_nudge(&converter)),
+            ("serena".into(), build_serena_usage_nudge().into()),
+        ]),
+        ("claude".into(), markitdown_claude_md_path(), vec![
+            ("markitdown_office".into(), build_markitdown_office_nudge(&converter)),
+            ("serena".into(), build_serena_usage_nudge().into()),
+        ]),
+    ]
+}
+
 /// Codex nudge: Codex has no command-rewrite hook, so it routes shell commands
 /// through the managed `rtk` binary by being told to prefix them with it.
 fn build_rtk_codex_nudge(managed_rtk_path: &Path) -> String {
-    let bin = managed_rtk_path.display();
+    let bin = format!("\"{}\"", shell_double_quote(&managed_rtk_path.to_string_lossy()));
     format!(
         "## Token-saving shell commands (Headroom RTK)\n\
          Follow the system/developer/user instructions and the active project's\n\
          `AGENTS.md`, `CLAUDE.md`, and skills first; this note only fills gaps.\n\
-         Run shell commands through RTK to get compact, token-optimized output:\n\
-         prefix every command segment with `{bin} `, including each segment in\n\
-         a chain (for example `{bin} git status`, `{bin} git diff && {bin} git\n\
-         status`),\n\
-         `{bin} ls -la`, `{bin} cargo build`). RTK compacts output, so do NOT\n\
-         use it when you need verbatim text: reading or grepping code you are\n\
-         about to edit or patch (RTK grep strips indentation and truncates long\n\
-         lines), `git diff --check` (RTK drops its whitespace report), or when\n\
-         debugging requires the raw command. Run those raw. Everything else\n\
-         (status, logs, builds, tests, listings) is safe to prefix while the\n\
-         managed RTK binary is available."
+         When the managed RTK binary is available, use it for compact status, build and test output.\n\
+         Prefix each applicable command segment, for example `{bin} git status`.\n\
+         Use raw commands when you need verbatim code, complete diagnostics, machine-readable output,\n\
+         or `git diff --check` whitespace reports. Compression can omit relevant details.\n\
+         If RTK is unavailable or fails, report the issue and use the raw command."
     )
 }
 
@@ -591,6 +606,8 @@ fn apply_client_setup_once(client_id: &str, allow_takeover: bool) -> Result<Clie
     let already_configured = changed_files.is_empty();
     let summary = if already_configured {
         "Client was already configured for Headroom.".to_string()
+    } else if normalized_setup_id(client_id) == "zcode" {
+        "Headroom MCP tools are configured in ZCode.".to_string()
     } else {
         "Client configuration updated to route through Headroom.".to_string()
     };
@@ -604,7 +621,9 @@ fn apply_client_setup_once(client_id: &str, allow_takeover: bool) -> Result<Clie
         summary,
         changed_files,
         backup_files,
-        next_steps: {
+        next_steps: if normalized_setup_id(client_id) == "zcode" {
+            vec!["Restart ZCode and check that the Headroom MCP tools are available.".into()]
+        } else {
             let mut steps = Vec::new();
             if shell_unwritable {
                 steps.push(
@@ -1764,6 +1783,7 @@ pub fn perform_full_cleanup() -> Vec<String> {
 /// `.headroom-local-community-backup-*` sibling to sweep.
 fn managed_backup_targets() -> Vec<PathBuf> {
     let mut targets: Vec<PathBuf> = claude_settings_candidates();
+    targets.push(zcode_cli_config_path());
     targets.push(home_dir().join(".claude.json"));
     targets.push(headroom_rtk_hook_path());
     targets.push(headroom_markitdown_hook_path());
@@ -2026,6 +2046,35 @@ fn strip_headroom_mcp_from_toml_file(path: &Path) -> Result<Option<String>> {
     Ok(Some(path.display().to_string()))
 }
 
+/// Strip ZCode servers that launch from the runtime being uninstalled.
+fn strip_headroom_mcp_from_zcode() -> Result<Option<String>> {
+    let path = zcode_cli_config_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut config = read_zcode_config(&path)?;
+    let Some(servers) = config.pointer_mut("/mcp/servers") else {
+        return Ok(None);
+    };
+    let servers = servers
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("{}.mcp.servers is not an object", path.display()))?;
+    let original_len = servers.len();
+    // Full uninstall must remove even customized entries that launch a
+    // runtime we are deleting, while keeping independently managed servers.
+    servers.retain(|_, entry| {
+        !entry.get("command")
+            .and_then(Value::as_str)
+            .is_some_and(mcp_command_in_headroom_footprint)
+    });
+    if servers.len() == original_len {
+        return Ok(None);
+    }
+    backup_if_exists(&path)?;
+    write_zcode_config(&path, &config)?;
+    Ok(Some(path.display().to_string()))
+}
+
 /// Strip Headroom-registered MCP servers from every client config. Runs even
 /// when the Python unregister helpers in uninstall_and_quit already succeeded
 /// (then it's a no-op) so a broken runtime can't leave dead entries behind.
@@ -2043,6 +2092,7 @@ fn remove_headroom_mcp_entries() -> Result<Vec<String>> {
             strip_headroom_mcp_from_toml_file(&grok_config_toml_path()),
         ),
         ("OpenCode", strip_headroom_mcp_from_opencode()),
+        ("ZCode", strip_headroom_mcp_from_zcode()),
     ] {
         match result {
             Ok(Some(path)) => removed.push(path),
@@ -2729,26 +2779,30 @@ fn markitdown_codex_agents_path() -> PathBuf {
 /// Office-only nudge for Claude Code, where PDFs are already handled by the
 /// PreToolUse(Read) hook.
 fn build_markitdown_office_nudge(shim_path: &Path) -> String {
-    let bin = shim_path.display();
+    let bin = format!("\"{}\"", shell_double_quote(&shim_path.to_string_lossy()));
     format!(
         "## Reading Office documents (Headroom MarkItDown)\n\
          Advisory only: follow system/developer/user instructions and active project instructions first.\n\
-         The Read tool cannot open .docx, .doc, .pptx, .ppt, .xlsx, or .xls files.\n\
-         To read one, run `{bin} <path>` via Bash and use the Markdown it prints.\n\
-         (PDFs are handled automatically and need no special step.)"
+         When the converter is available, extract Office (.docx, .doc, .pptx, .ppt, .xlsx, .xls) text with\n\
+         `{bin} \"<path>\"` via the shell. PDFs may also be handled by the installed Read hook.\n\
+         For layout, images, spreadsheet formulas or visual verification, use the relevant\n\
+         document skill and rendering tools; Markdown extraction alone is insufficient.\n\
+         If conversion fails, report it and use an available reader; do not claim unread content was checked."
     )
 }
 
 /// Codex nudge: Codex has no PreToolUse-style hook, so it covers PDF *and*
 /// Office formats through the `markitdown` CLI.
 fn build_markitdown_codex_nudge(shim_path: &Path) -> String {
-    let bin = shim_path.display();
+    let bin = format!("\"{}\"", shell_double_quote(&shim_path.to_string_lossy()));
     format!(
         "## Reading documents (Headroom MarkItDown)\n\
          Advisory only: follow system/developer/user instructions and active project instructions first.\n\
-         To read a .pdf, .docx, .doc, .pptx, .ppt, .xlsx, or .xls file, run\n\
-         `{bin} <path>` in the shell and use the Markdown it prints, rather than\n\
-         opening the raw file. This keeps large documents cheap to read."
+         When the converter is available, extract text from PDF (.pdf) or Office (.docx, .doc, .pptx, .ppt, .xlsx, .xls) files with\n\
+         `{bin} \"<path>\"` in the shell.\n\
+         For layout, images, spreadsheet formulas or visual verification, use the relevant\n\
+         document skill and rendering tools; Markdown extraction alone is insufficient.\n\
+         If conversion fails, report it and use an available reader; do not claim unread content was checked."
     )
 }
 
@@ -5197,9 +5251,8 @@ fn community_headroom_entrypoint() -> PathBuf {
         .join(binary)
 }
 
-/// Insert or replace Headroom's MCP entry in ZCode's user config. An
-/// identical entry is a no-op so re-running setup stays idempotent; any other
-/// shape of the same file survives untouched around the one key we own.
+/// Insert Headroom's MCP entry without overwriting a customized entry.
+/// An identical entry is a no-op so re-running setup stays idempotent.
 fn configure_zcode_mcp_entry() -> Result<(Vec<String>, Vec<String>)> {
     let entrypoint = community_headroom_entrypoint();
     if !entrypoint.exists() {
@@ -5213,6 +5266,28 @@ fn configure_zcode_mcp_entry() -> Result<(Vec<String>, Vec<String>)> {
     let entry = zcode_mcp_entry(&entrypoint);
     if config.pointer(&zcode_servers_pointer()) == Some(&entry) {
         return Ok((Vec::new(), Vec::new()));
+    }
+    if config.pointer(&zcode_servers_pointer()).is_some() {
+        bail!(
+            "{} contains a customized Headroom MCP entry; refusing to overwrite it.",
+            path.display()
+        );
+    }
+    // ZCode skips the entire user-level .agents fallback once a native
+    // server exists. Do not silently disable the user's existing tools.
+    if config.pointer("/mcp/servers").and_then(Value::as_object)
+        .is_none_or(|servers| servers.is_empty())
+    {
+        let fallback_path = home_dir().join(".agents/mcp.json");
+        let fallback = read_zcode_config(&fallback_path)?;
+        if fallback.get("mcpServers").is_some_and(|servers| {
+            servers.as_object().is_none_or(|servers| !servers.is_empty())
+        }) {
+            bail!(
+                "ZCode currently uses {}. Import those MCP servers into ZCode Settings > MCP Servers before connecting Headroom, so they remain available.",
+                fallback_path.display()
+            );
+        }
     }
 
     {
@@ -5253,7 +5328,7 @@ fn configure_zcode_mcp_entry() -> Result<(Vec<String>, Vec<String>)> {
     Ok((vec![path.display().to_string()], backup_files))
 }
 
-fn zcode_mcp_entry_matches() -> Result<bool> {
+pub(crate) fn zcode_mcp_entry_matches() -> Result<bool> {
     let path = zcode_cli_config_path();
     if !path.exists() {
         return Ok(false);
@@ -5329,6 +5404,12 @@ pub fn repin_zcode_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
             path.display()
         )
     })?;
+    // Use the same ownership check as disable: user edits are not ours to repin.
+    if config.pointer(&zcode_servers_pointer())
+        != Some(&zcode_mcp_entry(&community_headroom_entrypoint()))
+    {
+        return Ok(None);
+    }
     let Some(entry) = config
         .pointer_mut(&zcode_servers_pointer())
         .and_then(|value| value.as_object_mut())
@@ -5359,7 +5440,11 @@ fn zcode_installed_on_machine() -> bool {
     }
     if let Ok(entries) = std::fs::read_dir(zcode.join("cli")) {
         for entry in entries.flatten() {
-            if entry.file_name() != "config.json" {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name != "config.json"
+                && !name.starts_with("config.json.headroom-local-community-backup-")
+            {
                 return true;
             }
         }
@@ -8167,7 +8252,17 @@ fn codex_candidate_paths() -> Vec<PathBuf> {
 
     candidates.extend(binary_candidates_in_dirs(&user_bin_dirs, &binary_names));
     candidates.extend(nvm_binary_candidates(&home, &binary_names));
+    #[cfg(target_os = "macos")]
+    candidates.extend(codex_app_candidates(&home));
     dedupe_paths(candidates)
+}
+
+#[cfg(target_os = "macos")]
+fn codex_app_candidates(home: &Path) -> Vec<PathBuf> {
+    [PathBuf::from("/Applications"), home.join("Applications")]
+        .into_iter()
+        .flat_map(|root| ["Codex.app", "ChatGPT.app"].map(|app| root.join(app).join("Contents/Resources/codex")))
+        .collect()
 }
 
 fn codex_user_state_exists() -> bool {
@@ -8181,10 +8276,9 @@ fn codex_user_state_exists() -> bool {
 /// install locations first, then a PATH lookup. Used as the Headroom Learn
 /// analysis backend (`codex exec`) for Codex sessions.
 pub(crate) fn detect_codex_cli() -> Option<PathBuf> {
-    codex_candidate_paths()
-        .into_iter()
-        .find(|path| path.exists())
-        .or_else(|| find_on_path(&["codex"]))
+    crate::claude_cli::first_runnable(codex_candidate_paths().into_iter())
+        .or_else(|| crate::claude_cli::probe_on_path("codex"))
+        .or_else(|| crate::claude_cli::probe_via_login_shell("codex"))
 }
 
 /// True once the user has signed in to Codex with their ChatGPT account — the
@@ -8275,6 +8369,35 @@ fn windows_path_extensions() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codex_bundle_candidates_cover_system_and_user_applications() {
+        let home = std::path::Path::new("/Users/example");
+        let candidates = super::codex_app_candidates(home);
+        for path in [
+            "/Applications/Codex.app/Contents/Resources/codex",
+            "/Applications/ChatGPT.app/Contents/Resources/codex",
+            "/Users/example/Applications/Codex.app/Contents/Resources/codex",
+            "/Users/example/Applications/ChatGPT.app/Contents/Resources/codex",
+        ] {
+            assert!(candidates.contains(&std::path::PathBuf::from(path)));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bundled_codex_is_resolved_without_shell_path_and_invalid_files_are_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Applications/ChatGPT.app/Contents/Resources/codex");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "#!/bin/sh\n[ \"$1\" = --version ]\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invalid = root.path().join("codex");
+        std::fs::write(&invalid, "not an executable").unwrap();
+        let candidates = vec![invalid, path.clone()];
+        assert_eq!(crate::claude_cli::first_runnable(candidates.into_iter()), Some(path));
+    }
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -8765,15 +8888,15 @@ mod tests {
     #[test]
     fn markitdown_office_nudge_points_at_the_shim_and_skips_pdf() {
         let nudge = build_markitdown_office_nudge(Path::new("/h/bin/markitdown"));
-        assert!(nudge.contains("/h/bin/markitdown <path>"));
+        assert!(nudge.contains("\"/h/bin/markitdown\" \"<path>\""));
         assert!(nudge.contains(".docx"));
-        assert!(nudge.contains("PDFs are handled automatically"));
+        assert!(nudge.contains("PDFs may also be handled by the installed Read hook"));
     }
 
     #[test]
     fn markitdown_codex_nudge_covers_pdf_and_office() {
         let nudge = build_markitdown_codex_nudge(Path::new("/h/bin/markitdown"));
-        assert!(nudge.contains("/h/bin/markitdown <path>"));
+        assert!(nudge.contains("\"/h/bin/markitdown\" \"<path>\""));
         // Codex has no hook, so PDF is covered by the CLI nudge too.
         assert!(nudge.contains(".pdf"));
         assert!(nudge.contains(".docx"));
@@ -10845,6 +10968,51 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
             !after.contains("Headroom RTK"),
             "nudge removed on disable: {after}"
         );
+    }
+
+    #[test]
+    fn instruction_templates_preserve_raw_and_visual_workflows() {
+        let binary = Path::new("/tmp/Headroom Tools/rtk");
+        let rtk = super::build_rtk_codex_nudge(binary);
+        assert!(rtk.contains("\"/tmp/Headroom Tools/rtk\""), "quote executable paths");
+        assert!(rtk.contains("git diff --check"));
+        assert!(rtk.contains("raw"));
+        for body in [
+            super::build_markitdown_codex_nudge(binary),
+            super::build_markitdown_office_nudge(binary),
+        ] {
+            assert!(body.contains("layout"), "text extraction must not replace layout verification");
+            assert!(body.contains("available"), "do not assume the converter is available");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn instruction_templates_round_trip_without_changing_user_rules() {
+        let home = TestHome::new();
+        let binary = Path::new("/tmp/Headroom Tools/tool");
+        let templates = [
+            ("rtk", super::build_rtk_codex_nudge(binary)),
+            ("markitdown", super::build_markitdown_codex_nudge(binary)),
+            ("markitdown_office", super::build_markitdown_office_nudge(binary)),
+            ("serena", super::build_serena_usage_nudge().to_string()),
+        ];
+        for (id, body) in templates {
+            let path = home.path().join(format!("{id}.md"));
+            let original = "# User rules\n\n保留用户规则。\n";
+            fs::write(&path, original).unwrap();
+            let (changed, backup) = super::upsert_managed_block(&path, id, &body).unwrap();
+            assert!(changed);
+            assert_eq!(fs::read_to_string(backup.unwrap()).unwrap(), original);
+            let installed = fs::read(&path).unwrap();
+            let repeated = super::upsert_managed_block(&path, id, &body).unwrap();
+            assert!(!repeated.0);
+            assert!(repeated.1.is_none());
+            assert_eq!(fs::read(&path).unwrap(), installed);
+            assert!(super::remove_managed_block(&path, id).unwrap());
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+            assert!(!super::remove_managed_block(&path, id).unwrap());
+        }
     }
 
     #[test]
@@ -14626,6 +14794,10 @@ keep rtk\n\
         let result = super::apply_client_setup("zcode").expect("apply succeeds");
         assert!(result.applied);
         assert_eq!(result.client_id, "zcode");
+        assert_eq!(result.summary, "Headroom MCP tools are configured in ZCode.");
+        assert_eq!(result.next_steps, vec![
+            "Restart ZCode and check that the Headroom MCP tools are available."
+        ]);
 
         let config = read_zcode_config_json(&home);
         let entry = &config["mcp"]["servers"]["headroom_local_community"];
@@ -14798,6 +14970,7 @@ keep rtk\n\
         let config_path = home.path().join(".zcode/cli/config.json");
         fs::create_dir_all(config_path.parent().unwrap()).expect("create cli dir");
         fs::write(&config_path, "{}\n").expect("write husk config");
+        super::backup_if_exists(&config_path).expect("back up config");
         assert!(
             !super::zcode_installed_on_machine(),
             "config husk alone must not read as installed"
@@ -14806,6 +14979,73 @@ keep rtk\n\
         // Real desktop footprint: detected.
         fs::create_dir_all(home.path().join(".zcode/v2")).expect("create v2 dir");
         assert!(super::zcode_installed_on_machine());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn zcode_setup_and_repin_preserve_customized_entry() {
+        let home = TestHome::new();
+        seed_zcode_entrypoint();
+        super::apply_client_setup("zcode").expect("apply succeeds");
+        let path = super::zcode_cli_config_path();
+        let mut config = read_zcode_config_json(&home);
+        config["mcp"]["servers"]["headroom_local_community"]["command"] = json!("custom-wrapper");
+        let original = serde_json::to_string_pretty(&config).unwrap();
+        fs::write(&path, &original).unwrap();
+
+        assert!(super::apply_client_setup("zcode").is_err());
+        assert!(super::repin_zcode_mcp_command(&home.path().join("new/headroom"))
+            .unwrap().is_none());
+        assert_eq!(fs::read_to_string(path).unwrap(), original);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn zcode_backups_are_included_in_uninstall_cleanup() {
+        let _home = TestHome::new();
+        assert!(super::managed_backup_targets().contains(&super::zcode_cli_config_path()));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn zcode_setup_does_not_shadow_agents_fallback() {
+        let home = TestHome::new();
+        seed_zcode_entrypoint();
+        let fallback = home.path().join(".agents/mcp.json");
+        fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+        let original = r#"{"mcpServers":{"memory":{"command":"user-memory"}}}"#;
+        fs::write(&fallback, original).unwrap();
+        let error = super::apply_client_setup("zcode").unwrap_err();
+        assert!(error.to_string().contains("Import those MCP servers"));
+        assert!(!super::zcode_cli_config_path().exists());
+        assert_eq!(fs::read_to_string(&fallback).unwrap(), original);
+
+        // Once the native config already has servers, the fallback is
+        // already inactive and adding Headroom changes no existing tools.
+        let native = super::zcode_cli_config_path();
+        fs::create_dir_all(native.parent().unwrap()).unwrap();
+        fs::write(&native, r#"{"mcp":{"servers":{"memory":{"command":"user-memory"}}}}"#).unwrap();
+        super::apply_client_setup("zcode").unwrap();
+        assert_eq!(read_zcode_config_json(&home)["mcp"]["servers"]["memory"]["command"], "user-memory");
+        assert_eq!(fs::read_to_string(fallback).unwrap(), original);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn zcode_uninstall_removes_dead_runtime_entries_but_preserves_other_servers() {
+        let home = TestHome::new();
+        seed_zcode_entrypoint();
+        super::apply_client_setup("zcode").unwrap();
+        let path = super::zcode_cli_config_path();
+        let mut config = read_zcode_config_json(&home);
+        config["mcp"]["servers"]["headroom_local_community"]["env"]["CUSTOM"] = json!("yes");
+        config["mcp"]["servers"]["other"] = json!({"command": "user-server"});
+        fs::write(&path, serde_json::to_string(&config).unwrap()).unwrap();
+        super::remove_headroom_mcp_entries().unwrap();
+        let cleaned = read_zcode_config_json(&home);
+        assert!(cleaned["mcp"]["servers"]["headroom_local_community"].is_null());
+        assert_eq!(cleaned["mcp"]["servers"]["other"], config["mcp"]["servers"]["other"]);
+        assert!(super::strip_headroom_mcp_from_zcode().unwrap().is_none());
     }
 
     #[test]

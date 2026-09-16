@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Translate } from "./i18n";
 import {
   aggregateClientConnectors,
+  overviewClientConnectors,
   baseUrlTakeoverNotice,
   buildHourlySavingsChartData,
   buildHourlySavingsWindow,
@@ -17,6 +18,7 @@ import {
   connectorLabel,
   localizeAddonSavingsLabel,
   connectorStatusLine,
+  connectorVerificationPhase,
   shouldAutoRestartCodex,
   clientSetupNotice,
   currency,
@@ -37,6 +39,16 @@ import {
   shouldShowConnectorDetectionWarning,
   sortClientConnectors
 } from "./dashboardHelpers";
+
+it("verifies MCP-only setup independently from proxy traffic", () => {
+  const zcode = { clientId: "zcode", name: "ZCode", installed: true, enabled: true, verified: true };
+  const codex = { clientId: "codex", name: "Codex", installed: true, enabled: true, verified: true };
+  expect(connectorVerificationPhase([], false)).toBe("disabled");
+  expect(connectorVerificationPhase([zcode], false)).toBe("healthy");
+  expect(connectorVerificationPhase([{ ...zcode, verified: false }], true)).toBe("verifying");
+  expect(connectorVerificationPhase([zcode, codex], false)).toBe("verifying");
+  expect(connectorVerificationPhase([zcode, codex], true)).toBe("healthy");
+});
 import type {
   ClientConnectorStatus,
   ClientSetupResult,
@@ -45,6 +57,23 @@ import type {
 } from "./types";
 
 describe("dashboard helpers", () => {
+  it("keeps all five integrations in overview when Grok is not installed", () => {
+    const connectors = ["claude_code", "codex", "opencode", "zcode", "grok_build"].map(clientId => ({
+      clientId, name: clientId, installed: clientId !== "grok_build",
+      enabled: clientId === "codex", verified: clientId === "codex"
+    }));
+    const visible = overviewClientConnectors([...connectors, {
+      clientId: "unsupported", name: "Other", installed: true, enabled: true, verified: true
+    }]);
+    expect(visible).toHaveLength(5);
+    expect(visible.map(c => c.clientId)).toContain("grok_build");
+    expect(connectorDashboardStatus(visible.find(c => c.clientId === "grok_build")!))
+      .toEqual({ label: "Not installed", tone: "off" });
+    expect(connectorDashboardStatus(visible.find(c => c.clientId === "zcode")!))
+      .toEqual({ label: "Off", tone: "off" });
+    expect(connectorDashboardStatus(visible.find(c => c.clientId === "codex")!))
+      .toEqual({ label: "Active", tone: "active" });
+  });
   afterEach(() => {
     vi.useRealTimers();
   });

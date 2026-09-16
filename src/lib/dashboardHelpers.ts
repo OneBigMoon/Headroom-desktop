@@ -601,6 +601,10 @@ const SUPPORTED_CONNECTOR_IDS = new Set([
   "zcode"
 ]);
 
+export function connectorUsesProxy(clientId: string): boolean {
+  return SUPPORTED_CONNECTOR_IDS.has(clientId) && clientId !== "zcode";
+}
+
 export function baseUrlTakeoverNotice(replaced: string): string {
   return `This client was routed through ${replaced}. Headroom now handles routing while enabled and restores this address when you disable the connector.`;
 }
@@ -743,6 +747,11 @@ export function sortClientConnectors(connectors: ClientConnectorStatus[]) {
   });
 }
 
+// Overview lists supported integrations even before the client is installed.
+export function overviewClientConnectors(connectors: ClientConnectorStatus[]) {
+  return sortClientConnectors(aggregateClientConnectors(connectors));
+}
+
 export function getEnabledSupportedConnectors(
   connectors: ClientConnectorStatus[]
 ) {
@@ -753,6 +762,18 @@ export function getEnabledSupportedConnectors(
 
 export function hasEnabledConnector(connectors: ClientConnectorStatus[]) {
   return getEnabledSupportedConnectors(connectors).length > 0;
+}
+
+export function connectorVerificationPhase(
+  connectors: ClientConnectorStatus[],
+  trafficVerified: boolean
+): "disabled" | "verifying" | "healthy" {
+  const enabled = getEnabledSupportedConnectors(connectors);
+  if (enabled.length === 0) return "disabled";
+  const verified = enabled.some((connector) => connectorUsesProxy(connector.clientId))
+    ? trafficVerified
+    : enabled.every((connector) => connector.installed && connector.verified);
+  return verified ? "healthy" : "verifying";
 }
 
 export type ConnectorDashboardTone = "active" | "pending" | "idle" | "off";

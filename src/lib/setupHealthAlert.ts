@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { needsTermsAcceptance } from "./launcherHelpers";
-import { formatDayKey } from "./dashboardHelpers";
+import { connectorUsesProxy, formatDayKey } from "./dashboardHelpers";
 import type { Translate } from "./i18n";
 import type { ClientConnectorStatus, DashboardState } from "./types";
 
@@ -112,6 +112,7 @@ function hasUnverifiedConnector(connectors: ClientConnectorStatus[] | undefined)
     (connector) =>
       connector.installed &&
       connector.enabled &&
+      connectorUsesProxy(connector.clientId) &&
       !connector.verified &&
       !connector.verification?.foreignProvider
   );
@@ -199,6 +200,13 @@ export function setupStallBannerLine(
 ): string | null {
   if (context.forceKind) {
     return stallBannerBody(context.forceKind);
+  }
+  // MCP tools do not route model requests through the proxy.
+  if (
+    context.connectors?.some((connector) => connector.enabled && connector.clientId === "zcode") &&
+    !context.connectors.some((connector) => connector.enabled && connectorUsesProxy(connector.clientId))
+  ) {
+    return null;
   }
   // A first run is allowed to be quiet: the user may simply not have opened a
   // terminal yet, and the install flow has its own progress UI.

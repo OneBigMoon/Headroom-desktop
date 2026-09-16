@@ -13,7 +13,7 @@ pub fn detect_claude_cli() -> Option<PathBuf> {
 }
 
 pub fn detect_codex_cli() -> Option<PathBuf> {
-    detect_cli("codex")
+    crate::client_adapters::detect_codex_cli()
 }
 
 pub fn detect_npx() -> Option<PathBuf> {
@@ -24,6 +24,10 @@ pub fn detect_npx() -> Option<PathBuf> {
 /// The desktop process does not necessarily inherit the user's interactive PATH.
 pub fn detect_npm_cli() -> Option<PathBuf> {
     detect_cli("npm")
+}
+
+pub(crate) fn detect_gh_cli() -> Option<PathBuf> {
+    detect_cli("gh")
 }
 
 fn detect_cli(name: &str) -> Option<PathBuf> {
@@ -86,13 +90,13 @@ fn known_path_candidates_for_platform(home: PathBuf, name: &str, windows: bool) 
     candidates
 }
 
-fn first_runnable<I: Iterator<Item = PathBuf>>(candidates: I) -> Option<PathBuf> {
+pub(crate) fn first_runnable<I: Iterator<Item = PathBuf>>(candidates: I) -> Option<PathBuf> {
     candidates
         .into_iter()
         .find(|candidate| is_runnable(candidate))
 }
 
-fn probe_via_login_shell(name: &str) -> Option<PathBuf> {
+pub(crate) fn probe_via_login_shell(name: &str) -> Option<PathBuf> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     let shell_name = Path::new(&shell)
         .file_name()
@@ -286,6 +290,26 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::time::Instant;
+
+    #[test]
+    fn github_cli_candidates_cover_gui_homebrew_installations() {
+        let paths = known_path_candidates_for_platform(PathBuf::from("/Users/test"), "gh", false);
+        assert!(paths.contains(&PathBuf::from("/opt/homebrew/bin/gh")));
+        assert!(paths.contains(&PathBuf::from("/usr/local/bin/gh")));
+        assert!(paths.contains(&PathBuf::from("/Users/test/.local/bin/gh")));
+    }
+
+    #[test]
+    #[ignore = "reads installed desktop CLI binaries"]
+    fn desktop_cli_resolution_live() {
+        let learn = crate::client_adapters::detect_codex_cli().expect("Learn Codex CLI");
+        let plugins = detect_codex_cli().expect("plugin Codex CLI");
+        assert_eq!(learn, plugins);
+        assert!(is_runnable(&learn));
+        let gh = detect_gh_cli().expect("GitHub CLI");
+        assert!(is_runnable(&gh));
+        eprintln!("Learn/plugins Codex: {}; GitHub: {}", learn.display(), gh.display());
+    }
 
     struct ScopedTempDir(PathBuf);
     impl ScopedTempDir {

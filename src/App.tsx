@@ -1,3 +1,4 @@
+import { InstructionGovernance } from "./components/InstructionGovernance";
 import {
   useEffect,
   useRef,
@@ -128,6 +129,7 @@ import {
 } from "./lib/bootstrapSentry";
 import {
   aggregateClientConnectors,
+  overviewClientConnectors,
   addDays,
   addMonths,
   buildHourlySavingsChartData,
@@ -143,6 +145,8 @@ import {
   connectorLabel,
   connectorDashboardStatus,
   connectorStatusLine,
+  connectorUsesProxy,
+  connectorVerificationPhase,
   currency,
   currencyExact,
   dayOfMonthTickFormatter,
@@ -154,7 +158,6 @@ import {
   formatMonthLabel,
   formatSelectedDayLabel,
   getEnabledSupportedConnectors,
-  hasEnabledConnector,
   hasNeverScanned,
   localizeAddonSavingsLabel,
   hourOfDayTickFormatter,
@@ -421,6 +424,8 @@ function localizeUiText(t: Translate, value: string): string {
   const exact: Record<string, TranslationKey> = {
     "Client was already configured for Headroom.": "connections.setup.alreadyConfigured",
     "Client configuration updated to route through Headroom.": "connections.setup.updated",
+    "Headroom MCP tools are configured in ZCode.": "connections.setup.zcodeConfigured",
+    "Restart ZCode and check that the Headroom MCP tools are available.": "connections.setup.zcodeRestart",
     "Your shell profile (e.g. ~/.zshrc) couldn't be updated - it isn't writable, or it isn't valid UTF-8 text. Core routing still works via the client's own config; to launch the client from a terminal, fix the file and re-run setup, or add the export manually.": "connections.setup.shellProfileUnwritable",
     "Restart your terminal/editor session to pick up environment changes.": "connections.setup.restartSession",
     "After first setup, quit and reopen any Codex desktop, CLI, or IDE session once to load the stable route; later Headroom pauses or crashes do not require a Codex restart.": "connections.setup.reopenCodex",
@@ -2054,6 +2059,7 @@ export default function App() {
   const [connectorsError, setConnectorsError] = useState<string | null>(null);
   const [connectorsNotice, setConnectorsNotice] = useState<string | null>(null);
   const [proxyVerificationRows, setProxyVerificationRows] = useState<ProxyVerificationRow[]>([]);
+  const hasProxyVerificationRows = proxyVerificationRows.some((row) => connectorUsesProxy(row.clientId));
   const [proxyVerificationHint, setProxyVerificationHint] = useState<
     { text: string; tone: "info" | "error" } | null
   >(null);
@@ -2811,7 +2817,7 @@ export default function App() {
   }, [windowLabel, launcherStage, pricingStatus?.account?.subscriptionActive]);
 
   useEffect(() => {
-    if (windowLabel !== "launcher" || launcherStage !== "proxy_verify") {
+    if (windowLabel !== "launcher" || launcherStage !== "proxy_verify" || !hasProxyVerificationRows) {
       return;
     }
 
@@ -2870,7 +2876,7 @@ export default function App() {
           const anchor = proxyVerificationRequestAnchorRef.current;
           setProxyVerificationRows((current) =>
             current.map((row) => {
-              if (row.state === "verified") {
+              if (row.state === "verified" || !connectorUsesProxy(row.clientId)) {
                 return row;
               }
               const agentKey = row.clientId.replace(/_/g, "-");
@@ -2895,7 +2901,7 @@ export default function App() {
       active = false;
       window.clearInterval(interval);
     };
-  }, [windowLabel, launcherStage, interceptOnlyVerify, t]);
+  }, [windowLabel, launcherStage, interceptOnlyVerify, hasProxyVerificationRows, t]);
 
   // Warm the bootstrap download cache while the user is still signing up.
   // Download-only: nothing is installed until they consent on the install
@@ -2932,7 +2938,7 @@ export default function App() {
   useEffect(() => {
     if (windowLabel !== "launcher" || launcherStage !== "proxy_verify") return;
     if (
-      proxyVerificationRows.length > 0 &&
+      hasProxyVerificationRows &&
       proxyVerificationRows.every((row) => row.state === "verified")
     ) {
       // Persist for the main window: its own phase poller honors this marker,
@@ -2941,7 +2947,7 @@ export default function App() {
       setConnectorTrafficVerified(true);
       reportFunnelStep("proxy_verified");
     }
-  }, [windowLabel, launcherStage, proxyVerificationRows]);
+  }, [windowLabel, launcherStage, proxyVerificationRows, hasProxyVerificationRows]);
 
   useEffect(() => {
     if (!showInstallProgress) {
@@ -3718,10 +3724,9 @@ export default function App() {
     optimizeAppliedRefreshTick,
   ]);
 
-  // Keep connectorPhase in sync with the connector enabled state from the backend.
-  // Any supported connector (Claude Code, Codex, ...) being enabled counts as
-  // "connected" — the request-count poller below is connector-agnostic.
-  const anyConnectorEnabled = hasEnabledConnector(connectors);
+  const anyProxyConnectorEnabled = getEnabledSupportedConnectors(connectors).some(
+    (connector) => connectorUsesProxy(connector.clientId)
+  );
 
   // Which agents Headroom Learn should offer, driven by the enabled connectors.
   const claudeLearnEnabled = getClaudeConnector(connectors)?.enabled ?? false;
@@ -3753,24 +3758,13 @@ export default function App() {
     // window as "user disabled everything", or the persisted verification
     // marker would be wiped on every start.
     if (connectors.length === 0) return;
-    if (!anyConnectorEnabled) {
-      // A deliberate all-off is the one case that invalidates the persisted
-      // marker: re-enabling must re-verify with fresh traffic.
+    const phase = connectorVerificationPhase(connectors, isConnectorTrafficVerified());
+    if (!anyProxyConnectorEnabled) {
+      // MCP-only setup provides no evidence of model proxy traffic.
       setConnectorTrafficVerified(false);
-      setConnectorPhase("disabled");
-      return;
     }
-    // Transition from "disabled" → enabled drops into verifying (unless a
-    // past session already verified traffic), so the polling effect below
-    // confirms via /stats before the badge flips green.
-    setConnectorPhase((prev) =>
-      prev === "disabled"
-        ? isConnectorTrafficVerified()
-          ? "healthy"
-          : "verifying"
-        : prev
-    );
-  }, [anyConnectorEnabled, connectors.length]);
+    setConnectorPhase(phase);
+  }, [anyProxyConnectorEnabled, connectors]);
 
   useEffect(() => {
     // Pricing status hits the remote Headroom API. When the tray is focused,
@@ -3912,7 +3906,7 @@ export default function App() {
   // so the regex match could hang forever even while requests were being
   // optimized normally.
   useEffect(() => {
-    if (connectorPhase !== "verifying") return;
+    if (connectorPhase !== "verifying" || !anyProxyConnectorEnabled) return;
     let active = true;
     let anchor: number | null = null;
     let attempts = 0;
@@ -3960,7 +3954,7 @@ export default function App() {
       active = false;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [connectorPhase]);
+  }, [connectorPhase, anyProxyConnectorEnabled]);
 
   async function handleBootstrap() {
     bootstrapFailureSignatureRef.current = "";
@@ -6402,7 +6396,7 @@ export default function App() {
       >
         <div className="post-install__lead">
           <h1>{t("launcher.testTitle")}</h1>
-          <p>{t("launcher.testDescription")}</p>
+          <p>{t(hasEnabledApps && !hasProxyVerificationRows ? "connections.setup.zcodeRestart" : "launcher.testDescription")}</p>
           {hasEnabledApps ? (
             <div className="connector-list">
               {proxyVerificationRows.map((row) => (
@@ -6415,7 +6409,11 @@ export default function App() {
                       {row.name}
                     </h3>
                     <div className="proxy-verify-item__message">
-                      <span>{row.message}</span>
+                      <span>{connectorUsesProxy(row.clientId) ? row.message : t(
+                        row.state === "verified"
+                          ? "connections.verification.zcodeMcpFound"
+                          : "connections.verification.zcodeMcpMissing"
+                      )}</span>
                       {row.state === "verified" ? (
                         <span className="proxy-verified-pill">{t("launcher.verified")}</span>
                       ) : null}
@@ -7432,8 +7430,7 @@ export default function App() {
                 )}
               </div>
               {(() => {
-                const homeConnectors = sortClientConnectors(aggregateClientConnectors(connectors))
-                  .filter((connector) => connector.installed || connector.enabled);
+                const homeConnectors = overviewClientConnectors(connectors);
                 if (homeConnectors.length === 0) {
                   return null;
                 }
@@ -8598,6 +8595,7 @@ export default function App() {
 
         <div className="tray-content tray-content--settings" hidden={activeView !== "settings"}>
             <section className="panel-stack">
+              <InstructionGovernance />
               {!LOCAL_COMMUNITY_EDITION ? (
                 <article className="soft-card panel-card settings-account-card">
                 <div className="settings-account-row">

@@ -4136,8 +4136,8 @@ details[open] .optimize-minimal__details summary::after {
   font-size: 0.72rem;
   font-weight: 700;
   text-transform: uppercase;
-  color: #1f4a36;
-  background: rgba(108, 191, 155, 0.28);
+  color: var(--success);
+  background: var(--accent-tint-strong);
 }
 
 .link-button {
@@ -8591,3 +8591,28 @@ html[data-edition="local-community"] input:focus-visible {
   color: var(--text-secondary, #6c707b);
   font-size: 0.88em;
 }
+
+/* Instruction previews keep long paths and hashes inside the settings card. */
+.instruction-governance { min-width: 0; }
+.instruction-governance > section {
+  border-top: 1px solid var(--border-subtle);
+  margin-top: 16px;
+  padding-top: 12px;
+}
+.instruction-governance p { overflow-wrap: anywhere; }
+.instruction-governance details { margin: 12px 0; }
+.instruction-governance summary { cursor: pointer; color: var(--text-primary); }
+.instruction-governance h5 { margin: 12px 0 6px; }
+.instruction-governance .log-output {
+  max-height: 280px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--surface-sunken);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 12px;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+.instruction-governance__hash { font-family: var(--font-mono); font-size: var(--text-xxs); }

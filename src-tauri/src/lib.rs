@@ -9,6 +9,7 @@ mod codex_router;
 mod device;
 mod edition;
 mod insights;
+pub mod instruction_governance;
 mod keychain;
 mod logging;
 mod memory_scrubber;
@@ -5512,6 +5513,10 @@ pub fn run() {
         .manage(state)
         .manage(PendingAppUpdate(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
+            instruction_governance::audit_instructions,
+            instruction_governance::list_instruction_snapshots,
+            instruction_governance::apply_instruction_candidate,
+            instruction_governance::restore_instruction_snapshot,
             get_dashboard_state,
             get_app_update_configuration,
             check_for_app_update,

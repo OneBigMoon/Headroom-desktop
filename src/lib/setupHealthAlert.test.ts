@@ -446,6 +446,12 @@ describe("maybeFireSetupStallAlert", () => {
 });
 
 describe("setupStallBannerLine", () => {
+  it("does not accuse MCP-only connections of missing proxy traffic", () => {
+    const connectors = [connector({ clientId: "zcode", verified: false })];
+    const dashboard = stalledDashboard({ launchExperience: "dashboard" });
+    expect(evaluateSetupStall(dashboard, PAST_WINDOW, { connectors })).toBeNull();
+    expect(setupStallBannerLine(dashboard, PAST_WINDOW, { connectors })).toBeNull();
+  });
   // The banner only speaks up on a return launch: a first run is allowed to be
   // quiet because the user may simply not have opened a terminal yet.
   function returning(overrides: Partial<DashboardState> = {}): DashboardState {

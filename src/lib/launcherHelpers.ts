@@ -1,4 +1,4 @@
-import { aggregateClientConnectors } from "./dashboardHelpers";
+import { aggregateClientConnectors, connectorUsesProxy } from "./dashboardHelpers";
 import type {
   ClaudePlanTier,
   ClientConnectorStatus,
@@ -238,8 +238,12 @@ export function buildInitialProxyVerificationRows(
     .map((connector) => ({
       clientId: connector.clientId,
       name: connector.name,
-      state: "processing",
-      message: `Waiting for a ${connector.name} prompt...`
+      state: connectorUsesProxy(connector.clientId)
+        ? "processing"
+        : connector.verified ? "verified" : "waiting",
+      message: connectorUsesProxy(connector.clientId)
+        ? `Waiting for a ${connector.name} prompt...`
+        : connector.verified ? "MCP configuration verified." : "MCP configuration needs attention."
     }));
 }
 
