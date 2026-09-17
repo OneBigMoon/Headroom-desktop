@@ -2541,6 +2541,7 @@ impl AppState {
         if let Some(history) = history.as_ref() {
             let cutoff_date = savings_history_cutoff_date();
             let cutoff_hour = format!("{cutoff_date}T00:00");
+            let local_daily = history.local_daily_savings(&Local).unwrap_or_default();
             // Both drops target the same bucket -- the rollup's leading delta,
             // measured from a zero baseline -- from different evidence, so only
             // one may run. The parser's is exact (it can see the point cap was
@@ -2549,11 +2550,11 @@ impl AppState {
             // data dir. Running both ate a real day, and with only two buckets
             // in the window it left nothing at all.
             let (native_daily, native_hourly) = if history.backfill_bucket_dropped {
-                (history.daily_savings(), history.hourly_savings())
+                (local_daily, history.hourly_savings())
             } else {
                 (
                     drop_rollup_backfill(
-                        history.daily_savings(),
+                        local_daily,
                         daily_savings.iter().map(|p| p.date.as_str()).min(),
                         |p| p.date.as_str(),
                     ),
@@ -2570,14 +2571,13 @@ impl AppState {
             // periods the app wasn't running.
             {
                 let today_key = local_day_key(Local::now());
-                let utc_today_key = chrono::Utc::now().format("%Y-%m-%d").to_string();
                 let mut tracker = self.savings_tracker.lock();
                 if tracker.ingest_native_rollups(
                     &native_daily,
                     &native_hourly,
                     &cutoff_date,
                     &today_key,
-                    &utc_today_key,
+                    &today_key,
                 ) {
                     let _ = tracker.persist_state();
                 }
@@ -4970,28 +4970,27 @@ impl SavingsTracker {
         hourly: &[HourlySavingsPoint],
         cutoff_date: &str,
         today_key: &str,
-        utc_today_key: &str,
+        daily_today_key: &str,
     ) -> bool {
         let cutoff_hour = format!("{cutoff_date}T00:00");
         let mut changed = false;
         for point in daily {
-            // Daily rollups are UTC-day keyed; hourly keys below stay local and
-            // are guarded by the local today_key.
+            // Daily and hourly values have already been reconstructed in local
+            // time; both use the same local-day boundary.
             //
-            // The live UTC day is archived too, as it accumulates. Waiting for
+            // The live local day is archived too, as it accumulates. Waiting for
             // it to settle loses it outright at heavy volume: the backend keeps
-            // 5000 history points, which can be under 24h, so by UTC midnight
+            // 5000 history points, which can be under 24h, so by local midnight
             // the day's rollup has become the buffer's first (backfill) bucket
             // and drop_rollup_backfill discards it before we get here. That is
             // how 2026-08-13 collapsed from the backend's real total to the
             // $3.44 of traffic the local tracker had happened to observe.
-            if point.date.as_str() < cutoff_date || point.date.as_str() > utc_today_key {
+            if point.date.as_str() < cutoff_date || point.date.as_str() > daily_today_key {
                 continue;
             }
-            // Only ever grow the live bucket. The tracker keys its own deltas by
-            // LOCAL day, so ahead of UTC it already holds hours the backend's
-            // UTC bucket has not reached; a mid-day snapshot must not shrink it.
-            if point.date.as_str() == utc_today_key {
+            // Only grow the live bucket: a lagging backend snapshot must not
+            // erase newer local observations.
+            if point.date.as_str() == daily_today_key {
                 if let Some(existing) = self.daily_savings.get(&point.date) {
                     if point.total_tokens_sent <= existing.total_tokens_sent {
                         continue;
@@ -5019,12 +5018,12 @@ impl SavingsTracker {
             // point-capped (and compacted) checkpoint ring, so a settled day's
             // re-derivation only ever loses coverage relative to what was
             // archived while the day was live and complete: freeze at the
-            // first archived value. The live UTC day keeps taking the fresh
+            // first archived value. The live local day keeps taking the fresh
             // derivation, which grows with the day.
             let archived = self.daily_savings.get(&point.date).copied();
             let archived_read = archived.and_then(|b| b.cache_read_tokens);
             let archived_usd = archived.and_then(|b| b.cache_savings_usd);
-            let live_day = point.date.as_str() == utc_today_key;
+            let live_day = point.date.as_str() == daily_today_key;
             let bucket = DailySavingsBucket {
                 estimated_savings_usd: point.estimated_savings_usd,
                 estimated_tokens_saved: point.estimated_tokens_saved,
@@ -5995,6 +5994,84 @@ struct HeadroomSavingsHistoryResponse {
 }
 
 impl HeadroomSavingsHistoryResponse {
+    /// Reconstruct local days from hours only when the hours account for every
+    /// daily delta. UTC daily totals cannot be merged into a local-day archive:
+    /// the same request would otherwise be counted on two different dates.
+    fn local_daily_savings<Tz: TimeZone>(&self, timezone: &Tz) -> Option<Vec<DailySavingsPoint>> {
+        if self.hourly.is_empty() || self.daily.is_empty() {
+            return None;
+        }
+        let mut utc_totals: BTreeMap<String, (u64, u64, f64, f64, u64, f64)> = BTreeMap::new();
+        let mut local: BTreeMap<String, DailySavingsPoint> = BTreeMap::new();
+        for hour in &self.hourly {
+            // A UTC hour can straddle local midnight in fractional-offset
+            // zones. Without per-request timing we cannot split that bucket.
+            let local_start = hour.timestamp.with_timezone(timezone).date_naive();
+            let local_end = (hour.timestamp + chrono::Duration::seconds(3599))
+                .with_timezone(timezone)
+                .date_naive();
+            if local_start != local_end {
+                return None;
+            }
+            let utc = utc_totals
+                .entry(hour.timestamp.format("%Y-%m-%d").to_string())
+                .or_default();
+            utc.0 += hour.tokens_saved;
+            utc.1 += hour.total_input_tokens_delta;
+            utc.2 += hour.compression_savings_usd_delta;
+            utc.3 += hour.total_input_cost_usd_delta;
+            utc.4 += hour.output_tokens_saved_delta;
+            utc.5 += hour.output_savings_usd_delta;
+            let date = local_start.to_string();
+            let point = local
+                .entry(date.clone())
+                .or_insert_with(|| DailySavingsPoint {
+                    date,
+                    estimated_savings_usd: 0.0,
+                    estimated_tokens_saved: 0,
+                    actual_cost_usd: 0.0,
+                    total_tokens_sent: 0,
+                    output_savings_usd: 0.0,
+                    output_tokens_saved: 0,
+                    cache_read_tokens: None,
+                    cache_savings_usd: None,
+                    output_sampled_tokens_saved: None,
+                    output_baseline_tokens: None,
+                });
+            point.estimated_tokens_saved += hour.tokens_saved;
+            point.estimated_savings_usd += hour.compression_savings_usd_delta;
+            point.actual_cost_usd += hour.total_input_cost_usd_delta;
+            point.total_tokens_sent += hour.total_input_tokens_delta;
+            point.output_tokens_saved += hour.output_tokens_saved_delta;
+            point.output_savings_usd += hour.output_savings_usd_delta;
+            if let Some(value) = hour.cache_read_tokens_delta {
+                *point.cache_read_tokens.get_or_insert(0) += value;
+            }
+            if let Some(value) = hour.cache_savings_usd_delta {
+                *point.cache_savings_usd.get_or_insert(0.0) += value;
+            }
+        }
+        if utc_totals.len() != self.daily.len()
+            || self.daily.iter().any(|day| {
+                let Some(total) = utc_totals.get(&day.timestamp.format("%Y-%m-%d").to_string())
+                else {
+                    return true;
+                };
+                total.0 != day.tokens_saved
+                    || total.1 != day.total_input_tokens_delta
+                    || (total.2 - day.compression_savings_usd_delta).abs() > 0.000_001
+                    || (total.3 - day.total_input_cost_usd_delta).abs() > 0.000_001
+                    || total.4 != day.output_tokens_saved_delta
+                    || (total.5 - day.output_savings_usd_delta).abs() > 0.000_001
+            })
+        {
+            // Trimmed or lagging hourly data must not replace complete local
+            // observations with partial totals. Keep the local archive instead.
+            return None;
+        }
+        Some(local.into_values().collect())
+    }
+
     fn daily_savings(&self) -> Vec<DailySavingsPoint> {
         self.daily
             .iter()
@@ -10705,6 +10782,64 @@ LLM analysis failed: `codex exec` did not respond within 300s.
 
         assert_eq!(parsed.session_estimated_tokens_saved, Some(2_000));
         assert_eq!(parsed.session_total_tokens_sent, Some(50_000));
+    }
+
+    #[test]
+    fn local_history_does_not_double_count_across_midnight() {
+        let history = parse_headroom_stats_history_from_json(r#"{
+            "series": {
+                "hourly": [
+                    {"timestamp":"2026-09-16T15:00:00Z","tokens_saved":487,"compression_savings_usd_delta":0.00487,"total_input_tokens_delta":226883},
+                    {"timestamp":"2026-09-16T18:00:00Z","tokens_saved":6810,"compression_savings_usd_delta":0.0681,"total_input_tokens_delta":3600}
+                ],
+                "daily": [{"timestamp":"2026-09-16T00:00:00Z","tokens_saved":7297,"compression_savings_usd_delta":0.07297,"total_input_tokens_delta":230483}]
+            }
+        }"#).unwrap();
+        let zone = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let native = history.local_daily_savings(&zone).unwrap();
+        assert_eq!(
+            native
+                .iter()
+                .map(|p| (p.date.as_str(), p.estimated_tokens_saved))
+                .collect::<Vec<_>>(),
+            vec![("2026-09-16", 487), ("2026-09-17", 6810)]
+        );
+        // Reproduce the old archive: UTC Sept 16 already includes today's
+        // 6810, and the observer also recorded them on local Sept 17.
+        let mut tracker = make_tracker();
+        let mut old = daily("2026-09-16", 7297, 0.07297);
+        old.total_tokens_sent = 230483;
+        let mut today = daily("2026-09-17", 6810, 0.0681);
+        today.total_tokens_sent = 3600;
+        tracker.ingest_native_rollups(&[old, today], &[], "2026-09-01", "2026-09-17", "2026-09-17");
+        assert!(tracker.ingest_native_rollups(
+            &native,
+            &[],
+            "2026-09-01",
+            "2026-09-17",
+            "2026-09-17"
+        ));
+        let merged = merge_daily_savings(tracker.daily_savings(), native.clone(), "2026-09-01");
+        assert_eq!(
+            merged.iter().map(|p| p.estimated_tokens_saved).sum::<u64>(),
+            7297
+        );
+        assert!(!tracker.ingest_native_rollups(
+            &native,
+            &[],
+            "2026-09-01",
+            "2026-09-17",
+            "2026-09-17"
+        ));
+        // Complete hours are required; a trimmed history must not shrink a day.
+        let mut partial = history.clone();
+        partial.hourly.remove(0);
+        assert!(partial.local_daily_savings(&zone).is_none());
+        let west = chrono::FixedOffset::west_opt(8 * 3600).unwrap();
+        assert_eq!(
+            history.local_daily_savings(&west).unwrap()[0].estimated_tokens_saved,
+            7297
+        );
     }
 
     #[test]

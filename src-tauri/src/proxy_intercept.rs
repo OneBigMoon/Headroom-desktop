@@ -2740,7 +2740,11 @@ fn is_codex_request_head(head: &ParsedRequestHead) -> bool {
 /// and no browser Origin header is present. Protects against DNS-rebinding
 /// attacks that aim the user's browser at 127.0.0.1 via an attacker domain.
 fn request_is_loopback_safe(buf: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(buf) else {
+    // read_http_headers can over-read into an opaque/binary request body.
+    let Some(end) = find_header_end(buf) else {
+        return false;
+    };
+    let Ok(text) = std::str::from_utf8(&buf[..end]) else {
         return false;
     };
     let mut host: Option<&str> = None;
@@ -3731,6 +3735,20 @@ mod tests {
             1
         );
         assert!(buf.ends_with(b"\r\n\r\nhello"));
+    }
+
+    #[test]
+    fn codex_binary_body_preserves_loopback_guard() {
+        let mut request = b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:6867\r\nContent-Encoding: zstd\r\n\r\n".to_vec();
+        request.extend_from_slice(&[0x28, 0xb5, 0x2f, 0xfd, 0xff]);
+        assert!(request_is_loopback_safe(&request));
+        // Body text must neither forge nor invalidate header security checks.
+        request.extend_from_slice(b"\r\nOrigin: https://example.com\r\n");
+        assert!(request_is_loopback_safe(&request));
+        assert!(!request_is_loopback_safe(
+            b"POST /v1/responses HTTP/1.1\r\nHost: example.com\r\n\r\n"
+        ));
+        assert!(!request_is_loopback_safe(b"POST /v1/responses HTTP/1.1\r\nHost: localhost:6867\r\nOrigin: https://example.com\r\n\r\n"));
     }
 
     #[test]

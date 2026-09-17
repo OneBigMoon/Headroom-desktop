@@ -56,10 +56,9 @@ pub const ROUTER_CONTROL_ACTION_HEADER_NAME: &str = "X-Headroom-Codex-Router-Act
 pub const ROUTER_CONTROL_ACTION_SHUTDOWN: &str = "shutdown";
 pub const ROUTER_PROTOCOL_VERSION: &str = "2";
 /// Advertise both the wire-protocol generation and the package version for
-/// diagnostics. Helpers from another package release remain reusable while
-/// their protocol generation matches; an incompatible generation fails
-/// closed.
-pub const ROUTER_RUNTIME_VERSION: &str = concat!("2/", env!("CARGO_PKG_VERSION"));
+/// diagnostics. The build suffix also replaces an affected helper when a
+/// locally rebuilt app retains the same package version.
+pub const ROUTER_RUNTIME_VERSION: &str = concat!("2/", env!("CARGO_PKG_VERSION"), "+binary-head.1");
 
 /// Argument understood by the desktop executable before Tauri startup.
 pub const ROUTER_ARG: &str = "--headroom-codex-router";
@@ -202,10 +201,12 @@ pub fn ensure_running() -> std::io::Result<()> {
         // treated as an occupied port and reported to the caller before any
         // Codex config is written.
         match probe_router_owned_version(&control_token) {
-            Some(version)
-                if version == ROUTER_RUNTIME_VERSION || router_version_compatible(&version) =>
-            {
-                return Ok(())
+            Some(version) if version == ROUTER_RUNTIME_VERSION => return Ok(()),
+            Some(version) if router_version_compatible(&version) => {
+                // Only an authenticated, same-protocol helper may be updated.
+                // Keeping an old helper alive also keeps its routing bugs alive
+                // after the GUI is upgraded. Never resolve/kill an arbitrary PID.
+                shutdown_and_wait_locked()?;
             }
             Some(_) => {
                 // A listener that proves ownership but advertises another
@@ -260,7 +261,7 @@ pub fn ensure_running() -> std::io::Result<()> {
         // keeps setup from writing a 6891 route that cannot be owned by us.
         if probe_router_public() {
             if let Some(version) = probe_router_owned_version(&control_token) {
-                if router_version_compatible(&version) {
+                if version == ROUTER_RUNTIME_VERSION {
                     return Ok(());
                 }
                 return Err(std::io::Error::new(
@@ -850,12 +851,9 @@ fn probe_router_owned_version(token: &str) -> Option<String> {
     router_health_owned_version(&response, token)
 }
 
-/// The runtime version includes the desktop package version (`2/1.0.13`),
-/// which changes on every release even when the detached listener protocol is
-/// unchanged. Reusing a listener from the same protocol generation keeps a
-/// normal app update transparent; a future incompatible wire change must bump
-/// [`ROUTER_PROTOCOL_VERSION`] and will then fail closed instead of sending
-/// control traffic to an unknown implementation.
+/// Only the same wire protocol permits authenticated replacement of an old
+/// helper. An incompatible generation fails closed without sending control
+/// traffic to it, even if it presents the ownership token.
 fn router_version_compatible(version: &str) -> bool {
     version
         .strip_prefix(ROUTER_PROTOCOL_VERSION)
@@ -1364,7 +1362,10 @@ struct ParsedRequestHead {
 }
 
 fn parse_request_head(buf: &[u8]) -> Option<ParsedRequestHead> {
-    let text = std::str::from_utf8(buf).ok()?;
+    // A socket read can include binary body bytes after the headers (Codex
+    // uses zstd). Those bytes must not turn a proxy request into Direct mode.
+    let end = find_header_end(buf).unwrap_or(buf.len());
+    let text = std::str::from_utf8(&buf[..end]).ok()?;
     let mut lines = text.split("\r\n");
     let request_line = lines.next()?;
     let mut parts = request_line.split_whitespace();
@@ -1885,6 +1886,20 @@ mod tests {
         assert!(request_is_loopback_safe(good));
         let browser = b"GET /v1/models HTTP/1.1\r\nHost: 127.0.0.1:6891\r\nOrigin: https://evil.example\r\n\r\n";
         assert!(!request_is_loopback_safe(browser));
+    }
+
+    #[test]
+    fn codex_binary_body_does_not_bypass_proxy_classification() {
+        let mut request = b"POST /backend-api/codex/responses HTTP/1.1\r\nHost: 127.0.0.1:6891\r\nContent-Encoding: zstd\r\nContent-Length: 5\r\n\r\n".to_vec();
+        request.extend_from_slice(&[0x28, 0xb5, 0x2f, 0xfd, 0xff]);
+        let parsed = parse_request_head(&request).expect("binary body is not part of the head");
+        assert!(is_codex_path(&parsed.path));
+        assert!(request_is_loopback_safe(&request));
+        let rewritten = rewrite_request_target(&request, "/v1/responses").unwrap();
+        assert!(rewritten.ends_with(&[0x28, 0xb5, 0x2f, 0xfd, 0xff]));
+
+        let invalid = b"POST /v1/responses HTTP/1.1\r\nHost: \xff\r\n\r\n";
+        assert!(parse_request_head(invalid).is_none());
     }
 
     #[test]
