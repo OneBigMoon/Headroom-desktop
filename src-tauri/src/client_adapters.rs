@@ -5667,6 +5667,7 @@ fn marker_block_contains(content: &str, block_id: &str, needle: &str) -> bool {
 pub enum ManagedMcpRegistrationState {
     Healthy,
     Missing,
+    CompatibleUserManaged,
     UserManaged,
     Mismatch,
 }
@@ -5692,7 +5693,7 @@ fn codex_headroom_mcp_registration_health_for_config(
     expected_codebase_memory_cache_dir: &Path,
     owned_entries: &BTreeSet<String>,
 ) -> CodexMcpRegistrationHealth {
-    let context7 = managed_mcp_entry_state(
+    let context7 = context7_mcp_entry_state(
         config,
         "context7",
         owned_entries.contains("context7"),
@@ -5848,6 +5849,54 @@ fn managed_mcp_entry_state(
     } else {
         ManagedMcpRegistrationState::Mismatch
     }
+}
+
+fn context7_mcp_entry_state(
+    config: &toml::Value,
+    name: &str,
+    owned: bool,
+    matches: impl FnOnce(&toml::value::Table) -> bool,
+) -> ManagedMcpRegistrationState {
+    let Some(entry) = config
+        .get("mcp_servers")
+        .and_then(toml::Value::as_table)
+        .and_then(|servers| servers.get(name))
+        .and_then(toml::Value::as_table)
+    else {
+        return ManagedMcpRegistrationState::Missing;
+    };
+
+    if owned {
+        return if matches(entry) {
+            ManagedMcpRegistrationState::Healthy
+        } else {
+            ManagedMcpRegistrationState::Mismatch
+        };
+    }
+
+    if is_compatible_context7_entry(entry) {
+        ManagedMcpRegistrationState::CompatibleUserManaged
+    } else {
+        ManagedMcpRegistrationState::UserManaged
+    }
+}
+
+fn is_compatible_context7_entry(entry: &toml::value::Table) -> bool {
+    let command = entry.get("command").and_then(toml::Value::as_str);
+    let Some(args) = entry.get("args").and_then(toml::Value::as_array) else {
+        return false;
+    };
+    let Some(package) = args.get(1).and_then(toml::Value::as_str) else {
+        return false;
+    };
+
+    matches!(command, Some("npx" | "npx.cmd"))
+        && args.len() == 2
+        && args[0].as_str() == Some("-y")
+        && (package == "@upstash/context7-mcp"
+            || package
+                .strip_prefix("@upstash/context7-mcp@")
+                .is_some_and(|version| !version.is_empty()))
 }
 
 fn remove_codex_provider_block() -> Result<()> {
@@ -14718,7 +14767,7 @@ keep rtk\n\
         );
         assert_eq!(
             health.context7,
-            super::ManagedMcpRegistrationState::UserManaged
+            super::ManagedMcpRegistrationState::CompatibleUserManaged
         );
 
         owned.insert("context7".to_string());
@@ -14736,6 +14785,61 @@ keep rtk\n\
         assert_eq!(
             health.codebase_memory,
             super::ManagedMcpRegistrationState::Healthy
+        );
+    }
+
+    #[test]
+    fn codex_mcp_health_accepts_unversioned_compatible_context7_but_rejects_wrong_package() {
+        let unversioned: toml::Value = r#"
+            [mcp_servers.context7]
+            command = "npx"
+            args = ["-y", "@upstash/context7-mcp"]
+        "#
+        .parse()
+        .unwrap();
+        let empty = BTreeSet::new();
+        let health = super::codex_headroom_mcp_registration_health_for_config(
+            &unversioned,
+            "@upstash/context7-mcp@4.0.4",
+            Path::new("/managed/codebase-memory-mcp"),
+            Path::new("/managed/cache"),
+            &empty,
+        );
+        assert_eq!(
+            health.context7,
+            super::ManagedMcpRegistrationState::CompatibleUserManaged
+        );
+
+        let wrong_package: toml::Value = r#"
+            [mcp_servers.context7]
+            command = "npx"
+            args = ["-y", "@upstash/context7-mcp-tools"]
+        "#
+        .parse()
+        .unwrap();
+        let health = super::codex_headroom_mcp_registration_health_for_config(
+            &wrong_package,
+            "@upstash/context7-mcp@4.0.4",
+            Path::new("/managed/codebase-memory-mcp"),
+            Path::new("/managed/cache"),
+            &empty,
+        );
+        assert_eq!(
+            health.context7,
+            super::ManagedMcpRegistrationState::UserManaged
+        );
+
+        let owned = BTreeSet::from(["context7".to_string()]);
+        let health = super::codex_headroom_mcp_registration_health_for_config(
+            &unversioned,
+            "@upstash/context7-mcp@4.0.4",
+            Path::new("/managed/codebase-memory-mcp"),
+            Path::new("/managed/cache"),
+            &owned,
+        );
+        assert_eq!(
+            health.context7,
+            super::ManagedMcpRegistrationState::Mismatch
         );
     }
 

@@ -1251,7 +1251,7 @@ static RTK_INSTALL_NONCE: AtomicU64 = AtomicU64::new(0);
 static PACKAGE_UPDATE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const MARKITDOWN_PINNED_VERSION: &str = "0.1.7";
 const SERENA_PINNED_VERSION: &str = "1.7.0";
-const CONTEXT7_PINNED_VERSION: &str = "4.0.4";
+const CONTEXT7_PINNED_VERSION: &str = "4.1.1";
 
 pub(crate) fn stable_package_version(version: &str) -> Result<&str> {
     if version.len() >= 5
@@ -1264,6 +1264,38 @@ pub(crate) fn stable_package_version(version: &str) -> Result<&str> {
     } else {
         bail!("invalid package version {version:?}; expected stable x.y.z")
     }
+}
+
+fn resolve_context7_install_version(
+    requested: Option<&str>,
+    installed: Option<&str>,
+) -> Result<String> {
+    let requested = requested
+        .map(stable_package_version)
+        .transpose()?
+        .map(str::to_owned);
+    let version = requested.unwrap_or_else(|| {
+        match (
+            installed,
+            installed.and_then(parse_major_minor_patch),
+            parse_major_minor_patch(CONTEXT7_PINNED_VERSION),
+        ) {
+            (Some(installed), Some(current), Some(pinned)) if current > pinned => {
+                installed.to_string()
+            }
+            _ => CONTEXT7_PINNED_VERSION.to_string(),
+        }
+    });
+    if let (Some(installed), Some(current), Some(target)) = (
+        installed,
+        installed.and_then(parse_major_minor_patch),
+        parse_major_minor_patch(&version),
+    ) {
+        if target < current {
+            bail!("refusing to downgrade Context7 from {installed} to {version}");
+        }
+    }
+    Ok(version)
 }
 /// First run downloads the package into the npx cache; slow networks need
 /// headroom over the usual smoke-test budget.
@@ -1474,6 +1506,12 @@ def headroom_owns(registrar, current):
         registrar.name, current, path=legacy_ledger
     )
 
+def compatible_user_context7(current):
+    if current is None or current.command not in ("npx", "npx.cmd"):
+        return False
+    package = "@upstash/context7-mcp"
+    return any(arg == package or arg.startswith(package + "@") for arg in current.args)
+
 for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), OpencodeRegistrar()):
     if not registrar.detect():
         print(f"{registrar.name}: not detected, skipping")
@@ -1495,6 +1533,9 @@ for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), Opencode
                 )
                 if result is None:
                     continue
+            elif compatible_user_context7(current):
+                print(f"{registrar.name}: compatible user-managed context7 entry, leaving it")
+                continue
         if result.status == RegisterStatus.REGISTERED:
             record_install(registrar.name, spec)
         elif result.status == RegisterStatus.MISMATCH:
@@ -7404,15 +7445,15 @@ impl ToolManager {
         })
     }
 
-    fn require_owned_plugin_receipt(&self, plugin: &PluginAddon) -> Result<Value> {
-        let receipt = self.require_plugin_receipt(plugin)?;
-        if !Self::receipt_proves_plugin_ownership(plugin, &receipt) {
-            bail!(
-                "refusing to mutate {} because its legacy receipt lacks explicit Headroom ownership metadata; reinstall it from Headroom to create a managed receipt",
-                plugin.id
-            );
-        }
-        Ok(receipt)
+    fn receipt_is_legacy_plugin_state(receipt: &Value) -> bool {
+        receipt.as_object().is_some_and(|object| {
+            object.len() == 2
+                && object
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .is_some_and(|version| !version.trim().is_empty())
+                && object.get("enabled").and_then(Value::as_bool).is_some()
+        })
     }
 
     fn plugin_receipt_payload(plugin: &PluginAddon, version: &str, enabled: bool) -> Value {
@@ -8353,26 +8394,16 @@ impl ToolManager {
 
     pub fn install_context7_version(&self, version: Option<&str>) -> Result<()> {
         let _guard = PACKAGE_UPDATE_LOCK.get_or_init(|| Mutex::new(())).lock();
-        let version = version
-            .map(stable_package_version)
-            .transpose()?
-            .unwrap_or(CONTEXT7_PINNED_VERSION);
-        if let Some(current) = self
+        let current_version = self
             .read_tool_receipt("context7")
-            .and_then(|r| r.get("version").and_then(Value::as_str).map(str::to_owned))
-            .as_deref()
-            .and_then(parse_major_minor_patch)
-        {
-            if parse_major_minor_patch(version).is_some_and(|target| target < current) {
-                bail!("refusing to downgrade Context7 from {current:?} to {version}");
-            }
-        }
+            .and_then(|r| r.get("version").and_then(Value::as_str).map(str::to_owned));
+        let version = resolve_context7_install_version(version, current_version.as_deref())?;
         let npx = crate::claude_cli::detect_npx().context(
             "npx was not found. Context7 runs through Node.js -- install Node.js, then try again.",
         )?;
         run_command_with_timeout(
             &npx,
-            &["-y", &context7_package_spec_for(version), "--help"],
+            &["-y", &context7_package_spec_for(&version), "--help"],
             &self.runtime.root_dir,
             CONTEXT7_INSTALL_TIMEOUT,
         )
@@ -8383,7 +8414,7 @@ impl ToolManager {
             "context7 failed its smoke test (npx download or startup). Context7 needs Node.js 20.18.1 or newer",
         )?;
         let previous = self.read_tool_receipt("context7");
-        self.register_context7_mcp(version)?;
+        self.register_context7_mcp(&version)?;
         let enabled = self.tool_enabled("context7");
         if let Err(err) = self.write_tool_receipt(
             "context7",
@@ -8865,12 +8896,23 @@ impl ToolManager {
     fn run_mcp_helper(&self, args: &[&str]) -> Result<()> {
         // ClaudeRegistrar may shell out to the `claude` CLI, which can take a
         // few seconds per agent; 60s covers both registrars comfortably.
-        run_command_with_timeout(
+        let result = run_command_with_timeout(
             &self.managed_python(),
             args,
             &self.runtime.root_dir,
             Duration::from_secs(60),
-        )
+        );
+        result.map_err(|err| match err.downcast::<CommandFailure>() {
+            Ok(failure) => {
+                let mut safe_args = vec!["-c".to_string(), "<Headroom MCP registry helper>".into()];
+                safe_args.extend(args.iter().skip(2).map(|arg| (*arg).to_string()));
+                anyhow::Error::new(CommandFailure {
+                    args: safe_args,
+                    ..failure
+                })
+            }
+            Err(err) => err,
+        })
     }
 
     /// Remove the managed rtk binary and its receipt. Shell PATH and Claude Code
@@ -9401,9 +9443,11 @@ impl ToolManager {
         // unrecoverable.
         let receipt = self.read_plugin_receipt(plugin)?;
         if let Some(receipt) = receipt.as_ref() {
-            if !Self::receipt_proves_plugin_ownership(plugin, receipt) {
+            if !Self::receipt_proves_plugin_ownership(plugin, receipt)
+                && !Self::receipt_is_legacy_plugin_state(receipt)
+            {
                 bail!(
-                    "refusing to mutate {} because its legacy receipt lacks explicit Headroom ownership metadata; reinstall it from Headroom to create a managed receipt",
+                    "refusing to mutate {} because its receipt is not recognized as Headroom-managed state",
                     plugin.id
                 );
             }
@@ -9629,9 +9673,18 @@ impl ToolManager {
 
     fn set_plugin_enabled_inner(&self, id: &str, enabled: bool) -> Result<()> {
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
-        // The receipt is the ownership boundary. A host registration without
-        // this proof may belong to the user and must never be toggled by us.
-        let receipt = self.require_owned_plugin_receipt(plugin)?;
+        // Managed receipts authorize full lifecycle changes. Strict legacy
+        // receipts authorize only a reversible toggle of an existing Codex
+        // registration; they never authorize install, runtime, or cleanup work.
+        let receipt = self.require_plugin_receipt(plugin)?;
+        let owned = Self::receipt_proves_plugin_ownership(plugin, &receipt);
+        let legacy = Self::receipt_is_legacy_plugin_state(&receipt);
+        if !owned && !legacy {
+            bail!(
+                "refusing to toggle {} because its receipt is not recognized as Headroom-managed state",
+                plugin.id
+            );
+        }
         let previous_version = receipt
             .get("version")
             .and_then(Value::as_str)
@@ -9645,6 +9698,13 @@ impl ToolManager {
                     continue;
                 }
             };
+            if legacy && (!matches!(host, PluginHost::Codex) || !present) {
+                errors.push(format!(
+                    "{} legacy receipt can only toggle an existing Codex registration; reinstall it from Headroom first",
+                    plugin.id
+                ));
+                continue;
+            }
             // Codex exposes plugin activation as an `enabled` field in
             // config.toml. Toggle that field in place so Disable keeps the
             // install/cache and Enable does not need a network refresh. Only a
@@ -9691,14 +9751,18 @@ impl ToolManager {
         let version = installed_plugin_version(plugin)
             .or(previous_version)
             .unwrap_or_else(|| PLUGIN_DISPLAY_VERSION.into());
-        self.write_tool_receipt(
-            plugin.id,
-            Self::plugin_receipt_payload(plugin, &version, enabled),
-        )?;
-        if enabled {
-            self.ensure_plugin_runtime(plugin)?;
+        let next_receipt = if owned {
+            Self::plugin_receipt_payload(plugin, &version, enabled)
         } else {
-            self.remove_plugin_runtime(plugin)?;
+            json!({ "version": version, "enabled": enabled })
+        };
+        self.write_tool_receipt(plugin.id, next_receipt)?;
+        if owned {
+            if enabled {
+                self.ensure_plugin_runtime(plugin)?;
+            } else {
+                self.remove_plugin_runtime(plugin)?;
+            }
         }
         Ok(())
     }
@@ -9871,10 +9935,11 @@ impl ToolManager {
                     &self.codebase_memory_cache_dir(),
                 );
                 let healthy = match registration {
-                    Ok(health) if tool_id == "context7" => {
-                        health.context7
-                            == crate::client_adapters::ManagedMcpRegistrationState::Healthy
-                    }
+                Ok(health) if tool_id == "context7" => matches!(
+                    health.context7,
+                    crate::client_adapters::ManagedMcpRegistrationState::Healthy
+                        | crate::client_adapters::ManagedMcpRegistrationState::CompatibleUserManaged
+                ),
                     Ok(health) => {
                         health.codebase_memory
                             == crate::client_adapters::ManagedMcpRegistrationState::Healthy
@@ -10430,6 +10495,9 @@ fn prepare_codex_adapter_marketplace(plugin: &PluginAddon) -> Result<PathBuf> {
         let source_text = source.to_string_lossy().into_owned();
         run_codex_adapter_command("git", &["-C", &source_text, "pull", "--ff-only"], &root)?;
     } else {
+        if source.exists() && cleanup_stale_codex_adapter_marketplace(&source, plugin)? {
+            log::info!("removed stale Headroom Codex adapter {}", source.display());
+        }
         if source.exists() {
             bail!(
                 "{} already exists without a Git checkout; remove the stale directory before retrying",
@@ -10438,7 +10506,19 @@ fn prepare_codex_adapter_marketplace(plugin: &PluginAddon) -> Result<PathBuf> {
         }
         let url = format!("https://github.com/{}.git", plugin.marketplace);
         let source_text = source.to_string_lossy().into_owned();
-        run_codex_adapter_command("git", &["clone", "--depth", "1", &url, &source_text], &root)?;
+        if let Err(err) = run_codex_adapter_command(
+            "git",
+            &["clone", "--depth", "1", &url, &source_text],
+            &root,
+        ) {
+            if let Err(cleanup_err) = cleanup_unpublished_codex_adapter_clone(&source) {
+                return Err(anyhow!(
+                    "{err:#}; cleaning failed Codex adapter clone {} also failed: {cleanup_err:#}",
+                    source.display()
+                ));
+            }
+            return Err(err);
+        }
         fresh_clone = true;
     }
 
@@ -10478,6 +10558,77 @@ fn prepare_codex_adapter_marketplace(plugin: &PluginAddon) -> Result<PathBuf> {
         return Err(err);
     }
     Ok(source)
+}
+
+/// Remove an adapter directory left by an older Headroom install only when
+/// its ownership marker or generated compatibility manifest proves it is
+/// ours. Arbitrary directories at the same path remain untouched.
+fn cleanup_stale_codex_adapter_marketplace(source: &Path, plugin: &PluginAddon) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err).with_context(|| format!("inspecting {}", source.display())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(false);
+    }
+
+    let marked = codex_adapter_marker_is_owned(source, plugin)?;
+    let manifest = source.join(".agents/plugins/marketplace.json");
+    let legacy_manifest_matches = std::fs::read(&manifest)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .is_some_and(|body| {
+            body.get("name").and_then(Value::as_str) == Some(plugin.marketplace_name)
+                && body
+                    .get("interface")
+                    .and_then(|value| value.get("displayName"))
+                    .and_then(Value::as_str)
+                    == Some(plugin.id)
+                && body
+                    .get("plugins")
+                    .and_then(Value::as_array)
+                    .is_some_and(|plugins| {
+                        plugins.iter().any(|entry| {
+                            entry.get("name").and_then(Value::as_str) == Some(plugin.id)
+                                && entry
+                                    .get("source")
+                                    .and_then(|value| value.get("source"))
+                                    .and_then(Value::as_str)
+                                    == Some("local")
+                                && entry
+                                    .get("source")
+                                    .and_then(|value| value.get("path"))
+                                    .and_then(Value::as_str)
+                                    == Some(plugin.codex_local_path)
+                        })
+                    })
+        });
+    if !marked && !legacy_manifest_matches {
+        return Ok(false);
+    }
+
+    crate::client_adapters::remove_dir_all_retry(source)
+        .with_context(|| format!("removing stale Headroom Codex adapter {}", source.display()))?;
+    Ok(true)
+}
+
+/// The destination did not exist before this clone attempt. Clean up only a
+/// directory at that exact path, refusing symlinks or a changed file type.
+fn cleanup_unpublished_codex_adapter_clone(source: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(source) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err).with_context(|| format!("inspecting {}", source.display())),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "refusing remove failed Codex adapter clone path {} after its type changed",
+            source.display()
+        );
+    }
+    crate::client_adapters::remove_dir_all_retry(source)
+        .with_context(|| format!("removing failed Codex adapter clone {}", source.display()))
 }
 
 /// Remove a checkout created by the current adapter preparation only when the
@@ -11028,6 +11179,20 @@ fn upstream_declared_version(root: &Path) -> Option<String> {
     None
 }
 
+fn codex_adapter_pnpm_package(plugin_root: &Path) -> Option<String> {
+    if !plugin_root.join("pnpm-lock.yaml").is_file() {
+        return None;
+    }
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(plugin_root.join("package.json")).ok()?).ok()?;
+    let package_manager = manifest.get("packageManager")?.as_str()?.trim();
+    let version = package_manager.strip_prefix("pnpm@")?;
+    if version.is_empty() {
+        return None;
+    }
+    Some(package_manager.to_string())
+}
+
 fn prepare_codex_plugin_adapter_at(root: &Path, plugin: &PluginAddon) -> Result<()> {
     let Some((fallback_version, description, skills)) = codex_plugin_adapter(plugin) else {
         return Ok(());
@@ -11045,18 +11210,47 @@ fn prepare_codex_plugin_adapter_at(root: &Path, plugin: &PluginAddon) -> Result<
                     .join(".headroom-npm-cache")
                     .to_string_lossy()
                     .into_owned();
-                run_codex_adapter_command(
-                    "npm",
-                    &[
-                        "install",
-                        "--ignore-scripts",
-                        "--cache",
-                        &npm_cache,
-                        "--no-audit",
-                        "--no-fund",
-                    ],
-                    &plugin_root,
-                )?;
+                if let Some(pnpm_package) = codex_adapter_pnpm_package(&plugin_root) {
+                    let package_arg = format!("--package={pnpm_package}");
+                    let pnpm_store = plugin_root
+                        .join(".headroom-pnpm-store")
+                        .to_string_lossy()
+                        .into_owned();
+                    run_codex_adapter_command(
+                        "npm",
+                        &[
+                            "--cache",
+                            &npm_cache,
+                            "--ignore-scripts",
+                            "--no-audit",
+                            "--no-fund",
+                            "exec",
+                            "--yes",
+                            &package_arg,
+                            "--",
+                            "pnpm",
+                            "install",
+                            "--frozen-lockfile",
+                            "--ignore-scripts",
+                            "--store-dir",
+                            &pnpm_store,
+                        ],
+                        &plugin_root,
+                    )?;
+                } else {
+                    run_codex_adapter_command(
+                        "npm",
+                        &[
+                            "install",
+                            "--ignore-scripts",
+                            "--cache",
+                            &npm_cache,
+                            "--no-audit",
+                            "--no-fund",
+                        ],
+                        &plugin_root,
+                    )?;
+                }
                 run_codex_adapter_command(
                     "npm",
                     &["--cache", &npm_cache, "run", "build"],
@@ -18044,6 +18238,57 @@ after
     }
 
     #[test]
+    fn codex_adapter_uses_declared_pnpm_only_with_its_lockfile() {
+        let root = tempfile::tempdir().expect("adapter root");
+        fs::write(
+            root.path().join("package.json"),
+            br#"{"packageManager":"pnpm@10.34.5"}"#,
+        )
+        .expect("package manifest");
+        fs::write(root.path().join("pnpm-lock.yaml"), b"lockfileVersion: '9.0'\n")
+            .expect("pnpm lockfile");
+
+        assert_eq!(
+            super::codex_adapter_pnpm_package(root.path()),
+            Some("pnpm@10.34.5".to_string())
+        );
+
+        fs::remove_file(root.path().join("pnpm-lock.yaml")).expect("remove pnpm lockfile");
+        assert_eq!(super::codex_adapter_pnpm_package(root.path()), None);
+    }
+
+    #[test]
+    fn stale_generated_codex_adapter_is_removed_but_unrecognized_directory_is_preserved() {
+        let root = tempfile::tempdir().expect("adapter root");
+        let plugin = super::PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "openspec")
+            .expect("OpenSpec addon");
+        let checkout = root.path().join(plugin.marketplace_name);
+
+        super::write_codex_compat_marketplace_manifest_at(root.path(), plugin)
+            .expect("compatibility manifest");
+        fs::write(checkout.join("package-lock.json"), b"{}")
+            .expect("generated adapter artifact");
+        assert!(
+            super::cleanup_stale_codex_adapter_marketplace(&checkout, plugin)
+                .expect("recognized stale adapter cleanup")
+        );
+        assert!(!checkout.exists());
+
+        fs::create_dir_all(&checkout).expect("unrecognized directory");
+        fs::write(checkout.join("user-data.txt"), b"keep").expect("user-owned sentinel");
+        assert!(
+            !super::cleanup_stale_codex_adapter_marketplace(&checkout, plugin)
+                .expect("unrecognized directory check")
+        );
+        assert_eq!(
+            fs::read(checkout.join("user-data.txt")).expect("preserved sentinel"),
+            b"keep"
+        );
+    }
+
+    #[test]
     fn cleanup_fresh_codex_adapter_checkout_requires_owned_marker() {
         let root = tempfile::tempdir().expect("marker root");
         let plugin = super::PLUGIN_ADDONS
@@ -18983,6 +19228,40 @@ after
             )));
             assert!(helper.contains("elif result.status == RegisterStatus.MISMATCH:"));
         }
+    }
+
+    #[test]
+    fn context7_accepts_compatible_user_managed_package_without_taking_ownership() {
+        let helper = super::CONTEXT7_MCP_HELPER;
+        assert!(helper.contains("def compatible_user_context7(current):"));
+        assert!(helper.contains(
+            "arg == package or arg.startswith(package + \"@\") for arg in current.args"
+        ));
+        let compatible = helper
+            .find("elif compatible_user_context7(current):")
+            .expect("compatible user entry branch");
+        let conflict = helper
+            .find("context7 entry conflicts with user-managed configuration")
+            .expect("incompatible entry still fails");
+        assert!(compatible < conflict);
+        assert!(helper.contains("compatible user-managed context7 entry, leaving it"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mcp_helper_failure_hides_embedded_python_source() {
+        let (_root, runtime, manager) = seed_test_runtime("mcp-helper-redaction");
+        write_executable(
+            &runtime.managed_python(),
+            "#!/bin/sh\necho registry-conflict >&2\nexit 1\n",
+        );
+        let err = manager
+            .run_mcp_helper(&["-c", "SECRET_HELPER_BODY", "register", "package-spec"])
+            .expect_err("helper must fail");
+        let message = format!("{err:#}");
+        assert!(!message.contains("SECRET_HELPER_BODY"));
+        assert!(message.contains("<Headroom MCP registry helper> register package-spec"));
+        assert!(message.contains("registry-conflict"));
     }
 
     #[test]
@@ -20535,7 +20814,7 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
     /// but the plugin stays disabled instead of being switched back on.
     #[test]
     #[serial_test::serial]
-    fn updating_a_disabled_plugin_leaves_it_disabled() {
+    fn updating_a_disabled_legacy_plugin_leaves_it_disabled_and_adopts_receipt() {
         let (root, runtime, manager) = seed_test_runtime("plugin-update-disabled");
         let _home = HomeGuard::new(&root);
         let codex_home = root.join(".codex");
@@ -20553,9 +20832,9 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
         let receipt = runtime.tools_dir.join(format!("{}.json", plugin.id));
         fs::write(
             &receipt,
-            br#"{"managedBy":"Headroom","pluginId":"superpowers","version":"1.0.0","enabled":false}"#,
+            br#"{"version":"1.0.0","enabled":false}"#,
         )
-        .expect("managed receipt");
+        .expect("legacy receipt");
         let invoked = root.join("codex-invoked");
         // `plugin add` is allowed to drop an existing disabled flag, so the fake
         // CLI re-enables the plugin on every call: the update path has to put the
@@ -20601,6 +20880,22 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
         assert!(
             calls.contains("plugin add superpowers@openai-curated"),
             "unexpected Codex calls: {calls}"
+        );
+
+        let adopted: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipt).expect("adopted receipt bytes"))
+                .expect("adopted receipt JSON");
+        assert_eq!(
+            adopted.get("managedBy").and_then(serde_json::Value::as_str),
+            Some("Headroom")
+        );
+        assert_eq!(
+            adopted.get("pluginId").and_then(serde_json::Value::as_str),
+            Some("superpowers")
+        );
+        assert_eq!(
+            adopted.get("enabled").and_then(serde_json::Value::as_bool),
+            Some(false)
         );
 
         // The other direction still works: an enabled addon that is installed
@@ -20655,14 +20950,25 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
     }
 
     #[test]
-    fn legacy_plugin_receipt_cannot_authorize_destructive_mutation() {
+    #[serial_test::serial]
+    fn legacy_plugin_receipt_can_toggle_existing_codex_registration_but_not_uninstall() {
         let (root, runtime, manager) = seed_test_runtime("plugin-legacy-receipt");
+        let _home = HomeGuard::new(&root);
         let plugin = PLUGIN_ADDONS
             .iter()
-            .find(|plugin| plugin.id == "allinluna")
-            .expect("All in Luna addon");
+            .find(|plugin| plugin.id == "superpowers")
+            .expect("Superpowers addon");
         let receipt = runtime.tools_dir.join(format!("{}.json", plugin.id));
-        fs::write(&receipt, br#"{"version":"latest","enabled":true}"#).expect("legacy receipt");
+        fs::write(&receipt, br#"{"version":"5.1.3","enabled":true}"#)
+            .expect("legacy receipt");
+        let codex_home = root.join(".codex");
+        fs::create_dir_all(&codex_home).expect("Codex home");
+        let config = codex_home.join("config.toml");
+        fs::write(
+            &config,
+            "[plugins.\"superpowers@openai-curated\"]\nenabled = true\n",
+        )
+        .expect("Codex plugin registration");
 
         let err = manager
             .uninstall_plugin(plugin.id)
@@ -20674,15 +20980,27 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
         );
         assert!(receipt.exists(), "legacy receipt must remain for migration");
 
-        let err = manager
+        manager
             .set_plugin_enabled(plugin.id, false)
-            .expect_err("legacy receipt must not authorize toggling");
-        assert!(
-            err.to_string()
-                .contains("legacy receipt lacks explicit Headroom ownership"),
-            "unexpected error: {err:#}"
+            .expect("legacy receipt may disable its existing Codex registration");
+        let disabled = fs::read_to_string(&config).expect("disabled config");
+        assert!(disabled.contains("enabled = false"));
+        let receipt_value: serde_json::Value =
+            serde_json::from_slice(&fs::read(&receipt).expect("legacy receipt bytes"))
+                .expect("legacy receipt JSON");
+        assert_eq!(
+            receipt_value
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
         );
-        assert!(receipt.exists(), "legacy receipt must remain for migration");
+        assert!(receipt_value.get("managedBy").is_none());
+
+        manager
+            .set_plugin_enabled(plugin.id, true)
+            .expect("legacy receipt may re-enable its existing Codex registration");
+        let enabled = fs::read_to_string(&config).expect("enabled config");
+        assert!(enabled.contains("enabled = true"));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -20726,6 +21044,69 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
             !invoked.exists(),
             "preflight refusal must happen before invoking the host CLI"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn exclusive_workflow_switch_disables_a_legacy_codex_peer() {
+        let (root, runtime, manager) = seed_test_runtime("plugin-legacy-workflow-switch");
+        let _home = HomeGuard::new(&root);
+        let superpowers = PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "superpowers")
+            .expect("Superpowers addon");
+        let openspec = PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "openspec")
+            .expect("OpenSpec addon");
+        manager
+            .write_tool_receipt(
+                superpowers.id,
+                ToolManager::plugin_receipt_payload(superpowers, "6.3.0", false),
+            )
+            .expect("managed Superpowers receipt");
+        fs::write(
+            runtime.tools_dir.join("openspec.json"),
+            br#"{"version":"1.13.1","enabled":true}"#,
+        )
+        .expect("legacy OpenSpec receipt");
+        let codex_home = root.join(".codex");
+        fs::create_dir_all(&codex_home).expect("Codex home");
+        let config = codex_home.join("config.toml");
+        fs::write(
+            &config,
+            "[plugins.\"superpowers@openai-curated\"]\nenabled = false\n\
+             [plugins.\"openspec@openspec\"]\nenabled = true\n",
+        )
+        .expect("Codex workflow registrations");
+
+        manager
+            .set_plugin_enabled(superpowers.id, true)
+            .expect("switch to Superpowers");
+
+        let config_text = fs::read_to_string(&config).expect("switched config");
+        assert_eq!(
+            super::codex_plugin_enabled_from_text(&config_text, superpowers.plugin_ref)
+                .expect("parse Superpowers state"),
+            Some(true)
+        );
+        assert_eq!(
+            super::codex_plugin_enabled_from_text(&config_text, openspec.plugin_ref)
+                .expect("parse OpenSpec state"),
+            Some(false)
+        );
+        let openspec_receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(runtime.tools_dir.join("openspec.json")).expect("OpenSpec receipt bytes"),
+        )
+        .expect("OpenSpec receipt JSON");
+        assert_eq!(
+            openspec_receipt
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert!(openspec_receipt.get("managedBy").is_none());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -22403,5 +22784,25 @@ exit 0
             context7_package_spec_for("4.0.5"),
             "@upstash/context7-mcp@4.0.5"
         );
+    }
+
+    #[test]
+    fn context7_default_install_preserves_a_newer_receipt() {
+        assert_eq!(
+            super::resolve_context7_install_version(None, Some("4.2.0")).unwrap(),
+            "4.2.0"
+        );
+        assert_eq!(
+            super::resolve_context7_install_version(None, Some("4.0.4")).unwrap(),
+            super::CONTEXT7_PINNED_VERSION
+        );
+        assert_eq!(
+            super::resolve_context7_install_version(Some("4.2.0"), Some("4.1.1")).unwrap(),
+            "4.2.0"
+        );
+
+        let err = super::resolve_context7_install_version(Some("4.0.4"), Some("4.1.1"))
+            .expect_err("explicit downgrade must still be refused");
+        assert!(format!("{err:#}").contains("from 4.1.1 to 4.0.4"));
     }
 }
