@@ -2,7 +2,11 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { AddonPresetBar, listPresetDisables } from "./AddonPresetBar";
+import {
+  AddonPresetBar,
+  listPresetDisables,
+  RECOMMENDED_ADDON_PRESET,
+} from "./AddonPresetBar";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../lib/i18n";
 import { mockDashboard } from "../lib/mockData";
 import type { DashboardState } from "../lib/types";
@@ -63,6 +67,17 @@ describe("listPresetDisables", () => {
     ]);
 
     expect(listPresetDisables(dashboard)).toEqual([]);
+  });
+
+  it("keeps the optional Codex Security audit off by default", () => {
+    expect(RECOMMENDED_ADDON_PRESET["codex-security"]).toEqual({ enabled: false });
+
+    const dashboard = dashboardWith([
+      tool("codex-security", "Codex Security", true, "healthy"),
+    ]);
+    expect(listPresetDisables(dashboard)).toEqual([
+      { id: "codex-security", name: "Codex Security" },
+    ]);
   });
 });
 

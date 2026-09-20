@@ -1687,7 +1687,7 @@ struct PluginAddon {
     codex_sparse_paths: &'static [&'static str],
 }
 
-static PLUGIN_ADDONS: [PluginAddon; 10] = [
+static PLUGIN_ADDONS: [PluginAddon; 11] = [
     PluginAddon {
         id: "ponytail",
         marketplace: "DietrichGebert/ponytail",
@@ -1736,6 +1736,16 @@ static PLUGIN_ADDONS: [PluginAddon; 10] = [
         codex_local_path: "./plugins/superpowers",
         hosts: &[PluginHost::Codex],
         source_url: "https://github.com/obra/superpowers",
+        codex_sparse_paths: &[],
+    },
+    PluginAddon {
+        id: "codex-security",
+        marketplace: "openai-curated",
+        marketplace_name: "openai-curated",
+        plugin_ref: "codex-security@openai-curated",
+        codex_local_path: "./plugins/codex-security",
+        hosts: &[PluginHost::Codex],
+        source_url: "https://developers.openai.com/codex/security",
         codex_sparse_paths: &[],
     },
     PluginAddon {
@@ -2021,7 +2031,7 @@ fn plugin_addon(id: &str) -> Option<&'static PluginAddon> {
 }
 
 fn plugin_uses_existing_marketplace(plugin: &PluginAddon) -> bool {
-    plugin.id == "superpowers"
+    plugin.marketplace_name == "openai-curated"
 }
 
 /// True when a host CLI reported that the plugin is missing from a marketplace
@@ -2036,8 +2046,8 @@ fn is_marketplace_plugin_missing(err: &anyhow::Error) -> bool {
 
 /// Add the cause and the fix to a failure that carries neither.
 ///
-/// Superpowers lives in Codex's own `openai-curated` marketplace, which Codex
-/// creates itself the first time the app starts. An update that runs before
+/// Some plugins live in Codex's own `openai-curated` marketplace, which Codex
+/// creates itself the first time the app starts. An install that runs before
 /// that first sync fails with the bare CLI line "plugin `x` was not found in
 /// marketplace `y`" -- which reads as a permanent failure, offers no action,
 /// and repeats on every retry (the user's report: "I clicked update and it
@@ -2792,6 +2802,19 @@ impl ToolManager {
                 workflow_group: Some("primary_workflow".into()),
                 activation_scope: "new_session".into(),
                 source_url: "https://github.com/obra/superpowers".into(),
+                version: PLUGIN_DISPLAY_VERSION.into(),
+                checksum: None,
+                required: false,
+            },
+            ManagedToolManifest {
+                id: "codex-security".into(),
+                name: "Codex Security".into(),
+                description: "Official OpenAI security workflows for codebase and diff scanning, finding validation, triage, and remediation guidance. Available in Codex only.".into(),
+                runtime: "plugin".into(),
+                category: "guardrails".into(),
+                workflow_group: None,
+                activation_scope: "new_session".into(),
+                source_url: "https://developers.openai.com/codex/security".into(),
                 version: PLUGIN_DISPLAY_VERSION.into(),
                 checksum: None,
                 required: false,
@@ -7774,6 +7797,9 @@ impl ToolManager {
     }
 
     fn marketplace_removal_allowed(&self, plugin: &PluginAddon, host: PluginHost) -> Result<bool> {
+        if plugin_uses_existing_marketplace(plugin) {
+            return Ok(false);
+        }
         if !matches!(host, PluginHost::Codex) {
             // Claude marketplace ownership is not exposed consistently across
             // supported CLI versions. Keep it registered unless a future
@@ -7788,6 +7814,9 @@ impl ToolManager {
     }
 
     fn remove_owned_codex_adapter_marketplace(&self, plugin: &PluginAddon) -> Result<()> {
+        if plugin_uses_existing_marketplace(plugin) {
+            return Ok(());
+        }
         if !self.codex_adapter_marketplace_is_owned(plugin)? {
             return Ok(());
         }
@@ -9089,7 +9118,7 @@ impl ToolManager {
             self.run_plugin_cmd(plugin, &cli, host, &host.update_args(plugin))
                 .map_err(|err| explain_host_marketplace_missing_plugin(plugin, err))?;
         } else {
-            // Superpowers ships in the host's own openai-curated marketplace,
+            // Host-curated plugins ship in Codex's own openai-curated marketplace,
             // which Codex materializes the first time the app starts, so there
             // is no add step for it. Every other addon
             // must successfully add/refresh its marketplace before install;
@@ -18610,6 +18639,127 @@ after
             assert_eq!(plugin.source_url, source_url);
             assert_eq!(plugin.hosts, &[PluginHost::ClaudeCode, PluginHost::Codex]);
         }
+    }
+
+    #[test]
+    fn codex_security_uses_the_host_curated_marketplace_without_owning_it() {
+        let (_root, _runtime, manager) = seed_test_runtime("codex-security-marketplace");
+        for id in ["superpowers", "codex-security"] {
+            let curated = PLUGIN_ADDONS
+                .iter()
+                .find(|plugin| plugin.id == id)
+                .expect("host-curated addon");
+            assert!(super::plugin_uses_existing_marketplace(curated));
+            assert!(!manager
+                .marketplace_removal_allowed(curated, PluginHost::Codex)
+                .expect("host marketplace must be retained"));
+            manager
+                .remove_owned_codex_adapter_marketplace(curated)
+                .expect("host marketplace cleanup must be a no-op");
+        }
+
+        let plugin = PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "codex-security")
+            .expect("Codex Security addon");
+
+        assert_eq!(plugin.marketplace, "openai-curated");
+        assert_eq!(plugin.plugin_ref, "codex-security@openai-curated");
+        assert_eq!(plugin.hosts, &[PluginHost::Codex]);
+
+        let manifest = manager
+            .manifests
+            .iter()
+            .find(|manifest| manifest.id == plugin.id)
+            .expect("Codex Security tool manifest");
+        assert_eq!(manifest.category, "guardrails");
+        assert_eq!(manifest.activation_scope, "new_session");
+        assert!(!manifest.required);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_security_install_and_uninstall_never_mutate_the_host_marketplace() {
+        let (root, runtime, manager) = seed_test_runtime("codex-security-lifecycle");
+        let _home = HomeGuard::new(&root);
+        let codex_home = root.join(".codex");
+        fs::create_dir_all(&codex_home).expect("Codex home");
+        let config = codex_home.join("config.toml");
+        let invoked = root.join("codex-invoked");
+
+        write_cli_shim(
+            &root.join(".local/bin"),
+            "codex",
+            &format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = \"--version\" ]; then exit 0; fi\n\
+                 printf '%s\\n' \"$*\" >> '{invoked}'\n\
+                 if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"add\" ]; then\n\
+                   printf '[plugins.\"codex-security@openai-curated\"]\\nenabled = true\\n' > '{config}'\n\
+                 elif [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"remove\" ]; then\n\
+                   : > '{config}'\n\
+                 fi\n\
+                 exit 0\n",
+                invoked = invoked.display(),
+                config = config.display(),
+            ),
+            &format!(
+                "@echo off\r\n\
+                 if \"%~1\"==\"--version\" exit /b 0\r\n\
+                 >> \"{invoked}\" echo %*\r\n\
+                 if \"%~1 %~2\"==\"plugin add\" (\r\n\
+                   (\r\n\
+                     echo [plugins.\"codex-security@openai-curated\"]\r\n\
+                     echo enabled = true\r\n\
+                   ) > \"{config}\"\r\n\
+                 ) else if \"%~1 %~2\"==\"plugin remove\" (\r\n\
+                   type nul > \"{config}\"\r\n\
+                 )\r\n\
+                 exit /b 0\r\n",
+                invoked = invoked.display(),
+                config = config.display(),
+            ),
+        );
+
+        manager
+            .install_plugin("codex-security", true)
+            .expect("install Codex Security");
+
+        let receipt_path = runtime.tools_dir.join("codex-security.json");
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(&receipt_path).expect("Codex Security receipt"),
+        )
+        .expect("valid receipt JSON");
+        assert_eq!(
+            receipt.get("managedBy").and_then(serde_json::Value::as_str),
+            Some("Headroom")
+        );
+        assert_eq!(
+            receipt.get("pluginId").and_then(serde_json::Value::as_str),
+            Some("codex-security")
+        );
+
+        manager
+            .uninstall_plugin("codex-security")
+            .expect("uninstall Codex Security");
+        assert!(!receipt_path.exists(), "uninstall must remove receipt");
+
+        let calls = fs::read_to_string(&invoked).expect("Codex command log");
+        let calls: Vec<_> = calls.lines().collect();
+        assert!(
+            calls.contains(&"plugin add codex-security@openai-curated"),
+            "install command missing: {calls:?}"
+        );
+        assert!(
+            calls.contains(&"plugin remove codex-security@openai-curated"),
+            "uninstall command missing: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|call| !call.starts_with("plugin marketplace ")),
+            "host marketplace must never be mutated: {calls:?}"
+        );
     }
 
     #[test]

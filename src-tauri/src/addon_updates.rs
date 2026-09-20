@@ -66,7 +66,8 @@ const OPENSPEC: UpdateSource = UpdateSource::GithubRelease {
 /// Addons whose content is delivered by a marketplace Headroom does not own,
 /// so it can neither read their release cadence nor force a refresh.
 ///
-/// `superpowers` installs from Codex's own `openai-curated` marketplace:
+/// `superpowers` and `codex-security` install from Codex's own
+/// `openai-curated` marketplace:
 /// `codex plugin marketplace upgrade` refuses every source that is not a Git
 /// checkout, and Codex syncs that snapshot on its own schedule. Comparing the
 /// installed version against obra/superpowers' GitHub release therefore
@@ -77,7 +78,7 @@ const OPENSPEC: UpdateSource = UpdateSource::GithubRelease {
 /// 6.3.0, unchanged after "Superpowers 已更新。"). Nothing Headroom can do
 /// advances that version, so the card reports it without an update action;
 /// Codex updates the curated plugin as its snapshot moves.
-const HOST_MANAGED_ADDONS: &[&str] = &["superpowers"];
+const HOST_MANAGED_ADDONS: &[&str] = &["superpowers", "codex-security"];
 
 /// Whether Headroom can deliver an update for this addon.
 fn tracks_updates(id: &str) -> bool {
@@ -244,6 +245,7 @@ pub async fn check_all() -> Vec<AddonUpdateCheck> {
                 "allinluna",
                 "openspec",
                 "superpowers",
+                "codex-security",
                 "gstack",
                 "ralph-loop",
                 "stop-that-shit",
@@ -280,6 +282,7 @@ pub async fn check_all() -> Vec<AddonUpdateCheck> {
         allinluna,
         openspec,
         superpowers,
+        codex_security,
         gstack,
         ralph_loop,
         stop_that_shit,
@@ -298,6 +301,7 @@ pub async fn check_all() -> Vec<AddonUpdateCheck> {
         check_one(&client, "openspec", OPENSPEC),
         // Not checked: host-managed (see HOST_MANAGED_ADDONS).
         async { host_managed_check("superpowers") },
+        async { host_managed_check("codex-security") },
         check_one(&client, "gstack", GSTACK),
         check_one(&client, "ralph-loop", RALPH_LOOP),
         check_one(&client, "stop-that-shit", STOP_THAT_SHIT),
@@ -316,6 +320,7 @@ pub async fn check_all() -> Vec<AddonUpdateCheck> {
         allinluna,
         openspec,
         superpowers,
+        codex_security,
         gstack,
         ralph_loop,
         stop_that_shit,
@@ -340,7 +345,9 @@ mod tests {
     #[test]
     fn host_managed_addons_are_not_advertised_as_updatable() {
         assert!(!tracks_updates("superpowers"));
+        assert!(!tracks_updates("codex-security"));
         assert!(HOST_MANAGED_ADDONS.contains(&"superpowers"));
+        assert!(HOST_MANAGED_ADDONS.contains(&"codex-security"));
         for id in [
             "gstack",
             "openspec",
@@ -360,10 +367,12 @@ mod tests {
 
     #[test]
     fn host_managed_addons_report_no_error_and_no_version() {
-        let check = super::host_managed_check("superpowers");
-        assert_eq!(check.id, "superpowers");
-        assert!(check.latest_version.is_none());
-        assert!(check.error.is_none());
+        for id in ["superpowers", "codex-security"] {
+            let check = super::host_managed_check(id);
+            assert_eq!(check.id, id);
+            assert!(check.latest_version.is_none());
+            assert!(check.error.is_none());
+        }
     }
 
     #[test]

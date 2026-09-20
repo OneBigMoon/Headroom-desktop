@@ -352,3 +352,21 @@ export function workflowSwitchPeers<T extends SwitchableTool>(
       tool.status !== "not_installed"
   );
 }
+
+Object.assign(toolCategoryCopy.guardrails.description, {
+  en: "Controls risky or out-of-scope actions: Stop That Shit enforces task boundaries, Agent Guard checks secrets and dangerous commands, and optional official Codex Security audits code and diffs; these roles complement each other.",
+  "zh-CN": "限制越界和危险操作：Stop That Shit 约束任务范围，Agent Guard 检查密钥与高风险命令，官方 Codex Security 可选地审计代码与差异中的安全问题；三者职责不同，可以配合使用。",
+  "zh-TW": "限制越界和危險操作：Stop That Shit 約束任務範圍，Agent Guard 檢查密鑰與高風險命令，官方 Codex Security 可選地稽核程式碼與差異中的安全問題；三者職責不同，可以配合使用。",
+  ja: "危険または範囲外の操作を制御します。Stop That Shit はタスク境界、Agent Guard は秘密情報と危険なコマンド、公式の Codex Security はコードと差分のセキュリティ監査を担当します。役割は異なり、併用できます。",
+  ko: "위험하거나 범위를 벗어난 작업을 제어합니다. Stop That Shit은 작업 경계, Agent Guard는 비밀정보와 위험한 명령, 공식 Codex Security는 코드와 diff의 보안 감사를 담당합니다. 역할이 다르므로 함께 사용할 수 있습니다.",
+});
+
+Object.assign(toolCopy, {
+  "codex-security": {
+    en: "Optional official Codex-only security audit workflow for code and diffs, threat modeling, and fix validation. Findings tracking outside Codex may require separate authorization.",
+    "zh-CN": "可选的官方 Codex 专用安全审计工作流：扫描代码与差异、进行威胁建模并验证修复。若要在 Codex 外跟踪 findings，可能需要单独授权。",
+    "zh-TW": "可選的官方 Codex 專用安全稽核工作流程：掃描程式碼與差異、進行威脅建模並驗證修復。若要在 Codex 外追蹤 findings，可能需要另外授權。",
+    ja: "コードと差分のスキャン、脅威モデリング、修正検証を行う公式 Codex 専用の任意セキュリティ監査ワークフローです。Codex 外で findings を追跡するには別途認可が必要な場合があります。",
+    ko: "코드와 diff 스캔, 수정 검증을 제공하는 공식 Codex 전용 선택형 보안 감사 워크플로입니다. Codex 외부에서 findings를 추적하려면 별도 권한이 필요할 수 있습니다.",
+  },
+});

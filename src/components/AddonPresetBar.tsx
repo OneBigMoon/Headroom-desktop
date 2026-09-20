@@ -11,6 +11,7 @@ export const RECOMMENDED_ADDON_PRESET: Record<string, AddonPresetTarget> = {
   "ralph-loop": { enabled: false },
   "stop-that-shit": { enabled: true },
   "agent-guard": { enabled: true },
+  "codex-security": { enabled: false },
   serena: { enabled: true },
   "codebase-memory": { enabled: true },
   context7: { enabled: true },

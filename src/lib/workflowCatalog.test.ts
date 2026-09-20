@@ -4,6 +4,8 @@ import {
   activationScopeCopyByScope,
   getActivationScopeCopy,
   groupToolsByCategory,
+  toolCategoryCopy,
+  toolCopy,
   TOOL_CATEGORY_ORDER,
   workflowSwitchPeers,
 } from "./workflowCatalog";
@@ -78,5 +80,16 @@ describe("activation scope copy", () => {
     expect(getActivationScopeCopy("unexpected")).toEqual(activationScopeCopyByScope.unknown);
     expect(getActivationScopeCopy(null)["zh-CN"]).toContain("取决于具体工具");
     expect(getActivationScopeCopy(undefined)["zh-CN"]).not.toContain("重启");
+  });
+});
+
+describe("security workflow catalog copy", () => {
+  it("describes Codex Security as optional and distinct from the guardrails", () => {
+    expect(toolCopy["codex-security"]["zh-CN"]).toContain("可选");
+    expect(toolCopy["codex-security"]["zh-CN"]).toContain("威胁建模");
+    expect(toolCopy["codex-security"]["zh-CN"]).toContain("修复");
+    expect(toolCategoryCopy.guardrails.description["zh-CN"]).toContain("Stop That Shit");
+    expect(toolCategoryCopy.guardrails.description["zh-CN"]).toContain("Agent Guard");
+    expect(toolCategoryCopy.guardrails.description["zh-CN"]).toContain("Codex Security");
   });
 });
