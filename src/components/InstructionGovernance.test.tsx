@@ -10,6 +10,8 @@ describe("instruction governance", () => {
   it("restores the selected persisted snapshot and disables unchanged candidates", async () => {
     vi.mocked(invoke).mockImplementation(async command => command === "audit_instructions" ? [{ ...report, candidate_hash: "before" }] : command === "list_instruction_snapshots" ? [{ id: "saved-id", target: "codex", created_at: "" }] : undefined);
     render(<InstructionGovernance />);
+    expect(screen.getByText(/Review local Codex tool hints/i)).toHaveTextContent("existing codexbox blocks");
+    expect(screen.getByText(/Review local Codex tool hints/i)).not.toHaveTextContent(/Claude|Headroom/i);
     fireEvent.click(screen.getByText("Read and preview"));
     await screen.findByText("outdated");
     expect((screen.getByText("Back up and apply candidate") as HTMLButtonElement).disabled).toBe(true);

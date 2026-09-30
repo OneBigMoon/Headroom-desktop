@@ -57,12 +57,12 @@ test("stages macOS and Windows assets with one updater manifest", (t) => {
   });
 
   assert.deepEqual(result.assetNames, [
-    "Headroom.Local.Community_1.2.3_universal.dmg",
-    "Headroom.Local.Community_universal.app.tar.gz",
-    "Headroom.Local.Community_universal.app.tar.gz.sig",
-    "Headroom.Local.Community_1.2.3_x64-setup.exe",
-    "Headroom.Local.Community_x64-setup.nsis.zip",
-    "Headroom.Local.Community_x64-setup.nsis.zip.sig",
+    "codexbox_1.2.3_universal.dmg",
+    "codexbox_universal.app.tar.gz",
+    "codexbox_universal.app.tar.gz.sig",
+    "codexbox_1.2.3_x64-setup.exe",
+    "codexbox_x64-setup.nsis.zip",
+    "codexbox_x64-setup.nsis.zip.sig",
     "latest.json",
   ]);
   assert.equal(result.manifest.version, "1.2.3");
@@ -76,7 +76,7 @@ test("stages macOS and Windows assets with one updater manifest", (t) => {
   ]);
   assert.equal(
     result.manifest.platforms["darwin-aarch64"].url,
-    "https://github.com/OneBigMoon/Headroom-desktop/releases/download/v1.2.3/Headroom.Local.Community_universal.app.tar.gz",
+    "https://github.com/OneBigMoon/Headroom-desktop/releases/download/v1.2.3/codexbox_universal.app.tar.gz",
   );
   assert.equal(
     result.manifest.platforms["darwin-aarch64"].signature,
@@ -84,7 +84,7 @@ test("stages macOS and Windows assets with one updater manifest", (t) => {
   );
   assert.equal(
     result.manifest.platforms["windows-x86_64"].url,
-    "https://github.com/OneBigMoon/Headroom-desktop/releases/download/v1.2.3/Headroom.Local.Community_x64-setup.nsis.zip",
+    "https://github.com/OneBigMoon/Headroom-desktop/releases/download/v1.2.3/codexbox_x64-setup.nsis.zip",
   );
   assert.equal(
     result.manifest.platforms["windows-x86_64"].signature,
@@ -230,7 +230,7 @@ test("release workflow builds both platforms and publishes one seven-asset relea
   assert.match(workflow, /aggregate:[\s\S]*?needs: \[validate, build_macos, build_windows\]/);
   assert.match(workflow, /publish:[\s\S]*?needs: aggregate/);
   assert.match(workflow, /"windows-x86_64"/);
-  assert.match(workflow, /Headroom\.Local\.Community_x64-setup\.nsis\.zip/);
+  assert.match(workflow, /codexbox_x64-setup\.nsis\.zip/);
   assert.match(workflow, /\.assets \| length' <<<"\$\{release_json\}"\)" == "7"/);
   assert.equal((workflow.match(/contents: write/g) ?? []).length, 1);
 });

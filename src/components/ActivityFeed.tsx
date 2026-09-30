@@ -2,7 +2,11 @@ import { useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { Bell, WifiSlash } from "@phosphor-icons/react";
 import type { ReactNode } from "react";
 import { formatDateTime, formatRelativeTime } from "../lib/dashboardHelpers";
-import { estimateCostSavingsUsd, formatEstimatedUsd } from "../lib/modelPricing";
+import {
+  estimateCostSavingsUsd,
+  formatEstimatedUsd,
+  type ModelInputPriceMap
+} from "../lib/modelPricing";
 import { useI18n, type TranslationKey } from "../lib/i18n";
 import type {
   ActivityFeedResponse,
@@ -34,6 +38,7 @@ interface ActivityFeedProps {
   // from a just-uninstalled addon render rather than vanish mid-session.
   rtkInstalled?: boolean;
   serenaInstalled?: boolean;
+  modelInputPrices?: ModelInputPriceMap;
 }
 
 // One entry per tile kind. `kind` matches the `ActivityFeedSnapshot` slot name
@@ -94,7 +99,8 @@ export function ActivityFeed({
   loaded = true,
   onNavigateToOptimize,
   rtkInstalled = false,
-  serenaInstalled = false
+  serenaInstalled = false,
+  modelInputPrices = {}
 }: ActivityFeedProps) {
   const { t } = useI18n();
   const { tiles } = feed;
@@ -146,9 +152,16 @@ export function ActivityFeed({
         </div>
       ) : (
         <ul className="activity-feed__list">
-          {tiles.record ? <RecordRow event={tiles.record} /> : <EmptyTile kind="record" />}
+          {tiles.record ? (
+            <RecordRow event={tiles.record} modelInputPrices={modelInputPrices} />
+          ) : (
+            <EmptyTile kind="record" />
+          )}
           {tiles.transformation ? (
-            <TransformationRow event={tiles.transformation} />
+            <TransformationRow
+              event={tiles.transformation}
+              modelInputPrices={modelInputPrices}
+            />
           ) : (
             <EmptyTile kind="transformation" />
           )}
@@ -505,7 +518,13 @@ function isClampedTokenPair(
   return optimized === 0 && original != null && saved > original;
 }
 
-function TransformationRow({ event }: { event: TransformationFeedEvent }) {
+function TransformationRow({
+  event,
+  modelInputPrices
+}: {
+  event: TransformationFeedEvent;
+  modelInputPrices: ModelInputPriceMap;
+}) {
   const { t } = useI18n();
   const saved = event.tokensSaved ?? 0;
   const pct = event.savingsPercent ?? 0;
@@ -519,7 +538,7 @@ function TransformationRow({ event }: { event: TransformationFeedEvent }) {
   const hasRawTransforms = event.transformsApplied.length > 0;
   const groups = hasRawTransforms ? groupTransforms(event.transformsApplied) : [];
   const groupsWithTargets = groups.filter((g) => g.targets.length > 0);
-  const estimatedUsd = estimateCostSavingsUsd(event.model, saved);
+  const estimatedUsd = estimateCostSavingsUsd(event.model, saved, modelInputPrices);
   const hasRequestMessages = !!event.requestMessages && event.requestMessages.length > 0;
   const hasCompressedMessages =
     !!event.compressedMessages && event.compressedMessages.length > 0;
@@ -938,7 +957,13 @@ const RECORD_TAG_KEY: Record<RecordTag, TranslationKey> = {
   allTime: "activity.tag.allTime"
 };
 
-function RecordRow({ event }: { event: RecordEvent }) {
+function RecordRow({
+  event,
+  modelInputPrices
+}: {
+  event: RecordEvent;
+  modelInputPrices: ModelInputPriceMap;
+}) {
   const { t } = useI18n();
   const workspace = workspaceBasename(event.workspace);
   const pct = event.savingsPercent;
@@ -955,7 +980,11 @@ function RecordRow({ event }: { event: RecordEvent }) {
       event.inputTokensOptimized
     );
   const hasRequestId = !!event.requestId;
-  const estimatedUsd = estimateCostSavingsUsd(event.model, event.tokensSaved);
+  const estimatedUsd = estimateCostSavingsUsd(
+    event.model,
+    event.tokensSaved,
+    modelInputPrices
+  );
   const hasExtra =
     estimatedUsd != null ||
     hasExactTokens ||

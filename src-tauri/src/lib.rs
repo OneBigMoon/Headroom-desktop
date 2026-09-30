@@ -6,13 +6,17 @@ mod bearer;
 mod claude_cli;
 mod client_adapters;
 mod codex_router;
+mod system_one_adapter;
 mod device;
 mod edition;
 mod insights;
 pub mod instruction_governance;
+mod jev;
+mod jev_catalog;
 mod keychain;
 mod logging;
 mod memory_scrubber;
+mod model_pricing;
 mod models;
 mod output_savings;
 mod port_conflict;
@@ -1194,12 +1198,12 @@ fn show_app_update_notification(app: AppHandle, version: String) -> Result<(), S
 fn app_update_notification_body(version: &str) -> String {
     let trimmed = version.trim();
     let lead = if trimmed.is_empty() {
-        "A Headroom update is ready to install.".to_string()
+        "A codexbox update is ready to install.".to_string()
     } else {
-        format!("Headroom {trimmed} is ready to install.")
+        format!("codexbox {trimmed} is ready to install.")
     };
 
-    format!("{lead} Open Headroom to review the release and install it.")
+    format!("{lead} Open codexbox to review the release and install it.")
 }
 
 fn show_app_update_notification_impl(app: &AppHandle, version: &str) -> Result<(), String> {
@@ -3774,7 +3778,7 @@ fn run_activity_observation(app: &AppHandle, preferred_target: Option<&str>) {
         savings_canary::observe(&feed.transformations);
     }
 
-    let projects = state.list_claude_code_projects().unwrap_or_default();
+    let projects: Vec<ClaudeCodeProject> = Vec::new();
     let codex_project = state.codex_sessions_activity_project();
 
     // Memory.db "patterns today" comes from the export JSON's `created_at`
@@ -3958,6 +3962,9 @@ async fn delete_live_learning(state: State<'_, AppState>, memory_id: String) -> 
 async fn list_applied_patterns(
     project_path: String,
 ) -> Result<crate::models::AppliedPatterns, String> {
+    if project_path != "codex" {
+        return Err("codexbox only supports Codex learning targets.".into());
+    }
     Ok(read_applied_patterns_for_target(&project_path))
 }
 
@@ -3965,6 +3972,9 @@ async fn list_applied_patterns(
 async fn list_applied_patterns_for_projects(
     project_paths: Vec<String>,
 ) -> Result<std::collections::HashMap<String, crate::models::AppliedPatterns>, String> {
+    if project_paths.iter().any(|target| target != "codex") {
+        return Err("codexbox only supports Codex learning targets.".into());
+    }
     let mut out = std::collections::HashMap::with_capacity(project_paths.len());
     for p in project_paths {
         let patterns = read_applied_patterns_for_target(&p);
@@ -4027,6 +4037,20 @@ fn claude_learn_md_path(project_path: &str) -> std::path::PathBuf {
 
 #[tauri::command]
 async fn delete_applied_pattern(
+    project_path: String,
+    file_kind: String,
+    section_title: String,
+    bullet_text: String,
+) -> Result<(), String> {
+    if !matches!(file_kind.as_str(), "codex_agents" | "codex_instructions") {
+        return Err("codexbox only supports Codex learning files.".into());
+    }
+    delete_legacy_applied_pattern(project_path, file_kind, section_title, bullet_text).await
+}
+
+// Keep the historical file-format behavior testable, but expose only the
+// Codex-guarded command above to the desktop UI.
+async fn delete_legacy_applied_pattern(
     project_path: String,
     file_kind: String,
     section_title: String,
@@ -4164,6 +4188,9 @@ async fn start_headroom_learn(
     agent: String,
     project_path: Option<String>,
 ) -> Result<(), String> {
+    if agent != "codex" {
+        return Err("codexbox only supports Codex.".into());
+    }
     let agent = LearnAgent::parse(&agent)?;
     let target = learn_run_target(agent, project_path.clone())?;
     check_headroom_learn_prereqs(
@@ -4206,7 +4233,8 @@ fn show_dashboard_window(app: AppHandle) -> Result<(), String> {
         return Err("Complete onboarding before opening the tray dashboard.".into());
     }
 
-    ensure_runtime_ready_for_tray(&app);
+    let app_bg = app.clone();
+    std::thread::spawn(move || ensure_runtime_ready_for_tray(&app_bg));
     hide_launcher_window(&app).map_err(command_error)?;
     show_main_window(&app, None).map_err(command_error)
 }
@@ -5241,7 +5269,7 @@ pub fn run() {
             spawn_tray_savings_updater(app.handle().clone());
             spawn_proxy_watchdog(app.handle().clone());
             spawn_activity_observer(app.handle().clone());
-            spawn_claude_projects_warmer(app.handle().clone());
+            // codexbox does not scan other coding clients at startup.
             let state: tauri::State<'_, AppState> = app.state();
             let app_handle = app.handle().clone();
             analytics::set_headroom_ai_version(
@@ -5511,8 +5539,14 @@ pub fn run() {
         })
         .on_window_event(|window, event| handle_window_event(window, event))
         .manage(state)
+        .manage(jev::JevState::default())
         .manage(PendingAppUpdate(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
+            jev::get_jev_dashboard,
+            jev::get_jev_models,
+            jev::set_jev_key,
+            jev::set_adapter_key,
+            jev::evaluate_jev,
             instruction_governance::audit_instructions,
             instruction_governance::list_instruction_snapshots,
             instruction_governance::apply_instruction_candidate,
@@ -5546,9 +5580,6 @@ pub fn run() {
             get_launch_flags,
             get_rtk_activity,
             get_tool_logs,
-            get_claude_code_projects,
-            get_claude_usage,
-            get_claude_profile,
             get_headroom_pricing_status,
             get_activity_feed,
             list_live_learnings,
@@ -6767,10 +6798,10 @@ struct NativeTrayCopy {
 fn native_tray_copy(locale: NativeTrayLocale) -> NativeTrayCopy {
     match locale {
         NativeTrayLocale::SimplifiedChinese => NativeTrayCopy {
-            show: "显示 Headroom",
-            pause: "暂停 Headroom",
-            resume: "继续 Headroom",
-            quit: "退出 Headroom",
+            show: "显示 codexbox",
+            pause: "暂停 codexbox",
+            resume: "继续 codexbox",
+            quit: "退出 codexbox",
             starting: "Headroom — 正在启动",
             active: "Headroom — 运行中",
             paused: "Headroom — 已暂停（Claude Code 或 Codex 可正常运行）",
@@ -6780,10 +6811,10 @@ fn native_tray_copy(locale: NativeTrayLocale) -> NativeTrayCopy {
             disconnected_notification: "Claude Code 或 Codex 已断开连接，请打开 Headroom 重新启用。",
         },
         NativeTrayLocale::TraditionalChinese => NativeTrayCopy {
-            show: "顯示 Headroom",
-            pause: "暫停 Headroom",
-            resume: "繼續 Headroom",
-            quit: "結束 Headroom",
+            show: "顯示 codexbox",
+            pause: "暫停 codexbox",
+            resume: "繼續 codexbox",
+            quit: "結束 codexbox",
             starting: "Headroom — 正在啟動",
             active: "Headroom — 執行中",
             paused: "Headroom — 已暫停（Claude Code 或 Codex 可正常執行）",
@@ -6793,10 +6824,10 @@ fn native_tray_copy(locale: NativeTrayLocale) -> NativeTrayCopy {
             disconnected_notification: "Claude Code 或 Codex 已中斷連線，請開啟 Headroom 重新啟用。",
         },
         NativeTrayLocale::Japanese => NativeTrayCopy {
-            show: "Headroom を表示",
-            pause: "Headroom を一時停止",
-            resume: "Headroom を再開",
-            quit: "Headroom を終了",
+            show: "codexbox を表示",
+            pause: "codexbox を一時停止",
+            resume: "codexbox を再開",
+            quit: "codexbox を終了",
             starting: "Headroom — 起動中",
             active: "Headroom — 稼働中",
             paused: "Headroom — 一時停止中（Claude Code または Codex は通常どおり動作します）",
@@ -6806,10 +6837,10 @@ fn native_tray_copy(locale: NativeTrayLocale) -> NativeTrayCopy {
             disconnected_notification: "Claude Code または Codex が切断されました。Headroom を開いて再度有効にしてください。",
         },
         NativeTrayLocale::Korean => NativeTrayCopy {
-            show: "Headroom 표시",
-            pause: "Headroom 일시 정지",
-            resume: "Headroom 다시 시작",
-            quit: "Headroom 종료",
+            show: "codexbox 표시",
+            pause: "codexbox 일시 정지",
+            resume: "codexbox 다시 시작",
+            quit: "codexbox 종료",
             starting: "Headroom — 시작 중",
             active: "Headroom — 실행 중",
             paused: "Headroom — 일시 정지됨(Claude Code 또는 Codex는 정상 작동)",
@@ -6819,10 +6850,10 @@ fn native_tray_copy(locale: NativeTrayLocale) -> NativeTrayCopy {
             disconnected_notification: "Claude Code 또는 Codex의 연결이 끊겼습니다. Headroom을 열어 다시 활성화하세요.",
         },
         NativeTrayLocale::English => NativeTrayCopy {
-            show: "Show Headroom",
-            pause: "Pause Headroom",
-            resume: "Resume Headroom",
-            quit: "Quit Headroom",
+            show: "Show codexbox",
+            pause: "Pause codexbox",
+            resume: "Resume codexbox",
+            quit: "Quit codexbox",
             starting: "Headroom — starting",
             active: "Headroom — active",
             paused: "Headroom — paused (Claude Code or Codex running normally)",
@@ -6864,7 +6895,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let copy = native_tray_copy(locale);
 
     let show = tauri::menu::MenuItem::with_id(app, "show", copy.show, true, None::<&str>)?;
-    // Text flips to "Resume Headroom" while paused, from the tray updater loop.
+    // Text flips to "Resume codexbox" while paused, from the tray updater loop.
     let pause = tauri::menu::MenuItem::with_id(app, "pause", copy.pause, true, None::<&str>)?;
     let quit = tauri::menu::MenuItem::with_id(app, "quit", copy.quit, true, None::<&str>)?;
     let separator = tauri::menu::PredefinedMenuItem::separator(app)?;
@@ -6877,7 +6908,7 @@ fn setup_tray(app: &AppHandle) -> tauri::Result<()> {
     let mut tray_builder = tauri::tray::TrayIconBuilder::with_id("headroom-tray")
         .menu(&menu)
         .icon_as_template(false)
-        .tooltip("Headroom")
+        .tooltip("codexbox")
         .show_menu_on_left_click(false)
         .on_tray_icon_event(move |tray, event| {
             if let TrayIconEvent::Click {
@@ -7970,6 +8001,8 @@ fn toggle_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Resu
 }
 
 fn ensure_runtime_ready_for_tray(app: &AppHandle) {
+    static CHECKING: Mutex<()> = Mutex::new(());
+    let Some(_guard) = CHECKING.try_lock() else { return; };
     let state: tauri::State<'_, AppState> = app.state();
     if state.runtime_is_paused() {
         return;
@@ -8281,6 +8314,17 @@ fn compute_tray_window_position(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn codexbox_rejects_legacy_learning_targets_before_io() {
+        assert!(super::list_applied_patterns("claude".into()).await.is_err());
+        assert!(super::list_applied_patterns_for_projects(vec!["codex".into(), "opencode".into()]).await.is_err());
+        for file_kind in ["claude", "memory", "unknown"] {
+            let error = super::delete_applied_pattern(
+                "/nonexistent/codexbox-test".into(), file_kind.into(), "section".into(), "bullet".into(),
+            ).await.expect_err("unsupported learning files must be rejected before filesystem access");
+            assert_eq!(error, "codexbox only supports Codex learning files.");
+        }
+    }
     use super::{
         aggregate_live_learnings, app_quit_requested_properties, app_update_notification_body,
         auto_resume_backoff, begin_runtime_session_at, beta_channel_enabled_from,
@@ -8288,7 +8332,7 @@ mod tests {
         child_state_fingerprint_key, classify_backend_readyz, classify_bootstrap_failure,
         classify_update_check, classify_upgrade_error, client_setup_error_kind, command_error,
         compute_panel_corner_position, compute_tray_window_position, count_memories_created_today,
-        cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_applied_pattern,
+        cpu_rate_indicates_burn, debounced_tray_runtime_visual, delete_legacy_applied_pattern as delete_applied_pattern,
         empty_live_learnings_for_projects, exe_path_resolvable, extract_llm_failure_warnings,
         fake_override, fetch_transformations_feed_from, finish_runtime_session_at,
         first_savings_body, format_token_count, install_pending_update, is_disk_full_signal,
@@ -8346,31 +8390,31 @@ mod tests {
         let expected = [
             (
                 NativeTrayLocale::SimplifiedChinese,
-                "显示 Headroom",
-                "暂停 Headroom",
-                "继续 Headroom",
-                "退出 Headroom",
+                "显示 codexbox",
+                "暂停 codexbox",
+                "继续 codexbox",
+                "退出 codexbox",
             ),
             (
                 NativeTrayLocale::TraditionalChinese,
-                "顯示 Headroom",
-                "暫停 Headroom",
-                "繼續 Headroom",
-                "結束 Headroom",
+                "顯示 codexbox",
+                "暫停 codexbox",
+                "繼續 codexbox",
+                "結束 codexbox",
             ),
             (
                 NativeTrayLocale::Japanese,
-                "Headroom を表示",
-                "Headroom を一時停止",
-                "Headroom を再開",
-                "Headroom を終了",
+                "codexbox を表示",
+                "codexbox を一時停止",
+                "codexbox を再開",
+                "codexbox を終了",
             ),
             (
                 NativeTrayLocale::Korean,
-                "Headroom 표시",
-                "Headroom 일시 정지",
-                "Headroom 다시 시작",
-                "Headroom 종료",
+                "codexbox 표시",
+                "codexbox 일시 정지",
+                "codexbox 다시 시작",
+                "codexbox 종료",
             ),
         ];
 
@@ -8988,11 +9032,11 @@ mod tests {
     fn app_update_notification_body_mentions_the_target_version() {
         assert_eq!(
             app_update_notification_body("0.3.0"),
-            "Headroom 0.3.0 is ready to install. Open Headroom to review the release and install it."
+            "codexbox 0.3.0 is ready to install. Open codexbox to review the release and install it."
         );
         assert_eq!(
             app_update_notification_body("   "),
-            "A Headroom update is ready to install. Open Headroom to review the release and install it."
+            "A codexbox update is ready to install. Open codexbox to review the release and install it."
         );
     }
 

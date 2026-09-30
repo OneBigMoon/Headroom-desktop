@@ -127,13 +127,7 @@ enum ShellFamily {
 pub fn detect_clients() -> Vec<ClientStatus> {
     let setup_state = load_setup_state();
 
-    vec![
-        detect_claude_code_client(is_configured(&setup_state, "claude_code")),
-        detect_codex_client(is_configured(&setup_state, "codex")),
-        detect_grok_build_client(is_configured(&setup_state, "grok_build")),
-        detect_opencode_client(is_configured(&setup_state, "opencode")),
-        detect_zcode_client(is_configured(&setup_state, "zcode")),
-    ]
+    vec![detect_codex_client(is_configured(&setup_state, "codex"))]
 }
 
 pub fn ensure_rtk_integrations(
@@ -149,8 +143,8 @@ pub fn ensure_rtk_integrations(
 
 fn ensure_rtk_integrations_for_targets(
     managed_rtk_path: &Path,
-    managed_python_path: &Path,
-    shell_targets: &[PathBuf],
+    _managed_python_path: &Path,
+    _shell_targets: &[PathBuf],
 ) -> Result<(Vec<String>, Vec<String>)> {
     // Respect the user's opt-out so bootstrap, restore, and client setup don't
     // silently re-add the PATH export and Claude Code hook after they've been
@@ -164,6 +158,38 @@ fn ensure_rtk_integrations_for_targets(
     let mut changed_files = Vec::new();
     let mut backup_files = Vec::new();
 
+    // Codex has no PreToolUse-style hook, so the auto-rewrite is delivered as a
+    // managed instruction block. Do not create shell exports or Claude hooks
+    // from the Codex-only public integration boundary.
+    if is_codex_enabled() {
+        let agents = rtk_codex_agents_path();
+        let (codex_changed, codex_backup) =
+            upsert_managed_block(&agents, "rtk", &build_rtk_codex_nudge(managed_rtk_path))?;
+        if codex_changed {
+            changed_files.push(agents.display().to_string());
+        }
+        if let Some(path) = codex_backup {
+            backup_files.push(path.display().to_string());
+        }
+    }
+
+    Ok((changed_files, backup_files))
+}
+
+// Legacy implementation retained for the private compatibility path used by
+// old configuration tests and migration code. The public Codex boundary above
+// must not call this helper.
+fn ensure_legacy_rtk_integrations_for_targets(
+    managed_rtk_path: &Path,
+    managed_python_path: &Path,
+    shell_targets: &[PathBuf],
+) -> Result<(Vec<String>, Vec<String>)> {
+    if is_rtk_disabled() || !managed_rtk_path.exists() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let mut changed_files = Vec::new();
+    let mut backup_files = Vec::new();
     let mut path_updates = ensure_managed_rtk_on_path(managed_rtk_path, shell_targets)?;
     let mut hook_updates = ensure_claude_code_rtk_hook(managed_rtk_path, managed_python_path)?;
     changed_files.append(&mut path_updates.0);
@@ -171,10 +197,6 @@ fn ensure_rtk_integrations_for_targets(
     changed_files.append(&mut hook_updates.0);
     backup_files.append(&mut hook_updates.1);
 
-    // Codex has no PreToolUse-style hook, so the auto-rewrite can't be wired the
-    // way it is for Claude Code. Mirror the MarkItDown approach: drop a managed
-    // `~/.codex/AGENTS.md` nudge telling Codex to route shell commands through
-    // the managed `rtk` binary (which is already on PATH via the block above).
     if is_codex_enabled() {
         let agents = rtk_codex_agents_path();
         let (codex_changed, codex_backup) =
@@ -206,10 +228,6 @@ pub(crate) fn instruction_targets() -> Vec<(String, PathBuf, Vec<(String, String
         ("codex".into(), rtk_codex_agents_path(), vec![
             ("rtk".into(), build_rtk_codex_nudge(&default_headroom_rtk_path())),
             ("markitdown".into(), build_markitdown_codex_nudge(&converter)),
-            ("serena".into(), build_serena_usage_nudge().into()),
-        ]),
-        ("claude".into(), markitdown_claude_md_path(), vec![
-            ("markitdown_office".into(), build_markitdown_office_nudge(&converter)),
             ("serena".into(), build_serena_usage_nudge().into()),
         ]),
     ]
@@ -279,29 +297,7 @@ pub fn set_rtk_enabled(
     if enabled {
         ensure_rtk_integrations(managed_rtk_path, managed_python_path)?;
     } else {
-        let shell_targets = resolve_client_shell_targets_for_cleanup(&state, "claude_code")?;
-        remove_shell_block(&shell_targets, "managed_rtk")?;
-        let mut failures = Vec::new();
-        for settings_path in claude_settings_candidates() {
-            if let Err(err) = strip_headroom_hook_from_settings(&settings_path) {
-                failures.push(format!("{}: {err:#}", settings_path.display()));
-            }
-        }
-        let hook_path = headroom_rtk_hook_path();
-        if hook_path.exists() {
-            if let Err(err) = std::fs::remove_file(&hook_path) {
-                failures.push(format!("{}: {err}", hook_path.display()));
-            }
-        }
-        if let Err(err) = remove_managed_block(&rtk_codex_agents_path(), "rtk") {
-            failures.push(format!("{}: {err:#}", rtk_codex_agents_path().display()));
-        }
-        if !failures.is_empty() {
-            return Err(anyhow!(
-                "disabling RTK integrations was incomplete: {}",
-                failures.join("; ")
-            ));
-        }
+        remove_managed_block(&rtk_codex_agents_path(), "rtk")?;
     }
 
     Ok(())
@@ -387,7 +383,12 @@ fn official_headroom_routing_conflict() -> Option<PathBuf> {
 }
 
 pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
-    apply_client_setup_with_options(client_id, false)
+    let client_id = public_codex_client_id(client_id)?;
+    apply_legacy_client_setup_with_options(client_id, false)
+}
+
+fn apply_legacy_client_setup(client_id: &str) -> Result<ClientSetupResult> {
+    apply_legacy_client_setup_with_options(client_id, false)
 }
 
 /// `allow_takeover` is set only after the user explicitly confirms replacing an
@@ -395,6 +396,14 @@ pub fn apply_client_setup(client_id: &str) -> Result<ClientSetupResult> {
 /// `codex_local_access`). The displaced provider is recorded and restored on
 /// disable; without the flag Headroom still refuses to clobber an unknown one.
 pub fn apply_client_setup_with_options(
+    client_id: &str,
+    allow_takeover: bool,
+) -> Result<ClientSetupResult> {
+    let client_id = public_codex_client_id(client_id)?;
+    apply_legacy_client_setup_with_options(client_id, allow_takeover)
+}
+
+fn apply_legacy_client_setup_with_options(
     client_id: &str,
     allow_takeover: bool,
 ) -> Result<ClientSetupResult> {
@@ -478,7 +487,7 @@ fn apply_client_setup_once(client_id: &str, allow_takeover: bool) -> Result<Clie
             // Shell profile (RTK PATH + env export) is convenience; tolerate an
             // unwritable profile rather than failing the whole setup.
             let env_block = format!("export ANTHROPIC_BASE_URL={}", HEADROOM_ANTHROPIC_BASE_URL);
-            let shell_step = ensure_rtk_integrations_for_targets(
+            let shell_step = ensure_legacy_rtk_integrations_for_targets(
                 &default_headroom_rtk_path(),
                 &default_headroom_managed_python_path(),
                 &shell_targets,
@@ -612,7 +621,7 @@ fn apply_client_setup_once(client_id: &str, allow_takeover: bool) -> Result<Clie
         "Client configuration updated to route through Headroom.".to_string()
     };
 
-    let verification = verify_client_setup(client_id)?;
+    let verification = verify_legacy_client_setup(client_id)?;
 
     Ok(ClientSetupResult {
         client_id: client_id.to_string(),
@@ -663,6 +672,11 @@ fn apply_client_setup_once(client_id: &str, allow_takeover: bool) -> Result<Clie
 }
 
 pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
+    let client_id = public_codex_client_id(client_id)?;
+    verify_legacy_client_setup(client_id)
+}
+
+fn verify_legacy_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
     let mut checks = Vec::new();
     let mut failures = Vec::new();
     let mut foreign_provider: Option<String> = None;
@@ -740,7 +754,7 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
             }
         }
         "vscode" => {
-            let mut delegated = verify_client_setup("claude_code")?;
+            let mut delegated = verify_legacy_client_setup("claude_code")?;
             delegated.client_id = "vscode".to_string();
             return Ok(delegated);
         }
@@ -893,7 +907,7 @@ pub fn verify_client_setup(client_id: &str) -> Result<ClientSetupVerification> {
 }
 
 pub fn is_claude_code_enabled() -> bool {
-    is_configured(&load_setup_state(), "claude_code")
+    false
 }
 
 pub fn is_codex_enabled() -> bool {
@@ -901,15 +915,15 @@ pub fn is_codex_enabled() -> bool {
 }
 
 pub fn is_grok_build_enabled() -> bool {
-    is_configured(&load_setup_state(), "grok_build")
+    false
 }
 
 pub fn is_opencode_enabled() -> bool {
-    is_configured(&load_setup_state(), "opencode")
+    false
 }
 
 pub fn is_zcode_enabled() -> bool {
-    is_configured(&load_setup_state(), "zcode")
+    false
 }
 
 /// True when an enabled connector bills against the user's own provider keys
@@ -918,10 +932,19 @@ pub fn is_zcode_enabled() -> bool {
 /// its own provider settings, and its connector writes an MCP registration
 /// rather than a route.
 pub fn any_gate_exempt_client_enabled() -> bool {
-    is_codex_enabled() || is_opencode_enabled() || is_grok_build_enabled() || is_zcode_enabled()
+    is_codex_enabled()
 }
 
 pub fn list_client_connectors(
+    detected_clients: &[ClientStatus],
+) -> Result<Vec<ClientConnectorStatus>> {
+    Ok(list_legacy_client_connectors(detected_clients)?
+        .into_iter()
+        .filter(|connector| connector.client_id == "codex")
+        .collect())
+}
+
+fn list_legacy_client_connectors(
     detected_clients: &[ClientStatus],
 ) -> Result<Vec<ClientConnectorStatus>> {
     let setup_state = load_setup_state();
@@ -1189,6 +1212,11 @@ pub fn restart_codex_desktop() -> Result<()> {
 }
 
 pub fn disable_client_setup(client_id: &str) -> Result<()> {
+    public_codex_client_id(client_id)?;
+    disable_legacy_client_setup(client_id)
+}
+
+fn disable_legacy_client_setup(client_id: &str) -> Result<()> {
     let mut state = load_setup_state();
 
     match client_id {
@@ -1307,19 +1335,83 @@ pub fn disable_client_setup(client_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Clear all managed routes while retaining Codex's stable local-router
+/// Clear only Headroom's Codex route while retaining Codex's stable local-router
 /// configuration. The router is switched to native forwarding by lifecycle
 /// callers before the Headroom backend is stopped, so existing Codex sessions
 /// keep using the same URL while the GUI is closed or has crashed.
 pub fn clear_client_setups_preserving_codex() -> Result<()> {
-    clear_client_setups_with_options(true)
+    clear_codex_client_setups_with_options(true)
 }
 
 pub fn clear_client_setups() -> Result<()> {
-    clear_client_setups_with_options(false)
+    clear_codex_client_setups_with_options(false)
 }
 
-fn clear_client_setups_with_options(preserve_codex: bool) -> Result<()> {
+fn clear_codex_client_setups_with_options(preserve_codex: bool) -> Result<()> {
+    let pre = load_setup_state();
+
+    let codex_configured = pre
+        .configured_clients
+        .iter()
+        .filter(|(id, _)| is_codex_state_id(id))
+        .map(|(id, value)| (id.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut codex_remembered = pre
+        .remembered_clients
+        .iter()
+        .filter(|(id, _)| is_codex_state_id(id))
+        .map(|(id, value)| (id.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    codex_remembered.extend(codex_configured.clone());
+
+    let codex_managed_shell = pre
+        .managed_shell_files
+        .iter()
+        .filter(|(id, _)| is_codex_state_id(id))
+        .map(|(id, value)| (id.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut codex_remembered_shell = pre
+        .remembered_shell_files
+        .iter()
+        .filter(|(id, _)| is_codex_state_id(id))
+        .map(|(id, value)| (id.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+    codex_remembered_shell.extend(codex_managed_shell.clone());
+    let codex_preserved_urls = pre
+        .preserved_base_urls
+        .iter()
+        .filter(|(id, _)| is_codex_state_id(id))
+        .map(|(id, value)| (id.clone(), value.clone()))
+        .collect::<BTreeMap<_, _>>();
+
+    // The legacy helper is deliberately invoked only for Codex. It may retain
+    // its broader implementation for migration tests, but this public path
+    // never dispatches it for Claude, OpenCode, ZCode, or Grok.
+    disable_legacy_client_setup("codex")?;
+
+    let mut next = pre;
+    next.configured_clients
+        .retain(|id, _| !is_codex_state_id(id));
+    next.remembered_clients
+        .retain(|id, _| !is_codex_state_id(id));
+    next.managed_shell_files
+        .retain(|id, _| !is_codex_state_id(id));
+    next.remembered_shell_files
+        .retain(|id, _| !is_codex_state_id(id));
+    next.preserved_base_urls
+        .retain(|id, _| !is_codex_state_id(id));
+
+    next.remembered_clients.extend(codex_remembered);
+    next.remembered_shell_files.extend(codex_remembered_shell);
+    next.preserved_base_urls.extend(codex_preserved_urls);
+    if preserve_codex {
+        next.configured_clients.extend(codex_configured);
+        next.managed_shell_files.extend(codex_managed_shell);
+    }
+    write_setup_state(&mut next)
+}
+
+fn clear_client_setups_legacy_with_options(preserve_codex: bool) -> Result<()> {
     // Capture snapshot before disabling. We re-apply it afterwards because
     // disable_client_setup also clears remembered_clients as a side effect,
     // which would otherwise erase the snapshot we need for restore_client_setups.
@@ -1379,7 +1471,7 @@ fn clear_client_setups_with_options(preserve_codex: bool) -> Result<()> {
         if preserve_codex && spec.id == "codex" {
             continue;
         }
-        if let Err(err) = disable_client_setup(spec.id) {
+        if let Err(err) = disable_legacy_client_setup(spec.id) {
             failures.push(format!("{} ({}): {err:#}", spec.name, spec.id));
         }
     }
@@ -1389,7 +1481,7 @@ fn clear_client_setups_with_options(preserve_codex: bool) -> Result<()> {
     let legacy_codex_cleanup = if preserve_codex {
         disable_codex_gui()
     } else {
-        disable_client_setup("codex_gui")
+        disable_legacy_client_setup("codex_gui")
     };
     if let Err(err) = legacy_codex_cleanup {
         failures.push(format!("Codex desktop (codex_gui): {err:#}"));
@@ -2379,9 +2471,18 @@ fn remove_known_keychain_entries() {
 /// Re-applies setup for all clients that were active at the last pause or quit.
 pub fn restore_client_setups() {
     let state = load_setup_state();
-    let to_restore: Vec<String> = state.remembered_clients.keys().cloned().collect();
+    // The public product boundary is Codex-only. Preserve remembered legacy
+    // entries for compatibility, but never re-apply them or touch their files.
+    let to_restore: Vec<String> = state
+        .remembered_clients
+        .keys()
+        .filter(|id| is_codex_state_id(id))
+        .cloned()
+        .collect();
     for client_id in to_restore {
-        let _ = apply_client_setup(&client_id);
+        if let Err(err) = apply_client_setup(&client_id) {
+            log::error!("restore_client_setups: failed to restore {client_id}: {err:#}");
+        }
     }
 }
 
@@ -2899,7 +3000,9 @@ pub fn enable_markitdown_integration(
     let mut changed_files = Vec::new();
     let mut backup_files = Vec::new();
 
-    if is_claude_code_enabled() {
+    // Claude's legacy integration code remains below for compatibility, but
+    // this public product boundary must not create or refresh it.
+    if false && is_claude_code_enabled() {
         let hook_path = headroom_markitdown_hook_path();
         let hook_body = build_headroom_markitdown_hook(markitdown_entrypoint, python_path);
         let (hook_changed, hook_backup) = write_file_if_changed(&hook_path, &hook_body, true)?;
@@ -2959,18 +3062,8 @@ pub fn enable_markitdown_integration(
 /// nudge), leaving any RTK hook untouched. Cleanup runs unconditionally so a
 /// client that was later disconnected is still scrubbed.
 pub fn disable_markitdown_integration(markitdown_shim: &Path) -> Result<bool> {
-    let mut changed = remove_pre_tool_use_markers(
-        &claude_settings_path(),
-        &["headroom-local-community-markitdown-read.sh"],
-    )?;
-    let hook_path = headroom_markitdown_hook_path();
-    if hook_path.exists() {
-        std::fs::remove_file(&hook_path)
-            .with_context(|| format!("removing {}", hook_path.display()))?;
-    }
-    changed |= remove_managed_block(&markitdown_claude_md_path(), "markitdown_office")?;
-    changed |= set_markitdown_bash_permission(markitdown_shim, false)?;
-    changed |= remove_managed_block(&markitdown_codex_agents_path(), "markitdown")?;
+    let _ = markitdown_shim;
+    let changed = remove_managed_block(&markitdown_codex_agents_path(), "markitdown")?;
     Ok(changed)
 }
 
@@ -6742,6 +6835,20 @@ fn normalized_setup_id(client_id: &str) -> &str {
     }
 }
 
+fn public_codex_client_id(client_id: &str) -> Result<&'static str> {
+    match client_id {
+        "codex" => Ok("codex"),
+        // `codex_gui` is the legacy launchctl-backed Codex alias. Public
+        // setup/verification use the canonical Codex config route, while
+        // disable keeps the original alias so its launchctl cleanup remains
+        // correct.
+        "codex_cli" | "codex_gui" => Ok("codex_cli"),
+        _ => bail!(
+            "client setup is limited to Codex; unsupported client: {client_id}"
+        ),
+    }
+}
+
 fn upsert_managed_block(
     file_path: &Path,
     block_id: &str,
@@ -8453,6 +8560,134 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
+
+    #[test]
+    #[serial_test::serial]
+    fn public_client_boundary_lists_only_codex() {
+        let _home = TestHome::new();
+        let detected = super::detect_clients();
+        assert_eq!(
+            detected.iter().map(|client| client.id.as_str()).collect::<Vec<_>>(),
+            vec!["codex"]
+        );
+
+        let connectors = super::list_client_connectors(&detected).expect("list connectors");
+        assert_eq!(
+            connectors
+                .iter()
+                .map(|connector| connector.client_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["codex"]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn public_client_boundary_rejects_unsupported_clients_before_side_effects() {
+        let home = TestHome::new();
+        let error = super::apply_client_setup("claude_code").expect_err("Claude is unsupported");
+        assert!(error.to_string().contains("limited to Codex"));
+        assert!(super::apply_client_setup_with_options("grok_build", true).is_err());
+        assert!(super::disable_client_setup("zcode").is_err());
+        assert!(!home.path().join(".claude/settings.json").exists());
+        assert!(super::verify_client_setup("opencode").is_err());
+        assert!(!super::is_claude_code_enabled());
+        assert!(!super::is_grok_build_enabled());
+        assert!(!super::is_opencode_enabled());
+        assert!(!super::is_zcode_enabled());
+        assert!(!super::any_gate_exempt_client_enabled());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn restore_does_not_reapply_removed_codex_gui_memory() {
+        let home = TestHome::new();
+        fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
+        let codex_dir = home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        let config_path = codex_dir.join("config.toml");
+        let original = "model_provider = \"openai\"\n";
+        fs::write(&config_path, original).unwrap();
+
+        let mut state = super::ClientSetupState {
+            remembered_clients: [("codex_gui".into(), "legacy".into())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        super::write_setup_state(&mut state).unwrap();
+
+        super::restore_client_setups();
+        let restored = super::load_setup_state();
+        assert!(!restored.configured_clients.contains_key("codex_cli"));
+        assert!(!restored.configured_clients.contains_key("codex_gui"));
+        assert_eq!(fs::read_to_string(config_path).unwrap(), original);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn restore_client_setups_preserves_remembered_non_codex_configs() {
+        let home = TestHome::new();
+        let claude = home.path().join(".claude/settings.json");
+        fs::create_dir_all(claude.parent().unwrap()).unwrap();
+        let original = r#"{"env":{"ANTHROPIC_BASE_URL":"https://user.example"}}"#;
+        fs::write(&claude, original).unwrap();
+        let mut state = super::ClientSetupState {
+            remembered_clients: [("claude_code".into(), "2026-01-01T00:00:00Z".into())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        super::write_setup_state(&mut state).unwrap();
+
+        super::restore_client_setups();
+        assert_eq!(fs::read_to_string(&claude).unwrap(), original);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn public_clear_paths_leave_non_codex_config_and_memory_unchanged() {
+        let home = TestHome::new();
+        let claude = home.path().join(".claude/settings.json");
+        fs::create_dir_all(claude.parent().unwrap()).unwrap();
+        let original = r#"{"env":{"ANTHROPIC_BASE_URL":"https://user.example"},"custom":true}"#;
+        fs::write(&claude, original).unwrap();
+
+        let mut state = super::ClientSetupState {
+            configured_clients: [("claude_code".into(), "configured".into())]
+                .into_iter()
+                .collect(),
+            remembered_clients: [("claude_code".into(), "remembered".into())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        super::write_setup_state(&mut state).unwrap();
+
+        super::clear_client_setups().expect("Codex-only clear");
+        assert_eq!(fs::read_to_string(&claude).unwrap(), original);
+        let after_clear = super::load_setup_state();
+        assert_eq!(
+            after_clear.remembered_clients.get("claude_code").map(String::as_str),
+            Some("remembered")
+        );
+        assert_eq!(
+            after_clear.configured_clients.get("claude_code").map(String::as_str),
+            Some("configured")
+        );
+
+        super::clear_client_setups_preserving_codex().expect("Codex-only preserving clear");
+        assert_eq!(fs::read_to_string(&claude).unwrap(), original);
+        let after_preserving_clear = super::load_setup_state();
+        assert_eq!(
+            after_preserving_clear.remembered_clients.get("claude_code").map(String::as_str),
+            Some("remembered")
+        );
+        assert_eq!(
+            after_preserving_clear.configured_clients.get("claude_code").map(String::as_str),
+            Some("configured")
+        );
+    }
 
     use super::{
         build_claude_guard_script, build_codex_guard_script, build_headroom_markitdown_hook,
@@ -10376,7 +10611,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
         seed_installed_rtk();
 
         let result =
-            super::apply_client_setup("claude_code").expect("setup succeeds despite bad profile");
+            super::apply_legacy_client_setup("claude_code").expect("setup succeeds despite bad profile");
         assert!(result.applied);
         assert!(
             result.shell_profile_unwritable,
@@ -10395,7 +10630,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
             Some("http://127.0.0.1:6867")
         );
         // Verification reads the same profiles and must not blow up either.
-        super::verify_client_setup("claude_code").expect("verification tolerates bad profile");
+        super::verify_legacy_client_setup("claude_code").expect("verification tolerates bad profile");
     }
 
     #[test]
@@ -10406,7 +10641,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
         let original = "# >>> headroom:claude_code >>>\nexport ANTHROPIC_BASE_URL=http://127.0.0.1:6767\n# <<< headroom:claude_code <<<\n";
         fs::write(&zshrc, original).unwrap();
 
-        let err = super::apply_client_setup("claude_code").unwrap_err();
+        let err = super::apply_legacy_client_setup("claude_code").unwrap_err();
         assert!(
             err.to_string()
                 .contains("Official Headroom routing is active"),
@@ -10434,7 +10669,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
         .unwrap();
         seed_installed_rtk();
 
-        let result = super::apply_client_setup("claude_code").expect("apply_client_setup succeeds");
+        let result = super::apply_legacy_client_setup("claude_code").expect("apply_client_setup succeeds");
         assert!(result.applied);
         assert_eq!(result.client_id, "claude_code");
 
@@ -10477,7 +10712,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
         // Proxy reachability is reported via `proxy_reachable` only, so a
         // missing proxy in the test environment no longer flips `verified`.
         let verification =
-            super::verify_client_setup("claude_code").expect("verify_client_setup succeeds");
+            super::verify_legacy_client_setup("claude_code").expect("verify_client_setup succeeds");
         assert_eq!(verification.client_id, "claude_code");
         assert!(
             verification
@@ -10512,8 +10747,8 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
         .unwrap();
         seed_installed_rtk();
 
-        super::apply_client_setup("claude_code").expect("first apply");
-        super::apply_client_setup("claude_code").expect("second apply");
+        super::apply_legacy_client_setup("claude_code").expect("first apply");
+        super::apply_legacy_client_setup("claude_code").expect("second apply");
 
         let script = home
             .path()
@@ -10568,7 +10803,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
             "startup|resume|clear|compact"
         );
 
-        super::disable_client_setup("claude_code").expect("disable");
+        super::disable_legacy_client_setup("claude_code").expect("disable");
 
         assert!(!script.exists(), "guard script removed on disable");
         let after = read_settings_json(&settings_path);
@@ -10618,7 +10853,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
         .unwrap();
         seed_installed_rtk();
 
-        super::apply_client_setup("claude_code").expect("apply");
+        super::apply_legacy_client_setup("claude_code").expect("apply");
 
         let settings = read_settings_json(&home.path().join(".claude").join("settings.json"));
         let ups = serde_json::to_string(&settings["hooks"]["UserPromptSubmit"]).unwrap();
@@ -10655,7 +10890,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
         )
         .unwrap();
         seed_installed_rtk();
-        super::apply_client_setup("claude_code").expect("apply");
+        super::apply_legacy_client_setup("claude_code").expect("apply");
 
         // User data: Headroom's own directories.
         let app_dir = super::app_data_dir();
@@ -10782,7 +11017,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
         .unwrap();
         seed_installed_rtk();
 
-        super::apply_client_setup("claude_code").expect("apply");
+        super::apply_legacy_client_setup("claude_code").expect("apply");
 
         let settings_path = home.path().join(".claude").join("settings.json");
         let guard_script = home
@@ -10837,7 +11072,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
         .unwrap();
         seed_installed_rtk();
 
-        let result = super::apply_client_setup("claude_code").expect("apply");
+        let result = super::apply_legacy_client_setup("claude_code").expect("apply");
         // Setup captured the gateway and told the caller it took over routing.
         assert_eq!(result.replaced_base_url.as_deref(), Some(gateway));
         let settings_path = home.path().join(".claude").join("settings.json");
@@ -10851,7 +11086,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
             gateway
         );
 
-        super::disable_client_setup("claude_code").expect("disable");
+        super::disable_legacy_client_setup("claude_code").expect("disable");
         // The gateway URL is restored, not deleted.
         let after_disable = read_settings_json(&settings_path);
         assert_eq!(
@@ -10875,12 +11110,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
         fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
         seed_installed_rtk();
 
-        let result = super::apply_client_setup("claude_code").expect("apply");
+        let result = super::apply_legacy_client_setup("claude_code").expect("apply");
         assert!(result.replaced_base_url.is_none());
         assert!(super::load_setup_state().preserved_base_urls.is_empty());
 
         // Disable deletes the key (nothing to restore).
-        super::disable_client_setup("claude_code").expect("disable");
+        super::disable_legacy_client_setup("claude_code").expect("disable");
         let settings_path = home.path().join(".claude").join("settings.json");
         if settings_path.exists() {
             let after = read_settings_json(&settings_path);
@@ -10901,7 +11136,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
         )
         .unwrap();
 
-        super::apply_client_setup("claude_code").expect("apply_client_setup succeeds");
+        super::apply_legacy_client_setup("claude_code").expect("apply_client_setup succeeds");
 
         // User turns RTK off: this strips the RTK PATH block + hook but leaves
         // ANTHROPIC_BASE_URL routing intact, and persists the opt-out.
@@ -10917,7 +11152,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
         // Routing config is still present, so Claude Code must verify green
         // even though the RTK pieces are gone.
         let verification =
-            super::verify_client_setup("claude_code").expect("verify_client_setup succeeds");
+            super::verify_legacy_client_setup("claude_code").expect("verify_client_setup succeeds");
         assert!(
             verification.verified,
             "claude_code verifies on routing alone when RTK is disabled, failures: {:?}",
@@ -10947,7 +11182,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
         // the managed RTK binary was never dropped on disk and the user never
         // toggled RTK off (rtk_disabled stays false). Claude Code must still
         // verify green on routing alone.
-        super::apply_client_setup("claude_code").expect("apply_client_setup succeeds");
+        super::apply_legacy_client_setup("claude_code").expect("apply_client_setup succeeds");
 
         assert!(
             !super::default_headroom_rtk_path().exists(),
@@ -10960,7 +11195,7 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
         );
 
         let verification =
-            super::verify_client_setup("claude_code").expect("verify_client_setup succeeds");
+            super::verify_legacy_client_setup("claude_code").expect("verify_client_setup succeeds");
         assert!(
             verification.verified,
             "claude_code verifies on routing alone when RTK isn't installed, failures: {:?}",
@@ -11191,7 +11426,7 @@ keep rtk\n\
         fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
         seed_installed_rtk();
 
-        super::apply_client_setup("claude_code").expect("first apply");
+        super::apply_legacy_client_setup("claude_code").expect("first apply");
         let zshrc_after_first = fs::read_to_string(home.path().join(".zshrc")).unwrap();
         let zshenv_after_first = fs::read_to_string(home.path().join(".zshenv")).unwrap();
         let settings_after_first =
@@ -11204,7 +11439,7 @@ keep rtk\n\
         )
         .unwrap();
 
-        super::apply_client_setup("claude_code").expect("second apply");
+        super::apply_legacy_client_setup("claude_code").expect("second apply");
         let zshrc_after_second = fs::read_to_string(home.path().join(".zshrc")).unwrap();
         let zshenv_after_second = fs::read_to_string(home.path().join(".zshenv")).unwrap();
         let settings_after_second =
@@ -11255,7 +11490,7 @@ keep rtk\n\
         fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
         seed_installed_rtk();
 
-        super::apply_client_setup("claude_code").expect("apply");
+        super::apply_legacy_client_setup("claude_code").expect("apply");
         let hook_path = home
             .path()
             .join(".claude")
@@ -11263,7 +11498,7 @@ keep rtk\n\
             .join("headroom-local-community-rtk-rewrite.sh");
         assert!(hook_path.exists(), "hook present after apply");
 
-        super::disable_client_setup("claude_code").expect("disable");
+        super::disable_legacy_client_setup("claude_code").expect("disable");
 
         // Hook script removed.
         assert!(!hook_path.exists(), "hook removed after disable");
@@ -11293,7 +11528,7 @@ keep rtk\n\
 
         // clear_client_setups runs disable across all clients without error,
         // and the setup state file is left without a `claude_code` entry.
-        super::clear_client_setups().expect("clear");
+        super::clear_client_setups_legacy_with_options(false).expect("clear");
         let post = super::load_setup_state();
         assert!(
             post.configured_clients.get("claude_code").is_none(),
@@ -11314,9 +11549,9 @@ keep rtk\n\
         fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
         seed_installed_rtk();
 
-        super::apply_client_setup("claude_code").expect("apply");
+        super::apply_legacy_client_setup("claude_code").expect("apply");
 
-        super::clear_client_setups().expect("first clear (pause)");
+        super::clear_client_setups_legacy_with_options(false).expect("first clear (pause)");
         let state = super::load_setup_state();
         assert!(state.configured_clients.is_empty());
         assert!(
@@ -11325,7 +11560,7 @@ keep rtk\n\
             state.remembered_clients
         );
 
-        super::clear_client_setups().expect("second clear (quit)");
+        super::clear_client_setups_legacy_with_options(false).expect("second clear (quit)");
         let state = super::load_setup_state();
         assert!(
             state.remembered_clients.contains_key("claude_code"),
@@ -11343,10 +11578,10 @@ keep rtk\n\
         seed_installed_rtk();
 
         super::apply_client_setup("codex").expect("apply Codex");
-        super::apply_client_setup("claude_code").expect("apply Claude");
+        super::apply_legacy_client_setup("claude_code").expect("apply Claude");
         let config_path = home.path().join(".codex").join("config.toml");
 
-        super::clear_client_setups_preserving_codex().expect("preserving clear");
+        super::clear_client_setups_legacy_with_options(true).expect("preserving clear");
 
         let config = fs::read_to_string(&config_path).expect("Codex config retained");
         assert!(
@@ -11396,7 +11631,7 @@ keep rtk\n\
             health: crate::models::ClientHealth::Healthy,
             notes: Vec::new(),
         }];
-        let connectors = super::list_client_connectors(&detected).expect("listing succeeds");
+        let connectors = super::list_legacy_client_connectors(&detected).expect("listing succeeds");
 
         let codex = connectors
             .iter()
@@ -11455,7 +11690,7 @@ keep rtk\n\
             health: crate::models::ClientHealth::Healthy,
             notes: Vec::new(),
         }];
-        let connectors = super::list_client_connectors(&detected).expect("listing succeeds");
+        let connectors = super::list_legacy_client_connectors(&detected).expect("listing succeeds");
 
         let codex = connectors
             .iter()
@@ -11483,7 +11718,7 @@ keep rtk\n\
         // stops asking for a takeover nobody needs.
         super::apply_client_setup_with_options("codex", true)
             .expect("confirmed takeover succeeds");
-        let connectors = super::list_client_connectors(&detected).expect("listing succeeds");
+        let connectors = super::list_legacy_client_connectors(&detected).expect("listing succeeds");
         let codex = connectors
             .iter()
             .find(|connector| connector.client_id == "codex")
@@ -11597,7 +11832,7 @@ keep rtk\n\
     fn apply_then_verify_then_disable_opencode_round_trip() {
         let _home = TestHome::new(); // env guard
 
-        let result = super::apply_client_setup("opencode").expect("apply_client_setup succeeds");
+        let result = super::apply_legacy_client_setup("opencode").expect("apply_client_setup succeeds");
         assert!(result.applied);
         assert_eq!(result.client_id, "opencode");
 
@@ -11616,14 +11851,14 @@ keep rtk\n\
         }
 
         let verification =
-            super::verify_client_setup("opencode").expect("verify_client_setup succeeds");
+        super::verify_legacy_client_setup("opencode").expect("verify_client_setup succeeds");
         assert!(
             verification.failures.is_empty(),
             "{:?}",
             verification.failures
         );
 
-        super::disable_client_setup("opencode").expect("disable_client_setup succeeds");
+        super::disable_legacy_client_setup("opencode").expect("disable_client_setup succeeds");
         let after: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         assert!(
@@ -11656,7 +11891,7 @@ keep rtk\n\
         )
         .unwrap();
 
-        super::apply_client_setup("opencode").expect("apply succeeds");
+        super::apply_legacy_client_setup("opencode").expect("apply succeeds");
 
         let config: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -11671,7 +11906,7 @@ keep rtk\n\
             serde_json::json!("http://127.0.0.1:6867/v1")
         );
 
-        super::disable_client_setup("opencode").expect("disable succeeds");
+        super::disable_legacy_client_setup("opencode").expect("disable succeeds");
         let after: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         assert_eq!(
@@ -11708,7 +11943,7 @@ keep rtk\n\
         )
         .unwrap();
 
-        super::apply_client_setup("opencode").expect("apply unwraps instead of refusing");
+        super::apply_legacy_client_setup("opencode").expect("apply unwraps instead of refusing");
 
         let config: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
@@ -11722,7 +11957,7 @@ keep rtk\n\
         );
         assert_eq!(config["theme"], serde_json::json!("tokyonight"));
 
-        super::disable_client_setup("opencode").expect("disable succeeds");
+        super::disable_legacy_client_setup("opencode").expect("disable succeeds");
         let after: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         assert!(
@@ -11738,7 +11973,7 @@ keep rtk\n\
     fn opencode_apply_installs_transport_plugin_and_disable_removes_it() {
         let _home = TestHome::new(); // env guard
 
-        super::apply_client_setup("opencode").expect("apply succeeds");
+        super::apply_legacy_client_setup("opencode").expect("apply succeeds");
 
         let plugin_path = super::opencode_plugin_install_path();
         assert!(plugin_path.is_file(), "vendored plugin written to app data");
@@ -11753,7 +11988,7 @@ keep rtk\n\
             "plugin path registered, got:\n{config:#}"
         );
 
-        super::disable_client_setup("opencode").expect("disable succeeds");
+        super::disable_legacy_client_setup("opencode").expect("disable succeeds");
         let after: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         assert!(
@@ -11794,7 +12029,7 @@ keep rtk\n\
         )
         .unwrap();
 
-        super::apply_client_setup("opencode").expect("apply succeeds on .jsonc with comments");
+        super::apply_legacy_client_setup("opencode").expect("apply succeeds on .jsonc with comments");
         let after: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap())
                 .expect("apply wrote strict json");
@@ -11813,13 +12048,13 @@ keep rtk\n\
     fn opencode_disable_tolerates_comments_added_after_apply() {
         let _home = TestHome::new(); // env guard
 
-        super::apply_client_setup("opencode").expect("apply succeeds");
+        super::apply_legacy_client_setup("opencode").expect("apply succeeds");
         let config_path = super::opencode_config_path();
         let mut contents = fs::read_to_string(&config_path).unwrap();
         contents.insert_str(0, "// routed through headroom\n");
         fs::write(&config_path, &contents).unwrap();
 
-        super::disable_client_setup("opencode").expect("disable succeeds despite comments");
+        super::disable_legacy_client_setup("opencode").expect("disable succeeds despite comments");
         let after: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&config_path).unwrap())
                 .expect("disable wrote parseable json");
@@ -11837,7 +12072,7 @@ keep rtk\n\
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(config_dir.join("opencode.jsonc"), "{}").unwrap();
 
-        super::apply_client_setup("opencode").expect("apply succeeds");
+        super::apply_legacy_client_setup("opencode").expect("apply succeeds");
         let jsonc: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(config_dir.join("opencode.jsonc")).unwrap())
                 .unwrap();
@@ -11862,7 +12097,7 @@ keep rtk\n\
         fs::create_dir_all(&grok_dir).unwrap();
         fs::write(grok_dir.join("config.toml"), "default_model = \"grok-4\"\n").unwrap();
 
-        super::apply_client_setup("grok_build").expect("apply_client_setup succeeds");
+        super::apply_legacy_client_setup("grok_build").expect("apply_client_setup succeeds");
 
         let toml = fs::read_to_string(grok_dir.join("config.toml")).unwrap();
         let key_pos = toml.find("default_model").expect("user key kept");
@@ -11889,7 +12124,7 @@ keep rtk\n\
         )
         .unwrap();
 
-        super::apply_client_setup("grok_build").expect("apply_client_setup succeeds");
+        super::apply_legacy_client_setup("grok_build").expect("apply_client_setup succeeds");
 
         let toml = fs::read_to_string(grok_dir.join("config.toml")).unwrap();
         assert_eq!(
@@ -11905,14 +12140,14 @@ keep rtk\n\
         );
 
         let verification =
-            super::verify_client_setup("grok_build").expect("verify_client_setup succeeds");
+        super::verify_legacy_client_setup("grok_build").expect("verify_client_setup succeeds");
         assert!(
             verification.failures.is_empty(),
             "{:?}",
             verification.failures
         );
 
-        super::disable_client_setup("grok_build").expect("disable_client_setup succeeds");
+        super::disable_legacy_client_setup("grok_build").expect("disable_client_setup succeeds");
         let after = fs::read_to_string(grok_dir.join("config.toml")).unwrap();
         assert!(
             after.contains("base_url = \"http://127.0.0.1:8787/v1\""),
@@ -11931,7 +12166,7 @@ keep rtk\n\
         fs::write(home.path().join(".zshrc"), "# user zshrc\n").unwrap();
         fs::write(home.path().join(".zshenv"), "# user zshenv\n").unwrap();
 
-        let result = super::apply_client_setup("grok_build").expect("apply_client_setup succeeds");
+        let result = super::apply_legacy_client_setup("grok_build").expect("apply_client_setup succeeds");
         assert!(result.applied);
         assert_eq!(result.client_id, "grok_build");
 
@@ -11955,14 +12190,14 @@ keep rtk\n\
         );
 
         let verification =
-            super::verify_client_setup("grok_build").expect("verify_client_setup succeeds");
+        super::verify_legacy_client_setup("grok_build").expect("verify_client_setup succeeds");
         assert!(
             verification.failures.is_empty(),
             "{:?}",
             verification.failures
         );
 
-        super::disable_client_setup("grok_build").expect("disable_client_setup succeeds");
+        super::disable_legacy_client_setup("grok_build").expect("disable_client_setup succeeds");
         let toml_after = fs::read_to_string(&config_toml).unwrap_or_default();
         assert!(
             !toml_after.contains("# >>> headroom-local-community:grok_build_proxy >>>"),
@@ -14895,7 +15130,7 @@ keep rtk\n\
         let home = TestHome::new();
         seed_zcode_entrypoint();
 
-        let result = super::apply_client_setup("zcode").expect("apply succeeds");
+        let result = super::apply_legacy_client_setup("zcode").expect("apply succeeds");
         assert!(result.applied);
         assert_eq!(result.client_id, "zcode");
         assert_eq!(result.summary, "Headroom MCP tools are configured in ZCode.");
@@ -14915,11 +15150,11 @@ keep rtk\n\
         assert!(super::zcode_mcp_entry_matches().expect("entry matches"));
 
         // Re-apply is a no-op: the entry is already canonical.
-        let second = super::apply_client_setup("zcode").expect("second apply succeeds");
+        let second = super::apply_legacy_client_setup("zcode").expect("second apply succeeds");
         assert!(second.already_configured, "re-apply detects no changes");
 
         let verification =
-            super::verify_client_setup("zcode").expect("verify succeeds");
+        super::verify_legacy_client_setup("zcode").expect("verify succeeds");
         assert!(
             verification
                 .checks
@@ -14930,7 +15165,7 @@ keep rtk\n\
         );
         assert!(verification.verified, "verification passes: {verification:?}");
 
-        super::disable_client_setup("zcode").expect("disable succeeds");
+        super::disable_legacy_client_setup("zcode").expect("disable succeeds");
         assert!(
             !home.path().join(".zcode/cli/config.json").exists(),
             "husk file created by setup is removed on disable"
@@ -14956,7 +15191,7 @@ keep rtk\n\
         )
         .expect("seed user config");
 
-        super::apply_client_setup("zcode").expect("apply succeeds");
+        super::apply_legacy_client_setup("zcode").expect("apply succeeds");
         let config = read_zcode_config_json(&home);
         assert_eq!(
             config["mcp"]["servers"]["context7"]["command"], "npx",
@@ -14968,7 +15203,7 @@ keep rtk\n\
             "Headroom entry added alongside"
         );
 
-        super::disable_client_setup("zcode").expect("disable succeeds");
+        super::disable_legacy_client_setup("zcode").expect("disable succeeds");
         let config = read_zcode_config_json(&home);
         assert_eq!(
             config["mcp"]["servers"]["context7"]["command"], "npx",
@@ -14987,7 +15222,7 @@ keep rtk\n\
         let home = TestHome::new();
         seed_zcode_entrypoint();
 
-        super::apply_client_setup("zcode").expect("apply succeeds");
+        super::apply_legacy_client_setup("zcode").expect("apply succeeds");
         // The user edits the entry after enabling: disable must treat it as
         // theirs and leave it alone (same contract as the OpenCode URLs).
         let config_path = home.path().join(".zcode/cli/config.json");
@@ -14997,7 +15232,7 @@ keep rtk\n\
         fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap())
             .expect("customize entry");
 
-        super::disable_client_setup("zcode").expect("disable succeeds");
+        super::disable_legacy_client_setup("zcode").expect("disable succeeds");
         let config = read_zcode_config_json(&home);
         assert_eq!(
             config["mcp"]["servers"]["headroom_local_community"]["env"]["HEADROOM_BEACON"],
@@ -15022,7 +15257,7 @@ keep rtk\n\
         );
         assert!(!home.path().join(".zcode/cli/config.json").exists());
 
-        super::apply_client_setup("zcode").expect("apply succeeds");
+        super::apply_legacy_client_setup("zcode").expect("apply succeeds");
         // Same command: no write at all.
         assert!(
             super::repin_zcode_mcp_command(&entrypoint)
@@ -15090,14 +15325,14 @@ keep rtk\n\
     fn zcode_setup_and_repin_preserve_customized_entry() {
         let home = TestHome::new();
         seed_zcode_entrypoint();
-        super::apply_client_setup("zcode").expect("apply succeeds");
+        super::apply_legacy_client_setup("zcode").expect("apply succeeds");
         let path = super::zcode_cli_config_path();
         let mut config = read_zcode_config_json(&home);
         config["mcp"]["servers"]["headroom_local_community"]["command"] = json!("custom-wrapper");
         let original = serde_json::to_string_pretty(&config).unwrap();
         fs::write(&path, &original).unwrap();
 
-        assert!(super::apply_client_setup("zcode").is_err());
+        assert!(super::apply_legacy_client_setup("zcode").is_err());
         assert!(super::repin_zcode_mcp_command(&home.path().join("new/headroom"))
             .unwrap().is_none());
         assert_eq!(fs::read_to_string(path).unwrap(), original);
@@ -15119,7 +15354,7 @@ keep rtk\n\
         fs::create_dir_all(fallback.parent().unwrap()).unwrap();
         let original = r#"{"mcpServers":{"memory":{"command":"user-memory"}}}"#;
         fs::write(&fallback, original).unwrap();
-        let error = super::apply_client_setup("zcode").unwrap_err();
+        let error = super::apply_legacy_client_setup("zcode").unwrap_err();
         assert!(error.to_string().contains("Import those MCP servers"));
         assert!(!super::zcode_cli_config_path().exists());
         assert_eq!(fs::read_to_string(&fallback).unwrap(), original);
@@ -15129,7 +15364,7 @@ keep rtk\n\
         let native = super::zcode_cli_config_path();
         fs::create_dir_all(native.parent().unwrap()).unwrap();
         fs::write(&native, r#"{"mcp":{"servers":{"memory":{"command":"user-memory"}}}}"#).unwrap();
-        super::apply_client_setup("zcode").unwrap();
+        super::apply_legacy_client_setup("zcode").unwrap();
         assert_eq!(read_zcode_config_json(&home)["mcp"]["servers"]["memory"]["command"], "user-memory");
         assert_eq!(fs::read_to_string(fallback).unwrap(), original);
     }
@@ -15139,7 +15374,7 @@ keep rtk\n\
     fn zcode_uninstall_removes_dead_runtime_entries_but_preserves_other_servers() {
         let home = TestHome::new();
         seed_zcode_entrypoint();
-        super::apply_client_setup("zcode").unwrap();
+        super::apply_legacy_client_setup("zcode").unwrap();
         let path = super::zcode_cli_config_path();
         let mut config = read_zcode_config_json(&home);
         config["mcp"]["servers"]["headroom_local_community"]["env"]["CUSTOM"] = json!("yes");
@@ -15158,7 +15393,7 @@ keep rtk\n\
         let _home = TestHome::new();
         // No seeded entrypoint: setup must fail loudly instead of writing an
         // entry that points at nothing.
-        let err = super::apply_client_setup("zcode").unwrap_err();
+        let err = super::apply_legacy_client_setup("zcode").unwrap_err();
         assert!(
             format!("{err:#}").contains("entrypoint"),
             "error names the missing entrypoint: {err:#}"

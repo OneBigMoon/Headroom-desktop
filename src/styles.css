@@ -6781,7 +6781,7 @@ html[data-edition="local-community"] .tray-sidebar__logo {
 }
 
 html[data-edition="local-community"] .tray-sidebar__logo::after {
-  content: "Headroom Local";
+  content: "codexbox";
   color: var(--text-primary);
   font-size: var(--text-sm);
   font-weight: 700;

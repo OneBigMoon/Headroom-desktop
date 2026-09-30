@@ -48,7 +48,7 @@ describe("SetupStallModal", () => {
 
     expect(screen.getByText(/none of them have been optimized/i)).toBeInTheDocument();
     expect(screen.getByText(/Restart your coding agent/i)).toBeInTheDocument();
-    expect(screen.getByText(/Headroom is not paused/i)).toBeInTheDocument();
+    expect(screen.getByText(/codexbox is not paused/i)).toBeInTheDocument();
   });
 
   // evaluateSetupStall suppresses the alert entirely when the account gate has

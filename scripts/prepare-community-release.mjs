@@ -96,11 +96,11 @@ export function prepareCommunityRelease({
   const assetsDir = join(stagingDir, "assets");
   mkdirSync(assetsDir, { recursive: true });
 
-  const macDmgName = `Headroom.Local.Community_${version}_universal.dmg`;
-  const macUpdaterName = "Headroom.Local.Community_universal.app.tar.gz";
+  const macDmgName = `codexbox_${version}_universal.dmg`;
+  const macUpdaterName = "codexbox_universal.app.tar.gz";
   const macSignatureName = `${macUpdaterName}.sig`;
-  const windowsInstallerName = `Headroom.Local.Community_${version}_x64-setup.exe`;
-  const windowsUpdaterName = "Headroom.Local.Community_x64-setup.nsis.zip";
+  const windowsInstallerName = `codexbox_${version}_x64-setup.exe`;
+  const windowsUpdaterName = "codexbox_x64-setup.nsis.zip";
   const windowsSignatureName = `${windowsUpdaterName}.sig`;
 
   copyFileSync(macDmgPath, join(assetsDir, macDmgName));

@@ -65,7 +65,9 @@ describe("ActivityFeed", () => {
     const markup = renderToStaticMarkup(
       <ActivityFeed feed={{ ...baseFeed, proxyReachable: false }} error={null} />
     );
-    expect(markup).toContain("Waiting for the Headroom proxy");
+    expect(markup).toContain("Waiting");
+    expect(markup).toContain("codexbox");
+    expect(markup).not.toContain("Headroom");
     expect(markup).not.toContain("activity-feed__list");
   });
 
@@ -240,14 +242,14 @@ describe("ActivityFeed", () => {
   it("shows an estimated dollar savings alongside tokens saved", () => {
     const feed = feedWith({
       transformation: transformation({
-        model: "claude-sonnet-4-6",
+        model: "gpt-6-sol",
         tokensSaved: 750_000,
         savingsPercent: 75
       })
     });
     const markup = renderToStaticMarkup(<ActivityFeed feed={feed} error={null} />);
-    // sonnet: $3/M × 0.75M = $2.25
-    expect(markup).toContain("~$2.25");
+    // GPT-6 Sol: $2/M × 0.75M = $1.50.
+    expect(markup).toContain("~$1.50");
   });
 
   it("surfaces file paths from enriched read_lifecycle tags in the detail view", () => {

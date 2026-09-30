@@ -1,4 +1,9 @@
 import type { ResolvedLocale } from "./i18n";
+import { LOCAL_COMMUNITY_NAME } from "./localEdition";
+
+export function localizeWorkflowCopy(value: string): string {
+  return value.replace(/\bHeadroom\b/g, LOCAL_COMMUNITY_NAME);
+}
 
 export type ToolCategory =
   | "core"

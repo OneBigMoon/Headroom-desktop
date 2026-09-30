@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { LOCAL_COMMUNITY_NAME } from "./localEdition";
 
 export const LOCALE_STORAGE_KEY = "headroom_local_community_locale";
 
@@ -7,6 +8,7 @@ export type ResolvedLocale = Exclude<Locale, "system">;
 
 const english = {
   "nav.overview": "Overview",
+  "nav.decisions": "Decisions",
   "nav.connections": "Connections",
   "nav.tools": "Tools",
   "nav.settings": "Local settings",
@@ -353,6 +355,11 @@ const communityCopy = {
     "savingsInfo.byModel": "Compression rate by model",
     "savingsInfo.requests": "{count} requests",
     "savingsInfo.byModelNote": "This shows how much input Headroom removed for each model. Models with fewer than 100 requests are omitted.",
+    "savingsInfo.officialPricing": "OpenAI official model prices · checked {date}. New requests use the current price; historical amounts are unchanged.",
+    "savingsInfo.officialPricingLink": "View official pricing",
+    "savingsInfo.legacyPricing": "{count} saved tokens belong to internal or unpublished model IDs, so their previously recorded estimate is retained.",
+    "savingsInfo.inputPrice": "{price}/M input",
+    "savingsInfo.unpriced": "no official price",
     "cacheInfo.title": "Cache hits and compression",
     "cacheInfo.description": "Headroom preserves the cached conversation prefix and compresses the remaining input, keeping your prompt-cache discount intact.",
     "cacheInfo.today": "Today",
@@ -622,6 +629,11 @@ const communityCopy = {
     "savingsInfo.byModel": "各模型压缩率",
     "savingsInfo.requests": "{count} 个请求",
     "savingsInfo.byModelNote": "这里显示 Headroom 为每个模型移除的输入比例；请求少于 100 次的模型不显示。",
+    "savingsInfo.officialPricing": "OpenAI 官方模型价格 · 校验于 {date}。新请求使用当前价格，历史金额保持不变。",
+    "savingsInfo.officialPricingLink": "查看官方价目",
+    "savingsInfo.legacyPricing": "另有 {count} 个已节省 Token 来自内部或官网未发布的模型 ID，暂时保留其原有估算。",
+    "savingsInfo.inputPrice": "输入 {price}/百万 Token",
+    "savingsInfo.unpriced": "官网未定价",
     "cacheInfo.title": "缓存命中与压缩",
     "cacheInfo.description": "Headroom 保留已缓存的对话前缀，只压缩其余输入，从而不破坏提示词缓存折扣。",
     "cacheInfo.today": "今天",
@@ -891,6 +903,11 @@ const communityCopy = {
     "savingsInfo.byModel": "各模型壓縮率",
     "savingsInfo.requests": "{count} 個請求",
     "savingsInfo.byModelNote": "此處顯示 Headroom 為各模型移除的輸入比例；請求少於 100 次的模型不顯示。",
+    "savingsInfo.officialPricing": "OpenAI 官方模型價格 · 校驗於 {date}。新請求使用目前價格，歷史金額保持不變。",
+    "savingsInfo.officialPricingLink": "查看官方價目",
+    "savingsInfo.legacyPricing": "另有 {count} 個已節省 Token 來自內部或官網未發布的模型 ID，暫時保留原有估算。",
+    "savingsInfo.inputPrice": "輸入 {price}/百萬 Token",
+    "savingsInfo.unpriced": "官網未定價",
     "cacheInfo.title": "快取命中與壓縮",
     "cacheInfo.description": "Headroom 保留已快取的對話前綴，只壓縮其餘輸入，避免破壞提示詞快取折扣。",
     "cacheInfo.today": "今天",
@@ -1160,6 +1177,11 @@ const communityCopy = {
     "savingsInfo.byModel": "モデル別圧縮率",
     "savingsInfo.requests": "{count} 件のリクエスト",
     "savingsInfo.byModelNote": "モデルごとに Headroom が削減した入力割合です。100 件未満のモデルは表示しません。",
+    "savingsInfo.officialPricing": "OpenAI 公式モデル価格 · {date} 確認。新しいリクエストには現在価格を使い、過去の金額は変更しません。",
+    "savingsInfo.officialPricingLink": "公式価格を見る",
+    "savingsInfo.legacyPricing": "{count} 個の削減 Token は内部または未公開のモデル ID のため、従来の推定額を保持しています。",
+    "savingsInfo.inputPrice": "入力 {price}/100万 Token",
+    "savingsInfo.unpriced": "公式価格なし",
     "cacheInfo.title": "キャッシュヒットと圧縮",
     "cacheInfo.description": "Headroom はキャッシュ済みの会話プレフィックスを保持し、残りだけを圧縮してキャッシュ割引を維持します。",
     "cacheInfo.today": "今日",
@@ -1429,6 +1451,11 @@ const communityCopy = {
     "savingsInfo.byModel": "모델별 압축률",
     "savingsInfo.requests": "요청 {count}개",
     "savingsInfo.byModelNote": "모델별로 Headroom이 제거한 입력 비율입니다. 요청이 100개 미만인 모델은 표시하지 않습니다.",
+    "savingsInfo.officialPricing": "OpenAI 공식 모델 가격 · {date} 확인. 새 요청에는 현재 가격을 적용하며 과거 금액은 변경하지 않습니다.",
+    "savingsInfo.officialPricingLink": "공식 가격 보기",
+    "savingsInfo.legacyPricing": "절약된 Token {count}개는 내부 또는 미공개 모델 ID이므로 기존 추정값을 유지합니다.",
+    "savingsInfo.inputPrice": "입력 {price}/백만 Token",
+    "savingsInfo.unpriced": "공식 가격 없음",
     "cacheInfo.title": "캐시 적중과 압축",
     "cacheInfo.description": "Headroom은 캐시된 대화 접두부를 보존하고 나머지만 압축하여 프롬프트 캐시 할인을 유지합니다.",
     "cacheInfo.today": "오늘",
@@ -2366,6 +2393,7 @@ const translations: Record<ResolvedLocale, TranslationDictionary> = {
   en: english,
   "zh-CN": {
     "nav.overview": "概览",
+    "nav.decisions": "决策",
     "nav.connections": "连接",
     "nav.tools": "工具",
     "nav.settings": "本地设置",
@@ -2510,6 +2538,7 @@ const translations: Record<ResolvedLocale, TranslationDictionary> = {
   },
   "zh-TW": {
     "nav.overview": "總覽",
+    "nav.decisions": "決策",
     "nav.connections": "連線",
     "nav.tools": "工具",
     "nav.settings": "本機設定",
@@ -2654,6 +2683,7 @@ const translations: Record<ResolvedLocale, TranslationDictionary> = {
   },
   ja: {
     "nav.overview": "概要",
+    "nav.decisions": "判定",
     "nav.connections": "接続",
     "nav.tools": "ツール",
     "nav.settings": "ローカル設定",
@@ -2798,6 +2828,7 @@ const translations: Record<ResolvedLocale, TranslationDictionary> = {
   },
   ko: {
     "nav.overview": "개요",
+    "nav.decisions": "판단",
     "nav.connections": "연결",
     "nav.tools": "도구",
     "nav.settings": "로컬 설정",
@@ -3009,6 +3040,13 @@ function interpolate(template: string, values?: TranslationValues): string {
   return template.replace(/\{([^}]+)\}/g, (placeholder, key) => String(values[key] ?? placeholder));
 }
 
+// Keep backend/API terminology intact in source dictionaries while presenting
+// the renamed local product consistently. This only rewrites the visible
+// product token, never paths, commands, or identifiers.
+function localizeProductCopy(value: string): string {
+  return value.replace(/\bHeadroom\b/g, LOCAL_COMMUNITY_NAME);
+}
+
 interface I18nContextValue {
   locale: Locale;
   resolvedLocale: ResolvedLocale;
@@ -3026,7 +3064,7 @@ const fallbackI18nValue: I18nContextValue = {
     const supplementalTemplate = supplementalCopy.en[key as SupplementalTranslationKey];
     const communityTemplate = communityCopy.en[key as CommunityTranslationKey];
     const template = supplementalTemplate ?? communityTemplate ?? english[key as keyof typeof english];
-    return interpolate(template, values);
+    return localizeProductCopy(interpolate(template, values));
   },
 };
 
@@ -3060,7 +3098,7 @@ export function I18nProvider({ children }: { children: ReactNode }) {
       ?? supplementalCopy.en[key as SupplementalTranslationKey];
     const communityTemplate = communityCopy[resolvedLocale][key as CommunityTranslationKey];
     const template = supplementalTemplate ?? communityTemplate ?? translations[resolvedLocale][key as keyof typeof english];
-    return interpolate(template, values);
+    return localizeProductCopy(interpolate(template, values));
   }, [resolvedLocale]);
 
   const value = useMemo<I18nContextValue>(() => ({ locale, resolvedLocale, setLocale, t }), [locale, resolvedLocale, setLocale, t]);

@@ -199,7 +199,7 @@ html[data-edition="local-community"] .tray-sidebar__logo img {
 html[data-edition="local-community"] .tray-sidebar__logo::after {
   min-width: 0;
   color: var(--text-primary);
-  content: "Headroom";
+  content: "codexbox";
   font-family: var(--font-display);
   font-size: 0.94rem;
   font-weight: 650;
@@ -299,7 +299,7 @@ html[data-edition="local-community"] .tray-sidebar__footer {
 html[data-edition="local-community"] .tray-sidebar__footer::after {
   margin: 5px 9px 0;
   color: var(--text-muted);
-  content: "Local Community";
+  content: "Codex workspace";
   font-size: var(--text-xxs);
   line-height: 1.2;
 }

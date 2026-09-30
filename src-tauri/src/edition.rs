@@ -8,7 +8,7 @@ pub const ACCOUNT_API_LOOPBACK_SINK: &str = "http://127.0.0.1:9/api/v1";
 pub const WORKSPACE_DIR_NAME: &str = ".headroom-local-community";
 pub const MCP_SERVER_NAME: &str = "headroom_local_community";
 pub const COMMUNITY_ACCOUNT_BILLING_UNAVAILABLE: &str =
-    "Headroom Local Community does not provide accounts or billing.";
+    "codexbox does not provide accounts or billing.";
 
 pub fn workspace_dir() -> PathBuf {
     std::env::var_os("HOME")

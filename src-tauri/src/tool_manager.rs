@@ -129,11 +129,9 @@ const MCP_METHOD_COMMUNITY_REGISTRY: &str = "community_registry";
 const COMMUNITY_MCP_INSTALL_HELPER: &str = r#"
 import sys
 from headroom.mcp_registry.base import ServerSpec
-from headroom.mcp_registry.claude import ClaudeRegistrar
-from headroom.mcp_registry.install import get_all_registrars
+from headroom.mcp_registry import CodexRegistrar
 
 entrypoint, proxy_url, workspace_dir, config_dir = sys.argv[1:5]
-zcode_configured = len(sys.argv) > 5 and sys.argv[5] == "zcode-configured"
 spec = ServerSpec(
     name="headroom_local_community",
     command=entrypoint,
@@ -173,14 +171,13 @@ def file_backed(registrar):
     the client reads on start -- exactly the path the registrar takes when no
     CLI exists at all. Unrunnable is not unconfigurable.
     """
-    if isinstance(registrar, ClaudeRegistrar):
-        return ClaudeRegistrar(claude_cli=None)
+    # Codex is the only supported managed host; no file-backed fallback.
     return None
 
-attempted = 1 if zcode_configured else 0
+attempted = 0
 skipped = []
 failures = []
-for registrar in get_all_registrars():
+for registrar in (CodexRegistrar(),):
     detected = registrar_call(registrar, "detect", registrar.detect)
     if detected is not True:
         # None already printed why (unrunnable CLI); False is simply "not
@@ -1337,10 +1334,7 @@ import sys
 from pathlib import Path
 
 from headroom.mcp_registry import (
-    ClaudeRegistrar,
     CodexRegistrar,
-    GrokRegistrar,
-    OpencodeRegistrar,
     ServerSpec,
 )
 from headroom.mcp_registry.base import RegisterStatus
@@ -1377,9 +1371,8 @@ def headroom_owns_serena(registrar, current):
         registrar.name, current, path=legacy_ledger
     )
 
-# Claude/Codex only: serena's --context values are named profiles and no
-# grok/opencode context has been validated against serena yet.
-registrars = ((ClaudeRegistrar(), "claude-code"), (CodexRegistrar(), "codex"))
+# Codex-only: Serena's context is the Codex profile.
+registrars = ((CodexRegistrar(), "codex"),)
 
 if action == "register":
     for registrar, _ in registrars:
@@ -1466,10 +1459,7 @@ import sys
 from pathlib import Path
 
 from headroom.mcp_registry import (
-    ClaudeRegistrar,
     CodexRegistrar,
-    GrokRegistrar,
-    OpencodeRegistrar,
     ServerSpec,
 )
 from headroom.mcp_registry.base import RegisterStatus
@@ -1512,7 +1502,7 @@ def compatible_user_context7(current):
     package = "@upstash/context7-mcp"
     return any(arg == package or arg.startswith(package + "@") for arg in current.args)
 
-for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), OpencodeRegistrar()):
+for registrar in (CodexRegistrar(),):
     if not registrar.detect():
         print(f"{registrar.name}: not detected, skipping")
         continue
@@ -1575,10 +1565,7 @@ import sys
 from pathlib import Path
 
 from headroom.mcp_registry import (
-    ClaudeRegistrar,
     CodexRegistrar,
-    GrokRegistrar,
-    OpencodeRegistrar,
     ServerSpec,
 )
 from headroom.mcp_registry.base import RegisterStatus
@@ -1615,7 +1602,7 @@ def headroom_owns(registrar, current):
         registrar.name, current, path=legacy_ledger
     )
 
-for registrar in (ClaudeRegistrar(), CodexRegistrar(), GrokRegistrar(), OpencodeRegistrar()):
+for registrar in (CodexRegistrar(),):
     if not registrar.detect():
         print(f"{registrar.name}: not detected, skipping")
         continue
@@ -1694,7 +1681,7 @@ static PLUGIN_ADDONS: [PluginAddon; 11] = [
         marketplace_name: "ponytail",
         plugin_ref: "ponytail@ponytail",
         codex_local_path: ".",
-        hosts: &[PluginHost::ClaudeCode, PluginHost::Codex],
+        hosts: &[PluginHost::Codex],
         source_url: "https://github.com/DietrichGebert/ponytail",
         codex_sparse_paths: &[],
     },
@@ -1704,7 +1691,7 @@ static PLUGIN_ADDONS: [PluginAddon; 11] = [
         marketplace_name: "caveman",
         plugin_ref: "caveman@caveman",
         codex_local_path: "./plugins/caveman",
-        hosts: &[PluginHost::ClaudeCode, PluginHost::Codex],
+        hosts: &[PluginHost::Codex],
         source_url: "https://github.com/JuliusBrussee/caveman",
         codex_sparse_paths: &[],
     },
@@ -1774,7 +1761,7 @@ static PLUGIN_ADDONS: [PluginAddon; 11] = [
         marketplace_name: "stop-that-shit",
         plugin_ref: "stop-that-shit@stop-that-shit",
         codex_local_path: ".",
-        hosts: &[PluginHost::ClaudeCode, PluginHost::Codex],
+        hosts: &[PluginHost::Codex],
         source_url: "https://github.com/lennney/stop-that-shit",
         codex_sparse_paths: &[
             ".agents",
@@ -1796,7 +1783,7 @@ static PLUGIN_ADDONS: [PluginAddon; 11] = [
         marketplace_name: "agent-guard",
         plugin_ref: "agent-guard@agent-guard",
         codex_local_path: "./plugins/agent-guard",
-        hosts: &[PluginHost::ClaudeCode, PluginHost::Codex],
+        hosts: &[PluginHost::Codex],
         source_url: "https://github.com/JeongJaeSoon/agent-guard",
         codex_sparse_paths: &[".agents", "plugins/agent-guard"],
     },
@@ -1806,7 +1793,7 @@ static PLUGIN_ADDONS: [PluginAddon; 11] = [
         marketplace_name: "grill-me",
         plugin_ref: "grill-me@grill-me",
         codex_local_path: ".",
-        hosts: &[PluginHost::ClaudeCode, PluginHost::Codex],
+        hosts: &[PluginHost::Codex],
         source_url: "https://github.com/joshuawheelock/grill-me",
         codex_sparse_paths: &[],
     },
@@ -2352,7 +2339,7 @@ pub struct ToolManager {
     manifests: Vec<ManagedToolManifest>,
     log_marker_cache: Arc<Mutex<Option<ToolLogMarkerCache>>>,
     serena_calls_cache: Arc<Mutex<Option<SerenaCallsCache>>>,
-    serena_live_stats_cache: Arc<Mutex<Option<(Instant, Option<(u64, Option<Instant>)>)>>>,
+    serena_live_stats_cache: Arc<Mutex<SerenaLiveStatsCache>>,
     /// False once this app process has tried to start the backend at least
     /// once. See its use in `start_headroom_background`.
     first_backend_start: Arc<std::sync::atomic::AtomicBool>,
@@ -2364,6 +2351,55 @@ struct ToolLogMarkerCache {
     path: PathBuf,
     modified: std::time::SystemTime,
     result: Option<bool>,
+}
+
+#[derive(Debug, Default)]
+struct SerenaLiveStatsCache {
+    checked_at: Option<Instant>,
+    value: Option<(u64, Option<Instant>)>,
+    refreshing: bool,
+}
+
+/// Optional statistics never block dashboard startup. Only one refresh may run,
+/// even if an OS call stalls; repeated dashboard polls cannot grow a worker queue.
+fn cached_serena_live_stats(
+    cache: &Arc<Mutex<SerenaLiveStatsCache>>,
+    fetch: impl FnOnce() -> Option<(u64, Option<Instant>)> + Send + 'static,
+) -> Option<(u64, Option<Instant>)> {
+    let mut current = cache.lock();
+    let value = current.value;
+    if current.refreshing
+        || current
+            .checked_at
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(60))
+    {
+        return value;
+    }
+    current.refreshing = true;
+    drop(current);
+    let worker_cache = Arc::clone(cache);
+    if let Err(error) = thread::Builder::new()
+        .name("serena-stats".into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(fetch));
+            let mut current = worker_cache.lock();
+            current.value = match result {
+                Ok(value) => value,
+                Err(_) => {
+                    log::warn!("Serena statistics refresh panicked; dashboard remains available");
+                    None
+                }
+            };
+            current.checked_at = Some(Instant::now());
+            current.refreshing = false;
+        })
+    {
+        let mut current = cache.lock();
+        current.refreshing = false;
+        current.checked_at = Some(Instant::now());
+        log::warn!("Unable to start Serena statistics refresh: {error}");
+    }
+    value
 }
 
 /// Cached result of scanning today's serena logs for tool-call lines.
@@ -2891,7 +2927,7 @@ impl ToolManager {
             manifests,
             log_marker_cache: Arc::new(Mutex::new(None)),
             serena_calls_cache: Arc::new(Mutex::new(None)),
-            serena_live_stats_cache: Arc::new(Mutex::new(None)),
+            serena_live_stats_cache: Arc::new(Mutex::new(SerenaLiveStatsCache::default())),
             first_backend_start: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
@@ -3036,27 +3072,15 @@ impl ToolManager {
         if !self.serena_installed() {
             return None;
         }
-        {
-            let cache = self.serena_live_stats_cache.lock();
-            if let Some((at, stats)) = cache.as_ref() {
-                if at.elapsed() < Duration::from_secs(60) {
-                    return *stats;
-                }
-            }
-        }
-        // Serena assigns the first free port above its base. Discover current
-        // listeners so later sessions remain visible even after the first four
-        // ports are occupied (or older sessions leave gaps).
-        let stats = fetch_serena_output_tokens_from_ports(&discover_serena_dashboard_ports()).map(
-            |total| {
-                let session_start = self
+        let manager = self.clone();
+        cached_serena_live_stats(&self.serena_live_stats_cache, move || {
+            fetch_serena_output_tokens_from_ports(&discover_serena_dashboard_ports()).map(|total| {
+                let session_start = manager
                     .serena_oldest_session_age()
                     .and_then(|age| Instant::now().checked_sub(age));
                 (total, session_start)
-            },
-        );
-        *self.serena_live_stats_cache.lock() = Some((Instant::now(), stats));
-        stats
+            })
+        })
     }
 
     /// Age of the oldest running serena MCP session, from `ps` elapsed time.
@@ -3155,14 +3179,12 @@ impl ToolManager {
     }
 
     fn allinluna_runtime_path(&self) -> Option<PathBuf> {
-        let home = crate::client_adapters::home_dir();
         let codex_home = crate::client_adapters::codex_home();
-        [
-            codex_home.join(".tmp/marketplaces/allinluna/plugins/allinluna/runtime"),
-            home.join(".claude/plugins/marketplaces/allinluna/plugins/allinluna/runtime"),
-        ]
-        .into_iter()
-        .find(|path| path.join("allinluna_runtime/__main__.py").is_file())
+        let runtime = codex_home.join(".tmp/marketplaces/allinluna/plugins/allinluna/runtime");
+        runtime
+            .join("allinluna_runtime/__main__.py")
+            .is_file()
+            .then_some(runtime)
     }
 
     fn ensure_allinluna_launcher(&self) -> Result<()> {
@@ -3171,12 +3193,12 @@ impl ToolManager {
 
         #[cfg(windows)]
     let body = format!(
-        "@echo off\r\nif defined CODEX_HOME (set \"CODEX_ROOT=%CODEX_HOME%\") else (set \"CODEX_ROOT=%USERPROFILE%\\.codex\")\r\nset \"PLUGIN_RUNTIME=%CODEX_ROOT%\\.tmp\\marketplaces\\allinluna\\plugins\\allinluna\\runtime\"\r\nif not exist \"%PLUGIN_RUNTIME%\\allinluna_runtime\\__main__.py\" set \"PLUGIN_RUNTIME=%USERPROFILE%\\.claude\\plugins\\marketplaces\\allinluna\\plugins\\allinluna\\runtime\"\r\nif not exist \"%PLUGIN_RUNTIME%\\allinluna_runtime\\__main__.py\" (\r\n echo All in Luna requires installed marketplace runtime Headroom-managed Python ^>= 3.11. Install or enable All in Luna again. 1>&2\r\n exit /b 1\r\n)\r\nif defined PYTHONPATH (\r\n set \"PYTHONPATH=%PLUGIN_RUNTIME%;%PYTHONPATH%\"\r\n) else (\r\n set \"PYTHONPATH=%PLUGIN_RUNTIME%\"\r\n)\r\nset \"PYTHONNOUSERSITE=1\"\r\n\"{}\" -m allinluna_runtime %*\r\n",
+            "@echo off\r\nif defined CODEX_HOME (set \"CODEX_ROOT=%CODEX_HOME%\") else (set \"CODEX_ROOT=%USERPROFILE%\\.codex\")\r\nset \"PLUGIN_RUNTIME=%CODEX_ROOT%\\.tmp\\marketplaces\\allinluna\\plugins\\allinluna\\runtime\"\r\nif not exist \"%PLUGIN_RUNTIME%\\allinluna_runtime\\__main__.py\" (\r\n echo All in Luna requires the Codex marketplace runtime and Headroom-managed Python ^>= 3.11. Install or enable All in Luna again. 1>&2\r\n exit /b 1\r\n)\r\nif defined PYTHONPATH (\r\n set \"PYTHONPATH=%PLUGIN_RUNTIME%;%PYTHONPATH%\"\r\n) else (\r\n set \"PYTHONPATH=%PLUGIN_RUNTIME%\"\r\n)\r\nset \"PYTHONNOUSERSITE=1\"\r\n\"{}\" -m allinluna_runtime %*\r\n",
         managed_python.display()
     );
         #[cfg(not(windows))]
     let body = format!(
-        "#!/bin/sh\nset -eu\ncodex_root=\"${{CODEX_HOME:-$HOME/.codex}}\"\nfor plugin_runtime in \\\n \"$codex_root/.tmp/marketplaces/allinluna/plugins/allinluna/runtime\" \\\n \"$HOME/.claude/plugins/marketplaces/allinluna/plugins/allinluna/runtime\"; do\n if [ -f \"$plugin_runtime/allinluna_runtime/__main__.py\" ]; then\n  PYTHONPATH=\"$plugin_runtime${{PYTHONPATH:+:$PYTHONPATH}}\"\n  export PYTHONPATH\n  export PYTHONNOUSERSITE=1\n  exec '{}' -m allinluna_runtime \"$@\"\n fi\ndone\necho 'All in Luna requires installed marketplace runtime Headroom-managed Python >= 3.11.' >&2\nexit 1\n",
+        "#!/bin/sh\nset -eu\ncodex_root=\"${{CODEX_HOME:-$HOME/.codex}}\"\nplugin_runtime=\"$codex_root/.tmp/marketplaces/allinluna/plugins/allinluna/runtime\"\nif [ -f \"$plugin_runtime/allinluna_runtime/__main__.py\" ]; then\n  PYTHONPATH=\"$plugin_runtime${{PYTHONPATH:+:$PYTHONPATH}}\"\n  export PYTHONPATH\n  export PYTHONNOUSERSITE=1\n  exec '{}' -m allinluna_runtime \"$@\"\nfi\necho 'All in Luna requires the Codex marketplace runtime and Headroom-managed Python >= 3.11. Install or enable All in Luna again.' >&2\nexit 1\n",
         managed_python.display().to_string().replace('\'', "'\\''")
     );
 
@@ -6884,6 +6906,24 @@ impl ToolManager {
 
     fn install_headroom_mcp(&self) -> Result<McpInstallMethod> {
         let entrypoint = self.headroom_entrypoint();
+        if !crate::edition::LOCAL_COMMUNITY {
+            let entrypoint_arg = entrypoint.to_string_lossy().into_owned();
+            let workspace_arg = crate::edition::workspace_dir()
+                .to_string_lossy()
+                .into_owned();
+            let config_arg = crate::edition::config_dir().to_string_lossy().into_owned();
+            self.run_mcp_helper(&[
+                "-c",
+                COMMUNITY_MCP_INSTALL_HELPER,
+                &entrypoint_arg,
+                HEADROOM_PROXY_URL,
+                &workspace_arg,
+                &config_arg,
+            ])
+            .context("registering Headroom MCP with Codex")?;
+            let _ = crate::client_adapters::pin_codex_mcp_command(&entrypoint);
+            return Ok(McpInstallMethod::CommunityRegistry);
+        }
         let detected_claude = crate::claude_cli::detect_claude_cli();
 
         if crate::edition::LOCAL_COMMUNITY {
@@ -6894,11 +6934,6 @@ impl ToolManager {
             let config_arg = crate::edition::config_dir().to_string_lossy().into_owned();
             // Rust owns the ZCode entry; the Python registry has no ZCode
             // registrar. Count an existing valid entry when it is the only client.
-            if let Err(err) = crate::client_adapters::repin_zcode_mcp_command(&entrypoint) {
-                log::warn!("ZCode MCP repin skipped: {err:#}");
-            }
-            let zcode_configured = crate::client_adapters::is_zcode_enabled()
-                && crate::client_adapters::zcode_mcp_entry_matches().unwrap_or(false);
             self.run_mcp_helper(&[
                 "-c",
                 COMMUNITY_MCP_INSTALL_HELPER,
@@ -6906,12 +6941,10 @@ impl ToolManager {
                 HEADROOM_PROXY_URL,
                 &workspace_arg,
                 &config_arg,
-                if zcode_configured { "zcode-configured" } else { "" },
             ])
             .context("registering isolated Community MCP server")?;
 
             let _ = crate::client_adapters::pin_codex_mcp_command(&entrypoint);
-            let _ = crate::client_adapters::pin_grok_mcp_command(&entrypoint);
             return Ok(McpInstallMethod::CommunityRegistry);
         }
 
@@ -7011,7 +7044,6 @@ impl ToolManager {
         // absolute entrypoint so it survives runtime moves. Best-effort: a
         // failure here must not break the Claude integration below.
         let _ = crate::client_adapters::pin_codex_mcp_command(&entrypoint);
-        let _ = crate::client_adapters::pin_grok_mcp_command(&entrypoint);
 
         // Ground truth: did Claude Code actually see the server? The Python
         // CLI's fallback branch writes ~/.claude/mcp.json (legacy, ignored by
@@ -9059,6 +9091,9 @@ impl ToolManager {
         host: PluginHost,
         args: &[&str],
     ) -> Result<()> {
+        if !matches!(host, PluginHost::Codex) {
+            bail!("managed addon CLI execution is Codex-only");
+        }
         let id = plugin.id;
         let label = host.label();
         let result = run_command_streaming(cli, args, &self.runtime.root_dir, &mut |line: &str| {
@@ -9097,6 +9132,9 @@ impl ToolManager {
         host: PluginHost,
         enable: bool,
     ) -> Result<()> {
+        if !matches!(host, PluginHost::Codex) {
+            bail!("managed addon installation is Codex-only");
+        }
         let cli = host.cli().context("CLI not found on PATH")?;
         if uses_codex_plugin_adapter(plugin, host) {
             self.install_codex_adapter_plugin(plugin, &cli)?;
@@ -9929,7 +9967,15 @@ impl ToolManager {
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
             if !enabled {
-                return ToolStatus::Healthy;
+                // A disabled receipt only represents a healthy installation
+                // while Codex still has the plugin registration. Otherwise
+                // keep the card installed-but-degraded so the UI offers Repair
+                // instead of an Enable action that can only fail.
+                return if plugin.hosts.iter().any(|host| host.plugin_present(plugin)) {
+                    ToolStatus::Healthy
+                } else {
+                    ToolStatus::Degraded
+                };
             }
             // Enabled per our receipt: require it still be registered with a host,
             // so a manual `/plugin` removal surfaces as not-installed.
@@ -10009,7 +10055,9 @@ impl PluginHost {
 
     fn cli(self) -> Option<PathBuf> {
         match self {
-            PluginHost::ClaudeCode => crate::claude_cli::detect_claude_cli(),
+            // Legacy host data remains readable, but this manager never
+            // invokes or mutates non-Codex host CLIs.
+            PluginHost::ClaudeCode => None,
             PluginHost::Codex => crate::claude_cli::detect_codex_cli(),
         }
     }
@@ -11723,64 +11771,25 @@ const SERENA_TOOL_CALL_LOG_MARKER: &str = "; session_id: ";
 const SERENA_DASHBOARD_BASE_PORT: u16 = 24282;
 const SERENA_DASHBOARD_PORT_WINDOW: u16 = 64;
 
-/// Discover listening Serena dashboard candidates once per live-stats cache
-/// miss. We only query IPv4/IPv6 loopback and still require the dashboard's
-/// exact JSON shape. Keep candidates inside a bounded observation window so
-/// unrelated high-port local services are never probed. When listener
-/// enumeration is unavailable, scan the same window rather than regressing to
-/// the former four-port limit.
+/// Probe only Serena's bounded IPv4/IPv6 loopback port window. Responders must
+/// still satisfy the dashboard's exact JSON shape before their stats are used.
 fn discover_serena_dashboard_ports() -> Vec<u16> {
-    let mut ports = Vec::new();
-
-    for lsof in ["/usr/sbin/lsof", "/usr/bin/lsof"] {
-        let Ok(output) = crate::proc::command(lsof)
-            .args(["-nP", "-a", "-iTCP", "-sTCP:LISTEN"])
-            .output()
-        else {
-            continue;
-        };
-        if output.status.success() {
-            ports.extend(parse_lsof_listener_ports(&String::from_utf8_lossy(
-                &output.stdout,
-            )));
-            break;
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    if ports.is_empty() {
-        if let Ok(output) = crate::proc::command("ss").arg("-ltn").output() {
-            if output.status.success() {
-                ports.extend(parse_ss_listener_ports(&String::from_utf8_lossy(
-                    &output.stdout,
-                )));
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    if ports.is_empty() {
-        if let Ok(output) = crate::proc::command("netstat")
-            .args(["-ano", "-p", "tcp"])
-            .output()
-        {
-            if output.status.success() {
-                ports.extend(parse_netstat_listener_ports(&String::from_utf8_lossy(
-                    &output.stdout,
-                )));
-            }
-        }
-    }
-
-    ports.sort_unstable();
-    ports.dedup();
-    if ports.is_empty() {
-        ports.extend(
-            (0..SERENA_DASHBOARD_PORT_WINDOW)
-                .filter_map(|offset| SERENA_DASHBOARD_BASE_PORT.checked_add(offset)),
-        );
-    }
-    ports
+    // lsof may block indefinitely stat'ing an unrelated disconnected SMB mount.
+    // TCP loopback probes do not enumerate filesystems or launch child processes.
+    (0..SERENA_DASHBOARD_PORT_WINDOW)
+        .map(|offset| SERENA_DASHBOARD_BASE_PORT + offset)
+        .filter(|port| {
+            [
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            ]
+            .into_iter()
+            .any(|ip| {
+                TcpStream::connect_timeout(&SocketAddr::new(ip, *port), Duration::from_millis(10))
+                    .is_ok()
+            })
+        })
+        .collect()
 }
 
 fn parse_dashboard_listener_port(endpoint: &str) -> Option<u16> {
@@ -12678,20 +12687,17 @@ fn probe_headroom_http(port: u16, timeout: Duration) -> bool {
 /// listening" and never "it is not ours". Both the port-reclaim kill path and
 /// the stale-argv check hang off this, so neither may treat None as evidence.
 fn listener_process(port: u16) -> Option<(String, u32)> {
+    static PENDING: Mutex<Option<Child>> = Mutex::new(None);
     for lsof in ["/usr/sbin/lsof", "/usr/bin/lsof"] {
         // Only `-iTCP:{port}` — a bare `-iTCP` here would OR with the port
         // selector (lsof ORs `-i` options) and match every listening socket on
         // the machine, so the first row would be an unrelated daemon.
-        let Ok(output) = crate::proc::command(lsof)
-            .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
-            .output()
-        else {
-            continue; // not installed at this path
-        };
-        if !output.status.success() {
+        let mut cmd = crate::proc::command(lsof);
+        cmd.args(["-b", "-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN"]);
+        let Some(output) = bounded_listener_output(&mut cmd, &PENDING, Duration::from_millis(500)) else {
             continue;
-        }
-        if let Some(found) = parse_lsof_listener(&String::from_utf8_lossy(&output.stdout)) {
+        };
+        if let Some(found) = parse_lsof_listener(&String::from_utf8_lossy(&output)) {
             return Some(found);
         }
     }
@@ -12701,6 +12707,64 @@ fn listener_process(port: u16) -> Option<(String, u32)> {
     return windows_listener(port);
     #[cfg(not(any(target_os = "linux", windows)))]
     return None;
+}
+
+/// A hung kernel query must not block the app or generate an unbounded pile of
+/// subprocesses. Keep the unreaped child in one slot until try_wait confirms exit.
+/// Tempfile capture avoids waiting forever for inherited pipe handles to close.
+fn bounded_listener_output(
+    cmd: &mut Command,
+    pending: &Mutex<Option<Child>>,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    use std::io::{Seek, SeekFrom};
+    let mut slot = pending.try_lock()?;
+    if let Some(child) = slot.as_mut() {
+        match child.try_wait() {
+            Ok(Some(_)) => { slot.take(); }
+            _ => return None,
+        }
+    }
+    let mut file = tempfile::tempfile().ok()?;
+    cmd.stdin(Stdio::null()).stdout(file.try_clone().ok()?).stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().ok()?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() { return None; }
+                file.seek(SeekFrom::Start(0)).ok()?;
+                let mut bytes = Vec::new();
+                file.take(1_048_577).read_to_end(&mut bytes).ok()?;
+                return (bytes.len() <= 1_048_576).then_some(bytes);
+            }
+            Ok(None) if start.elapsed() < timeout
+                && file.metadata().map(|m| m.len() <= 1_048_576).unwrap_or(false) => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                #[cfg(unix)]
+                unsafe {
+                    // This process group was created above and belongs to our child.
+                    if libc::kill(-(child.id() as i32), libc::SIGKILL) != 0 {
+                        log::warn!("Listener query group cleanup failed: {}", std::io::Error::last_os_error());
+                    }
+                }
+                #[cfg(not(unix))]
+                if let Err(error) = child.kill() {
+                    log::warn!("Listener query cleanup failed: {error}");
+                }
+                *slot = Some(child);
+                log::warn!("Listener identity query did not complete within its limits; identity remains unknown");
+                return None;
+            }
+        }
+    }
 }
 
 /// Windows has neither `lsof` nor `ss`, so `listener_process` returned `None`
@@ -18637,7 +18701,7 @@ after
             assert_eq!(plugin.plugin_ref, plugin_ref);
             assert_eq!(plugin.codex_local_path, local_path);
             assert_eq!(plugin.source_url, source_url);
-            assert_eq!(plugin.hosts, &[PluginHost::ClaudeCode, PluginHost::Codex]);
+        assert_eq!(plugin.hosts, &[PluginHost::Codex]);
         }
     }
 
@@ -18778,12 +18842,12 @@ after
             // literal `.codex\...` prefix, so assert the variables the script
             // actually switches on.
             assert!(body.contains(r"%CODEX_ROOT%\.tmp\marketplaces\allinluna"));
-            assert!(body.contains(r"%USERPROFILE%\.claude\plugins\marketplaces\allinluna"));
+            assert!(!body.contains(r"%USERPROFILE%\.claude\plugins\marketplaces\allinluna"));
         } else {
             assert!(body.contains("CODEX_HOME"));
             assert!(body.contains("codex_root"));
             assert!(body.contains(".tmp/marketplaces/allinluna"));
-            assert!(body.contains(".claude/plugins/marketplaces/allinluna"));
+            assert!(!body.contains(".claude/plugins/marketplaces/allinluna"));
         }
         let required_python = if cfg!(target_os = "windows") {
             "Headroom-managed Python ^>= 3.11"
@@ -19470,19 +19534,11 @@ after
         }
     }
 
-    /// The registered server name the helper must keep passing through.
+    /// The Codex-only helper must execute its success and failure paths.
     #[test]
-    fn community_mcp_helper_still_registers_both_agents_when_one_cli_is_unrunnable() {
-        // Homebrew leaves /opt/homebrew/bin/claude as a `sh` shim when the
-        // native binary never downloaded: `shutil.which` finds it, so
-        // detect() says yes and the CLI path is taken, but the file has no
-        // shebang, so subprocess raises `OSError: [Errno 8] Exec format
-        // error` BEFORE ClaudeRegistrar's own CLI->file fallback runs. That
-        // aborted the whole loop -- Codex, next in the list, got nothing --
-        // and the desktop reported a cause-free "installation failed"
-        // (reproduced live 2026-09-10). The guard must skip the unrunnable
-        // CLI, keep configuring everyone else, and still configure the broken
-        // one through the file the client reads on start.
+    fn community_mcp_helper_is_codex_only() {
+        assert!(super::COMMUNITY_MCP_INSTALL_HELPER.contains("CodexRegistrar"));
+        assert!(!super::COMMUNITY_MCP_INSTALL_HELPER.contains("get_all_registrars"));
         let helper = super::COMMUNITY_MCP_INSTALL_HELPER;
         let script = format!(
             r#"import sys
@@ -19511,59 +19567,27 @@ class RegisterResult:
     def ok(self):
         return self.status in (Status.REGISTERED, Status.ALREADY)
 
-STATE = {{"calls": [], "claude_file_write_ok": True}}
-
-class ClaudeRegistrar:
-    name = "claude"
-
-    def __init__(self, *, claude_cli=..., home_dir=None, config_dir=None):
-        self.cli = None if claude_cli is None else "claude"
-
-    def detect(self):
-        STATE["calls"].append("claude.detect")
-        return True
-
-    def register_server(self, spec, *, force=False):
-        if self.cli is not None:
-            raise OSError(8, "Exec format error")
-        STATE["calls"].append("claude.register(file)")
-        if not STATE["claude_file_write_ok"]:
-            return RegisterResult(Status.FAILED, "config is not valid JSON")
-        return RegisterResult(Status.REGISTERED, "wrote ~/.claude.json")
+STATE = {{"calls": []}}
 
 class CodexRegistrar:
     name = "codex"
 
     def detect(self):
         STATE["calls"].append("codex.detect")
-        return True
+        return STATE.get("mode") != "unavailable"
 
     def register_server(self, spec, *, force=False):
         STATE["calls"].append("codex.register")
+        if STATE.get("mode") == "register-failure":
+            return RegisterResult(Status.FAILED, "codex config is invalid")
         return RegisterResult(Status.REGISTERED, "wrote ~/.codex/config.toml")
 
-class CliOnlyRegistrar:
-    """An agent whose only write path is its CLI (no file fallback)."""
-
-    name = "grok"
-
-    def detect(self):
-        STATE["calls"].append("grok.detect")
-        return True
-
-    def register_server(self, spec, *, force=False):
-        raise OSError(8, "Exec format error")
-
-REGISTRARS = [ClaudeRegistrar(), CodexRegistrar()]
 
 pkg = types.ModuleType("headroom.mcp_registry")
 pkg.__path__ = []
 base = types.ModuleType("headroom.mcp_registry.base")
 base.ServerSpec = ServerSpec
-claude = types.ModuleType("headroom.mcp_registry.claude")
-claude.ClaudeRegistrar = ClaudeRegistrar
-install = types.ModuleType("headroom.mcp_registry.install")
-install.get_all_registrars = lambda: list(REGISTRARS)
+pkg.CodexRegistrar = CodexRegistrar
 headroom = types.ModuleType("headroom")
 headroom.__path__ = []
 sys.modules.update(
@@ -19571,8 +19595,6 @@ sys.modules.update(
         "headroom": headroom,
         "headroom.mcp_registry": pkg,
         "headroom.mcp_registry.base": base,
-        "headroom.mcp_registry.claude": claude,
-        "headroom.mcp_registry.install": install,
     }}
 )
 
@@ -19583,50 +19605,41 @@ def run():
     STATE["calls"] = []
     exec(compile(HELPER, "community_mcp_helper", "exec"), {{"__name__": "__main__"}})
 
-# The unrunnable CLI is skipped with a reason, its file fallback still
-# configures it, and the next agent is reached.
+# The Codex registrar is executed directly, with no non-Codex fallback.
 run()
-assert STATE["calls"] == [
-    "claude.detect",
-    "claude.register(file)",
-    "codex.detect",
-    "codex.register",
-], STATE["calls"]
+assert STATE["calls"] == ["codex.detect", "codex.register"], STATE["calls"]
 
-# When nothing can be configured the helper must fail loudly rather than
+# When Codex cannot be configured the helper must fail loudly rather than
 # report a successful no-op.
-REGISTRARS[:] = [CliOnlyRegistrar()]
-STATE["claude_file_write_ok"] = False
+STATE["mode"] = "unavailable"
 try:
     run()
 except SystemExit as exc:
-    assert "unrunnable CLI: grok" in str(exc), str(exc)
+    assert "no supported MCP clients detected" in str(exc), str(exc)
 else:
-    raise AssertionError("helper must fail when no agent could be configured")
+    raise AssertionError("helper must fail when Codex is unavailable")
 
-# A file fallback that itself fails is a real failure: its reason must reach
-# the user instead of being folded into the skip path.
-REGISTRARS[:] = [ClaudeRegistrar()]
+# A Codex registration failure is a real failure: its reason must reach
+# the user instead of being folded into a skip path.
+STATE["mode"] = "register-failure"
 try:
     run()
 except SystemExit as exc:
-    assert "config is not valid JSON" in str(exc), str(exc)
+    assert "codex config is invalid" in str(exc), str(exc)
 else:
-    raise AssertionError("a failed file fallback must not be reported as success")
+    raise AssertionError("a failed Codex registration must not be reported as success")
 
-# ZCode is registered by Rust rather than the Python registry. An explicitly
-# verified ZCode entry is sufficient on a machine with no other agents.
-REGISTRARS[:] = []
-sys.argv.append("zcode-configured")
+# A successful Codex retry still performs no non-Codex operation.
+STATE["mode"] = "success"
 run()
-assert STATE["calls"] == []
-sys.argv.pop()
+assert STATE["calls"] == ["codex.detect", "codex.register"], STATE["calls"]
+STATE["mode"] = "unavailable"
 try:
     run()
 except SystemExit as exc:
     assert "no supported MCP clients" in str(exc), str(exc)
 else:
-    raise AssertionError("an absent ZCode entry cannot count as configured")
+    raise AssertionError("an unavailable Codex entry cannot count as configured")
 print("ok")
 "#
         );
@@ -19643,8 +19656,113 @@ print("ok")
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(
-            String::from_utf8_lossy(&out.stdout).contains("CLI is not runnable"),
-            "the unusable CLI must be reported to the user"
+            String::from_utf8_lossy(&out.stdout).trim_end().ends_with("ok"),
+            "the Codex-only helper scenario must complete"
+        );
+    }
+
+    #[test]
+    fn serena_live_stats_refresh_is_nonblocking_and_single_flight() {
+        use super::{Arc, Mutex, Instant, thread};
+        use std::sync::mpsc;
+        let cache = Arc::new(Mutex::new(super::SerenaLiveStatsCache::default()));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let before = Instant::now();
+        assert_eq!(
+            super::cached_serena_live_stats(&cache, move || {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                Some((42, None))
+            }),
+            None
+        );
+        assert!(before.elapsed() < Duration::from_millis(500));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        for _ in 0..25 {
+            assert_eq!(
+                super::cached_serena_live_stats(&cache, || {
+                    panic!("duplicate refresh must not run")
+                }),
+                None
+            );
+        }
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while cache.lock().refreshing && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!cache.lock().refreshing);
+        assert_eq!(
+            super::cached_serena_live_stats(&cache, || panic!("fresh cache")),
+            Some((42, None))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_listener_query_times_out_and_reaps_before_reuse() {
+        use super::{Mutex, Instant, thread};
+        let pending = Mutex::new(None);
+        let mut slow = crate::proc::command("/bin/sh");
+        slow.args(["-c", "sleep 10"]);
+        let before = Instant::now();
+        assert!(super::bounded_listener_output(&mut slow, &pending, Duration::from_millis(50)).is_none());
+        assert!(before.elapsed() < Duration::from_secs(1));
+        assert!(pending.lock().is_some(), "keep ownership until child is reaped");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if pending.lock().as_mut().unwrap().try_wait().unwrap().is_some() { break; }
+            assert!(Instant::now() < deadline, "synthetic child must exit after kill");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let mut healthy = crate::proc::command("/bin/sh");
+        healthy.args(["-c", "printf 'listener-ok'"]);
+        assert_eq!(super::bounded_listener_output(&mut healthy, &pending, Duration::from_secs(1)), Some(b"listener-ok".to_vec()));
+        assert!(pending.lock().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_listener_query_skips_concurrent_probe_and_failed_command() {
+        use super::Mutex;
+        let pending = Mutex::new(None);
+        let mut cmd = crate::proc::command("/bin/sh");
+        cmd.args(["-c", "exit 7"]);
+        let held = pending.lock();
+        assert!(super::bounded_listener_output(&mut cmd, &pending, Duration::from_secs(1)).is_none());
+        drop(held);
+        assert!(super::bounded_listener_output(&mut cmd, &pending, Duration::from_secs(1)).is_none());
+        assert!(pending.lock().is_none());
+    }
+
+    #[test]
+    fn serena_live_stats_negative_cache_prevents_retry_storm() {
+        use super::{Arc, Mutex, Instant, thread};
+        let cache = Arc::new(Mutex::new(super::SerenaLiveStatsCache::default()));
+        assert_eq!(super::cached_serena_live_stats(&cache, || None), None);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while cache.lock().refreshing && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(cache.lock().checked_at.is_some());
+        assert_eq!(
+            super::cached_serena_live_stats(&cache, || panic!("negative cache")),
+            None
+        );
+    }
+
+    #[test]
+    fn serena_live_stats_keeps_cached_value_while_refreshing() {
+        use super::{Arc, Mutex, Instant};
+        let cache = Arc::new(Mutex::new(super::SerenaLiveStatsCache {
+            checked_at: Some(Instant::now() - Duration::from_secs(61)),
+            value: Some((123, None)),
+            refreshing: true,
+        }));
+        assert_eq!(
+            super::cached_serena_live_stats(&cache, || panic!("in flight")),
+            Some((123, None))
         );
     }
 
@@ -20940,6 +21058,20 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
         // (Install), while the host registration remains available for a fast
         // re-enable.
         let (root, runtime, manager) = seed_test_runtime("plugin-disabled");
+        let _home = HomeGuard::new(&root);
+        let codex_home = root.join(".codex");
+        fs::create_dir_all(&codex_home).expect("Codex home");
+        let config = PLUGIN_ADDONS
+            .iter()
+            .map(|plugin| {
+                format!(
+                    "[plugins.\"{}\"]\nenabled = false\n",
+                    plugin.plugin_ref
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(codex_home.join("config.toml"), config).expect("Codex config");
         for plugin in &PLUGIN_ADDONS {
             fs::write(
                 runtime.tools_dir.join(format!("{}.json", plugin.id)),
@@ -20951,6 +21083,29 @@ TCP 127.0.0.1:24299 127.0.0.1:50000 ESTABLISHED 46\n";
                 crate::models::ToolStatus::Healthy
             ));
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn plugin_disabled_receipt_without_registration_reports_degraded_for_repair() {
+        let (root, runtime, manager) = seed_test_runtime("plugin-disabled-stale");
+        let _home = HomeGuard::new(&root);
+        let plugin = PLUGIN_ADDONS
+            .iter()
+            .find(|plugin| plugin.id == "ralph-loop")
+            .expect("Ralph Loop addon");
+
+        fs::write(
+            runtime.tools_dir.join(format!("{}.json", plugin.id)),
+            br#"{"version":"0.1.0","enabled":false}"#,
+        )
+        .expect("legacy receipt");
+
+        assert!(matches!(
+            manager.detect_status(plugin.id),
+            crate::models::ToolStatus::Degraded
+        ));
+        assert!(!manager.tool_enabled(plugin.id));
         let _ = fs::remove_dir_all(root);
     }
 

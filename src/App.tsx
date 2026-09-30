@@ -47,7 +47,15 @@ import {
 } from "recharts";
 import headroomAvatar from "./assets/headroom-rage-avatar.png";
 import packageJson from "../package.json";
-import { LOCAL_COMMUNITY_EDITION } from "./lib/localEdition";
+import {
+  CODEX_CONNECTOR_ID,
+  LOCAL_COMMUNITY_EDITION,
+  LOCAL_COMMUNITY_NAME,
+  codexOnlyUiCopy,
+  codexLearnInvocation,
+  filterCodexConnectors,
+  isCodexConnector,
+} from "./lib/localEdition";
 import {
   clearAddonOperationMessage,
   setAddonOperationMessage,
@@ -64,6 +72,7 @@ import { useTakeoverConfirm } from "./lib/takeoverConfirm";
 import {
   getActivationScopeCopy,
   groupToolsByCategory,
+  localizeWorkflowCopy,
   toolCopy,
   toolCategoryCopy,
   TOOL_CATEGORY_ORDER,
@@ -204,6 +213,8 @@ import {
 import { trackAnalyticsEvent, trackInstallMilestoneOnce } from "./lib/analytics";
 import { withDeadline } from "./lib/asyncDeadline";
 import { ActivityFeed } from "./components/ActivityFeed";
+import { JevPanel } from "./components/JevPanel";
+import { JevOverviewCard } from "./components/JevOverviewCard";
 import { AuthCodeForm } from "./components/AuthCodeForm";
 import { ConnectorIcon, hasConnectorIcon } from "./components/ConnectorIcon";
 import { LauncherShell } from "./components/LauncherShell";
@@ -266,6 +277,7 @@ const navItems: NavItem[] = [
   { id: "home", labelKey: "nav.overview", icon: House },
   { id: "optimization", labelKey: "nav.optimize", icon: Sliders },
   { id: "notifications", labelKey: "nav.activity", icon: Bell },
+  { id: "decisions", labelKey: "nav.decisions", icon: Brain },
   { id: "addons", labelKey: "nav.tools", icon: PuzzlePiece },
 ];
 
@@ -368,6 +380,20 @@ const addonCopy: Record<string, AddonCopy> = {
     disabled: "Context7 is off but still installed. Re-enable any time."
   }
 };
+
+function codexOnlyAddonCopy(copy?: AddonCopy): AddonCopy | undefined {
+  if (!copy) return undefined;
+  return {
+    whatItDoes: localizeWorkflowCopy(codexOnlyUiCopy(copy.whatItDoes)),
+    installing: copy.installing ? localizeWorkflowCopy(codexOnlyUiCopy(copy.installing)) : undefined,
+    uninstalling: copy.uninstalling ? localizeWorkflowCopy(codexOnlyUiCopy(copy.uninstalling)) : undefined,
+    installed: copy.installed ? localizeWorkflowCopy(codexOnlyUiCopy(copy.installed)) : undefined,
+    uninstalled: copy.uninstalled ? localizeWorkflowCopy(codexOnlyUiCopy(copy.uninstalled)) : undefined,
+    enabling: copy.enabling ? localizeWorkflowCopy(codexOnlyUiCopy(copy.enabling)) : undefined,
+    disabling: copy.disabling ? localizeWorkflowCopy(codexOnlyUiCopy(copy.disabling)) : undefined,
+    disabled: copy.disabled ? localizeWorkflowCopy(codexOnlyUiCopy(copy.disabled)) : undefined,
+  };
+}
 
 const connectorSetupDetails: Record<string, string> = {
   claude_code:
@@ -526,7 +552,7 @@ function localizeAppUpdateCopy(t: Translate, value: string | null): string | nul
 // It stops at attributing the decision and does not speculate about why they
 // made it, which we do not know.
 const CLAUDE_DESKTOP_LIMITATION =
-  "Claude Code inside the Claude desktop app cannot be optimized. Headroom routes Claude Code by pointing it at a local proxy via your shell profile and ~/.claude/settings.json, and Anthropic's desktop app uses neither, so its requests never reach Headroom. That is a design decision on Anthropic's side and nothing Headroom can work around. Run Claude Code from a terminal, or use the VS Code or JetBrains extension, and Headroom picks it up automatically.";
+  "Claude Code inside the Claude desktop app cannot be optimized. codexbox routes Claude Code by pointing it at a local proxy via your shell profile and ~/.claude/settings.json, and Anthropic's desktop app uses neither, so its requests never reach codexbox. That is a design decision on Anthropic's side and nothing codexbox can work around. Run Claude Code from a terminal, or use the VS Code or JetBrains extension, and codexbox picks it up automatically.";
 
 const connectorSupportWarnings: Record<string, string> = {
   claude_code: CLAUDE_DESKTOP_LIMITATION
@@ -547,9 +573,9 @@ const connectorUnavailableReasons: Record<string, string> = {
   // lands here, because the CLI genuinely isn't installed. Say so, or they
   // reasonably conclude Headroom is broken rather than inapplicable.
   claude_code:
-    "Claude Code was not detected. Install the Claude Code CLI and restart Headroom. Note that Claude Code inside the Claude desktop app cannot be optimized: Anthropic's desktop app does not use the CLI's configuration, so Headroom never sees its requests. That is their design decision, not something Headroom can configure around.",
+    "Claude Code was not detected. Install the Claude Code CLI and restart codexbox. Note that Claude Code inside the Claude desktop app cannot be optimized: Anthropic's desktop app does not use the CLI's configuration, so codexbox never sees its requests. That is their design decision, not something codexbox can configure around.",
   codex:
-    "Codex CLI was not detected. Headroom can still configure the Codex desktop app and IDE extension; install the CLI only if you also want terminal use.",
+    "Codex CLI was not detected. codexbox can still configure the Codex desktop app and IDE extension; install the CLI only if you also want terminal use.",
   grok_build:
     "Grok Build was not detected. Install Grok Build and restart Headroom.",
   opencode:
@@ -558,20 +584,8 @@ const connectorUnavailableReasons: Record<string, string> = {
     "ZCode was not detected. Install ZCode and restart Headroom."
 };
 
-// Grok routing: UA-classified in the intercept, forwarded to api.x.ai via
-// the backend's per-request x-headroom-base-url selection.
-const GROK_CONNECTOR_ENABLED = true;
-
-// OpenCode is visible in RC builds for end-to-end verification; keep the
-// flag so it can ship dark in a stable if the RC pass surfaces problems.
-const OPENCODE_CONNECTOR_ENABLED = true;
-
 function withoutHiddenConnectors(list: ClientConnectorStatus[]) {
-  return list.filter(
-    (connector) =>
-      (GROK_CONNECTOR_ENABLED || connector.clientId !== "grok_build") &&
-      (OPENCODE_CONNECTOR_ENABLED || connector.clientId !== "opencode")
-  );
+  return filterCodexConnectors(list);
 }
 
 // Connectors the Claude pricing gate neither auto-disables nor blocks
@@ -583,36 +597,8 @@ const GATE_EXEMPT_CONNECTOR_IDS = new Set(["codex", "opencode", "grok_build", "z
 
 const launcherConnectorFallback: ClientConnectorStatus[] = withoutHiddenConnectors([
   {
-    clientId: "claude_code",
-    name: "Claude Code",
-    installed: false,
-    enabled: false,
-    verified: false
-  },
-  {
-    clientId: "codex",
+    clientId: CODEX_CONNECTOR_ID,
     name: "Codex",
-    installed: false,
-    enabled: false,
-    verified: false
-  },
-  {
-    clientId: "grok_build",
-    name: "Grok Build",
-    installed: false,
-    enabled: false,
-    verified: false
-  },
-  {
-    clientId: "opencode",
-    name: "OpenCode",
-    installed: false,
-    enabled: false,
-    verified: false
-  },
-  {
-    clientId: "zcode",
-    name: "ZCode",
     installed: false,
     enabled: false,
     verified: false
@@ -1897,9 +1883,10 @@ function addonConnectors(
   connectors: ClientConnectorStatus[]
 ): ClientConnectorStatus[] {
   const supportedClientIds = ADDON_CLIENT_IDS[toolId];
+  const codexConnectors = connectors.filter((connector) => isCodexConnector(connector.clientId));
   return supportedClientIds
-    ? connectors.filter((connector) => supportedClientIds.includes(connector.clientId))
-    : connectors;
+    ? codexConnectors.filter((connector) => supportedClientIds.includes(connector.clientId))
+    : codexConnectors;
 }
 
 // Unknown ids land after the curated ones, before the trailing RTK card.
@@ -2565,7 +2552,7 @@ export default function App() {
         setLauncherStage(initialStage);
       }
 
-      updateStartup("runtime", 80, "Preparing Headroom runtime…");
+      updateStartup("runtime", 80, `Preparing ${LOCAL_COMMUNITY_NAME} runtime…`);
       const [runtimeResult, pricingResult, launchFlagsResult] = await Promise.all([
         invoke<RuntimeStatus>("get_runtime_status").catch(() => null),
         invoke<HeadroomPricingStatus>("get_headroom_pricing_status").catch(() => null),
@@ -2598,7 +2585,7 @@ export default function App() {
           return;
         }
         setStartupPercent(100);
-        setStartupCopy("Headroom is ready.");
+      setStartupCopy(`${LOCAL_COMMUNITY_NAME} is ready.`);
         setStartupReady(true);
       }, 120);
     };
@@ -3522,7 +3509,6 @@ export default function App() {
       if (!active) {
         return;
       }
-      void refreshClaudeProjects();
       void refreshHeadroomLearnPrereq();
       invoke<ActivityFeedResponse>("get_activity_feed")
         .then((next) => {
@@ -3606,7 +3592,7 @@ export default function App() {
     if (activeView !== "optimization") {
       return;
     }
-    void Promise.all([refreshClaudeProjects(), refreshHeadroomLearnPrereq()]);
+    void refreshHeadroomLearnPrereq();
   }, [activeView]);
 
   useEffect(() => {
@@ -3679,7 +3665,6 @@ export default function App() {
       );
     }
 
-    void refreshClaudeProjects();
   }, [
     headroomLearnStatus.finishedAt,
     headroomLearnStatus.lastRunAt,
@@ -3688,70 +3673,21 @@ export default function App() {
     headroomLearnStatus.success
   ]);
 
-  const claudeProjectPathsKey = claudeProjects
-    .map((project) => project.projectPath)
-    .sort()
-    .join("\t");
-  // Batched applied-patterns fetch: one IPC instead of one per OptimizePanel.
-  useEffect(() => {
-    if (activeView !== "optimization") {
-      return;
-    }
-    const paths = claudeProjectPathsKey === "" ? [] : claudeProjectPathsKey.split("\t");
-    if (paths.length === 0) {
-      setOptimizeAppliedByProject({});
-      return;
-    }
-    let active = true;
-    invoke<Record<string, AppliedPatterns>>("list_applied_patterns_for_projects", {
-      projectPaths: paths,
-    })
-      .then((result) => {
-        if (!active) return;
-        setOptimizeAppliedByProject(result);
-      })
-      .catch(() => {
-        if (!active) return;
-        setOptimizeAppliedByProject(null);
-      });
-    return () => {
-      active = false;
-    };
-  }, [
-    activeView,
-    claudeProjectPathsKey,
-    headroomLearnStatus.finishedAt,
-    optimizeAppliedRefreshTick,
-  ]);
-
   const anyProxyConnectorEnabled = getEnabledSupportedConnectors(connectors).some(
     (connector) => connectorUsesProxy(connector.clientId)
   );
 
-  // Which agents Headroom Learn should offer, driven by the enabled connectors.
-  const claudeLearnEnabled = getClaudeConnector(connectors)?.enabled ?? false;
+  // This edition intentionally exposes one learning source: Codex sessions.
+  // The backend still owns the historical multi-client data, but it is not a
+  // reason to present compatibility controls for clients this build does not
+  // configure.
+  const claudeLearnEnabled = false;
   const codexLearnEnabled = aggregateClientConnectors(connectors).some(
     (connector) => connector.clientId === "codex" && connector.enabled
   );
-  const opencodeLearnEnabled = aggregateClientConnectors(connectors).some(
-    (connector) => connector.clientId === "opencode" && connector.enabled
-  );
-  const grokLearnEnabled = aggregateClientConnectors(connectors).some(
-    (connector) => connector.clientId === "grok_build" && connector.enabled
-  );
-  const learnAgentCount =
-    Number(claudeLearnEnabled) +
-    Number(codexLearnEnabled) +
-    Number(opencodeLearnEnabled) +
-    Number(grokLearnEnabled);
-  const learnBlurb =
-    learnAgentCount > 1
-      ? t("learn.blurb.multiple")
-      : codexLearnEnabled
-        ? t("learn.blurb.codex")
-        : opencodeLearnEnabled || grokLearnEnabled
-          ? t("learn.blurb.agent")
-          : t("learn.blurb.claude");
+  const opencodeLearnEnabled = false;
+  const grokLearnEnabled = false;
+  const learnBlurb = t("learn.blurb.codex");
   useEffect(() => {
     // connectors === [] means get_client_connectors hasn't returned yet (the
     // Rust side always lists every managed client). Don't treat that launch
@@ -4333,7 +4269,7 @@ export default function App() {
       await refreshRuntimeStatus();
     } catch (error) {
       setResumeError(
-        describeInvokeError(error, "Could not restart Headroom.")
+        describeInvokeError(error, `Could not restart ${LOCAL_COMMUNITY_NAME}.`)
       );
     } finally {
       setResuming(false);
@@ -4370,21 +4306,6 @@ export default function App() {
     } finally {
       pricingRefreshInFlightRef.current = false;
       setPricingBusy(false);
-    }
-  }
-
-  async function refreshClaudeProjects() {
-    setClaudeProjectsBusy(true);
-    try {
-      setClaudeProjectsError(null);
-      const projects = await invoke<ClaudeCodeProject[]>("get_claude_code_projects");
-      applyClaudeProjectsIfChanged(projects);
-    } catch (error) {
-      setClaudeProjectsError(
-        describeInvokeError(error, "Could not load Claude Code projects.")
-      );
-    } finally {
-      setClaudeProjectsBusy(false);
     }
   }
 
@@ -4502,14 +4423,18 @@ export default function App() {
     agent: "claude" | "codex" | "opencode" | "grok",
     projectPath?: string
   ) {
+    const learnInvocation = codexLearnInvocation(agent);
+    if (!learnInvocation) {
+      return;
+    }
     if (runtimeStatus?.headroomLearnSupported === false) {
       setHeadroomLearnStatus((current) => ({
         ...current,
         running: false,
-        summary: "Headroom Learn is unavailable on this platform.",
+        summary: `${LOCAL_COMMUNITY_NAME} Learn is unavailable on this platform.`,
         error:
           runtimeStatus.headroomLearnDisabledReason ??
-          "Headroom Learn is unavailable on this platform."
+          `${LOCAL_COMMUNITY_NAME} Learn is unavailable on this platform.`
       }));
       return;
     }
@@ -4543,7 +4468,7 @@ export default function App() {
       error: null
     }));
     try {
-      await invoke("start_headroom_learn", { agent, projectPath: projectPath ?? null });
+      await invoke("start_headroom_learn", learnInvocation);
       for (const waitMs of [180, 350, 650, 900, 1200, 1800, 2400]) {
         await delay(waitMs);
         const status = await invoke<HeadroomLearnStatus>("get_headroom_learn_status", {
@@ -5535,6 +5460,12 @@ export default function App() {
     dashboard.lifetimeEstimatedSavingsUsd
   );
   const compressionOfRestPct = cachePairAllTime?.compressedPct ?? null;
+  const modelInputPrices = Object.fromEntries(
+    (dashboard.savingsBreakdown?.modelInputPrices ?? []).map((price) => [
+      price.model,
+      price.inputUsdPerMillion
+    ])
+  );
   // Same pair for the shorter windows, from the buckets that carry cache
   // coverage (backend history checkpoints; local-tracker buckets and days
   // aged out of retention are excluded from both rates). The all-time row
@@ -5744,8 +5675,8 @@ export default function App() {
           <div className="modal-card runtime-upgrade-modal">
             <h3>
               {runtimeUpgradeProgress.toVersion
-                ? `Finishing Headroom update to ${runtimeUpgradeProgress.toVersion}…`
-                : "Finishing Headroom update…"}
+                ? `Finishing ${LOCAL_COMMUNITY_NAME} update to ${runtimeUpgradeProgress.toVersion}…`
+                : `Finishing ${LOCAL_COMMUNITY_NAME} update…`}
             </h3>
             <p className="runtime-upgrade-modal__sub">
               {runtimeUpgradeProgress.fromVersion
@@ -5882,8 +5813,8 @@ export default function App() {
           <>
             <h1>
               {runtimeUpgradeProgress.toVersion
-                ? `Finishing Headroom ${runtimeUpgradeProgress.toVersion} update…`
-                : "Finishing Headroom update…"}
+                ? `Finishing ${LOCAL_COMMUNITY_NAME} ${runtimeUpgradeProgress.toVersion} update…`
+                : `Finishing ${LOCAL_COMMUNITY_NAME} update…`}
             </h1>
             <p className="launcher-install-notice">
               {runtimeUpgradeProgress.message ||
@@ -6007,13 +5938,7 @@ export default function App() {
         <div>
         <h1>{t("launcher.headlineBefore")} <span className="headline-highlight">50%</span> {t("launcher.headlineAfter")}</h1>
         <div className="intro-shell__agents" aria-label={t("aria.supportedAgents")}>
-          {[
-            ["claude_code", "Claude Code"],
-            ["codex", "Codex"],
-            ["grok_build", "Grok Build"],
-            ["opencode", "OpenCode"],
-            ["zcode", "ZCode"]
-          ].map(([clientId, label]) => (
+          {[ ["codex", "Codex"] ].map(([clientId, label]) => (
             <span className="intro-shell__agent" key={clientId}>
               <ConnectorIcon clientId={clientId} size={14} />
               {label}
@@ -7262,11 +7187,11 @@ export default function App() {
       {upgradeOverlay}
       <WindowChrome
         platform={desktopPlatform === "windows" ? "windows" : "macos"}
-        title={`Headroom · ${activeViewTitle}`}
+        title={`${LOCAL_COMMUNITY_NAME} · ${activeViewTitle}`}
       />
       <aside className="tray-sidebar">
         <div className="tray-sidebar__logo">
-          <img src={headroomAvatar} alt="Headroom" />
+          <img src={headroomAvatar} alt={LOCAL_COMMUNITY_NAME} />
         </div>
         <nav className="tray-nav" aria-label={t("aria.trayNavigation")}>
           {navItems.map((item) => (
@@ -7525,6 +7450,11 @@ export default function App() {
                 <p className="loading-copy">{t("home.loadingHistory")}</p>
               </div>
             )}
+
+            <JevOverviewCard
+              active={activeView === "home"}
+              onOpenDecisions={() => setActiveView("decisions")}
+            />
 
           </div>
 
@@ -8017,11 +7947,18 @@ export default function App() {
             loaded={activityFeedLoaded}
             onNavigateToOptimize={() => setActiveView("optimization")}
             rtkInstalled={runtimeStatus?.rtk.installed === true}
+            modelInputPrices={modelInputPrices}
             serenaInstalled={dashboard.tools.some(
               (tool) => tool.id === "serena" && tool.status !== "not_installed"
             )}
           />
         </div>
+
+        {activeView === "decisions" ? (
+          <div className="tray-content">
+            <JevPanel />
+          </div>
+        ) : null}
 
         <div className="tray-content" hidden={activeView !== "addons"}>
           <article className="soft-card addons-card">
@@ -8091,7 +8028,7 @@ export default function App() {
                 const categoryCopy = toolCategoryCopy[category];
                 const workflowGroup = categoryTools.find((tool) => tool.workflowGroup)?.workflowGroup;
                 const singleSelectLabel = workflowGroup
-                  ? workflowGroupCopy[workflowGroup]?.[resolvedLocale]
+                  ? localizeWorkflowCopy(workflowGroupCopy[workflowGroup]?.[resolvedLocale] ?? "")
                   : null;
                 return (
                   <section
@@ -8101,8 +8038,8 @@ export default function App() {
                   >
                     <header className="addon-group__head">
                       <div className="addon-group__copy">
-                        <h2 id={`addon-group-${category}`}>{categoryCopy.title[resolvedLocale]}</h2>
-                        <p>{categoryCopy.description[resolvedLocale]}</p>
+                        <h2 id={`addon-group-${category}`}>{localizeWorkflowCopy(categoryCopy.title[resolvedLocale])}</h2>
+                        <p>{localizeWorkflowCopy(categoryCopy.description[resolvedLocale])}</p>
                       </div>
                       {singleSelectLabel ? (
                   <span className="tool-group__rule">{singleSelectLabel}</span>
@@ -8119,13 +8056,13 @@ export default function App() {
                       version={tool.version}
                       installed={installed}
                       enabled={tool.enabled}
-                    description={
+                    description={codexOnlyUiCopy(
                       ADDON_DESCRIPTION_KEYS[tool.id]
                         ? t(ADDON_DESCRIPTION_KEYS[tool.id])
-                        : toolCopy[tool.id]?.[resolvedLocale] ?? tool.description
-                    }
-                      activationLabel={getActivationScopeCopy(tool.activationScope)[resolvedLocale]}
-                      copy={addonCopy[tool.id]}
+                        : localizeWorkflowCopy(toolCopy[tool.id]?.[resolvedLocale] ?? tool.description)
+                    )}
+                      activationLabel={localizeWorkflowCopy(getActivationScopeCopy(tool.activationScope)[resolvedLocale])}
+                      copy={codexOnlyAddonCopy(addonCopy[tool.id])}
                       infoOpen={addonInfoId === tool.id}
                       onToggleInfo={() =>
                         setAddonInfoId(addonInfoId === tool.id ? null : tool.id)
@@ -8196,7 +8133,7 @@ export default function App() {
                       : ""}
                   </>
                 }
-                activationLabel={getActivationScopeCopy(checkedRtkTool?.activationScope)[resolvedLocale]}
+                activationLabel={localizeWorkflowCopy(getActivationScopeCopy(checkedRtkTool?.activationScope)[resolvedLocale])}
                 copy={addonCopy.rtk}
                 infoOpen={addonInfoId === "rtk"}
                 onToggleInfo={() => setAddonInfoId(addonInfoId === "rtk" ? null : "rtk")}
@@ -9120,6 +9057,26 @@ export default function App() {
                       <span>{t("savingsInfo.inputCompression")}</span>
                       <strong>{currency(dashboard.savingsBreakdown.compressionSavingsUsd)}</strong>
                     </div>
+                    {dashboard.savingsBreakdown.pricingSyncedAt ? (
+                      <p className="savings-breakdown__note">
+                        {t("savingsInfo.officialPricing", {
+                          date: dashboard.savingsBreakdown.pricingSyncedAt.slice(0, 10)
+                        })}{" "}
+                        {dashboard.savingsBreakdown.pricingSourceUrl ? (
+                          <button
+                            type="button"
+                            className="link-button"
+                            onClick={() =>
+                              void openExternalLink(
+                                dashboard.savingsBreakdown?.pricingSourceUrl ?? ""
+                              )
+                            }
+                          >
+                            {t("savingsInfo.officialPricingLink")}
+                          </button>
+                        ) : null}
+                      </p>
+                    ) : null}
                     {dashboard.savingsBreakdown.outputSavingsUsd >= 0.005 ? (
                       <>
                         <div className="savings-breakdown__row">
@@ -9164,7 +9121,7 @@ export default function App() {
                         </p>
                       </>
                     ) : null}
-                    {(dashboard.savingsBreakdown.modelRates?.length ?? 0) > 1 ? (
+                    {(dashboard.savingsBreakdown.modelRates?.length ?? 0) > 0 ? (
                       <details className="savings-breakdown__models">
                         <summary>{t("savingsInfo.byModel")}</summary>
                         <div className="savings-breakdown__models-body">
@@ -9173,7 +9130,14 @@ export default function App() {
                               <span>
                                 {row.model}{" "}
                                 <span className="savings-breakdown__sample">
-                                  {t("savingsInfo.requests", { count: compactNumber(row.requests) })}
+                                  {t("savingsInfo.requests", {
+                                    count: compactNumber(row.requests)
+                                  })}
+                                  {row.inputPricePerMillion != null
+                                    ? ` · ${t("savingsInfo.inputPrice", {
+                                        price: currencyExact(row.inputPricePerMillion)
+                                      })}`
+                                    : ` · ${t("savingsInfo.unpriced")}`}
                                 </span>
                               </span>
                               <strong>{percent1(row.savingsPercent)}%</strong>

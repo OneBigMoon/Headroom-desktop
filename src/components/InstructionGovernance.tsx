@@ -28,7 +28,7 @@ export function InstructionGovernance() {
   };
   return <article className="soft-card panel-card instruction-governance">
     <h3>{zh ? "指令审计与恢复" : "Instruction audit and recovery"}</h3>
-    <p>{zh ? "检查本机 Codex / Claude 的工具提示。仅更新已有 Headroom 区块；用户规则保留。此检查不等同于模型行为评测。" : "Review local Codex / Claude tool hints. Only existing Headroom blocks are refreshed; user rules are preserved. This is not a model behavior evaluation."}</p>
+    <p>{zh ? "检查本机 Codex 的工具提示。仅更新已有 codexbox 区块；用户规则保留。此检查不等同于模型行为评测。" : "Review local Codex tool hints. Only existing codexbox blocks are refreshed; user rules are preserved. This is not a model behavior evaluation."}</p>
     <button className="secondary-button secondary-button--small" disabled={busy} onClick={() => void run(refresh)}>{zh ? "读取并预览" : "Read and preview"}</button>
     {message && <p role="status">{message}</p>}
     {reports.map(report => <section key={report.target}>

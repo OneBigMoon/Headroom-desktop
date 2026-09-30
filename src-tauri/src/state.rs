@@ -2624,6 +2624,17 @@ impl AppState {
             }
         }
 
+        // Official price changes are forward-only. The adjustment ledger is
+        // baselined from existing cumulative counters, so historical amounts
+        // never move; only requests observed after the baseline use the price
+        // current at that time.
+        crate::model_pricing::apply_forward_adjustments(
+            &mut daily_savings,
+            &mut hourly_savings,
+        );
+        snapshot.session_estimated_savings_usd +=
+            crate::model_pricing::session_forward_adjustment_usd();
+
         let (launch_experience, accepted_terms_version) = {
             let profile = self.launch_profile.lock();
             (
@@ -6195,19 +6206,9 @@ fn warn_stats_fetch_failed(reason: &str) {
     *last = Some((Instant::now(), streak));
     drop(last);
     let category = stats_fetch_failure_category(reason);
-    // A 4xx means SOMETHING answered 6867 without the backend's routes, and
-    // the readyz gate cannot tell it from an ancient-but-ours proxy (a 404
-    // there deliberately counts as reachable). The listener's identity is the
-    // one fact that splits "foreign squatter" from "orphaned old Headroom" --
-    // RUST-87 shipped three unattributable 404s before this. Throttled to one
-    // lookup per 15-minute warn window, so the lsof subprocess is free here.
-    let held_by = if category.starts_with("http-4") {
-        crate::tool_manager::listener_identity(6867)
-            .map(|who| format!("; port 6867 is held by {who}"))
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
+    // Diagnostics must not launch OS listener queries on the dashboard path.
+    // Explicit port-conflict recovery still verifies ownership independently.
+    let held_by = "";
     let message = format!(
         "headroom /stats fetch failed ({reason}){held_by}; dashboard loses the layers \
          only this endpoint reports (output shaping, tool schema)"
@@ -6313,6 +6314,8 @@ fn fetch_headroom_savings_history() -> Option<HeadroomSavingsHistoryResponse> {
             Err(_) => continue,
         };
 
+        crate::model_pricing::schedule_refresh_from_stats_json(&body);
+        crate::model_pricing::record_forward_adjustments_from_stats_json(&body);
         if let Some(parsed) = parse_headroom_stats_history_from_json(&body) {
             return Some(parsed);
         }
@@ -6677,6 +6680,8 @@ fn parse_headroom_stats_history_from_json(body: &str) -> Option<HeadroomSavingsH
 fn parse_savings_breakdown(root: &Value) -> Option<crate::models::SavingsBreakdown> {
     let compression_savings_usd =
         value_at_path_f64(root, &["lifetime", "compression_savings_usd"])?;
+    let (model_input_prices, pricing_synced_at) =
+        crate::model_pricing::catalog_for_stats(root);
     Some(crate::models::SavingsBreakdown {
         compression_savings_usd,
         // Overwritten at render time from the merged daily buckets (see
@@ -6697,6 +6702,11 @@ fn parse_savings_breakdown(root: &Value) -> Option<crate::models::SavingsBreakdo
         total_input_cost_usd: value_at_path_f64(root, &["lifetime", "total_input_cost_usd"])
             .unwrap_or(0.0),
         model_rates: parse_model_rates(root),
+        model_input_prices,
+        pricing_source_url: pricing_synced_at
+            .as_ref()
+            .map(|_| crate::model_pricing::OFFICIAL_PRICING_URL.to_string()),
+        pricing_synced_at,
     })
 }
 
@@ -6721,10 +6731,16 @@ fn parse_model_rates(root: &Value) -> Vec<crate::models::ModelSavingsRate> {
             if requests < MIN_MODEL_RATE_REQUESTS {
                 return None;
             }
+            let tokens_saved = value_at_path_u64(node, &["tokens_saved"]).unwrap_or(0);
+            let price = crate::model_pricing::input_price_for_model(model);
             Some(crate::models::ModelSavingsRate {
                 model: model.clone(),
                 requests,
                 savings_percent: value_at_path_f64(node, &["savings_percent"])?,
+                tokens_saved,
+                input_price_per_million: price
+                    .as_ref()
+                    .map(|price| price.input_usd_per_million),
             })
         })
         .collect();
@@ -10984,6 +11000,55 @@ LLM analysis failed: `codex exec` did not respond within 300s.
         );
         assert_eq!(rates[0].requests, 5663);
         assert!((rates[0].savings_percent - 37.86).abs() < 1e-9);
+    }
+
+    #[test]
+    fn official_model_pricing_exposes_current_price_without_revaluing_history() {
+        let parsed = parse_headroom_stats_history_from_json(
+            r#"{
+              "lifetime": {
+                "tokens_saved": 2000000,
+                "compression_savings_usd": 8.0
+              },
+              "by_model": {
+                "gpt-6-sol": {
+                  "requests": 100,
+                  "tokens_saved": 1000000,
+                  "compression_savings_usd": 5.0,
+                  "savings_percent": 20.0
+                },
+                "gpt-5.3-codex-spark": {
+                  "requests": 100,
+                  "tokens_saved": 1000000,
+                  "compression_savings_usd": 3.0,
+                  "savings_percent": 10.0
+                }
+              }
+            }"#,
+        )
+        .expect("parsed history");
+
+        let breakdown = parsed.lifetime.expect("lifetime breakdown");
+        // The recorded $8 is historical and must not change when the current
+        // GPT-6 Sol price is $2/M.
+        assert!((breakdown.compression_savings_usd - 8.0).abs() < 1e-9);
+        assert_eq!(breakdown.model_input_prices.len(), 1);
+        assert_eq!(breakdown.model_input_prices[0].model, "gpt-6-sol");
+        assert_eq!(breakdown.model_input_prices[0].input_usd_per_million, 2.0);
+
+        let sol = breakdown
+            .model_rates
+            .iter()
+            .find(|row| row.model == "gpt-6-sol")
+            .expect("Sol model row");
+        assert_eq!(sol.tokens_saved, 1_000_000);
+        assert_eq!(sol.input_price_per_million, Some(2.0));
+        let spark = breakdown
+            .model_rates
+            .iter()
+            .find(|row| row.model == "gpt-5.3-codex-spark")
+            .expect("Spark model row");
+        assert_eq!(spark.input_price_per_million, None);
     }
 
     #[test]

@@ -126,15 +126,23 @@ export interface SavingsBreakdown {
   totalInputCostUsd: number;
   // Optional for the same reason as the tool-schema fields above.
   modelRates?: ModelSavingsRate[];
+  modelInputPrices?: ModelInputPrice[];
+  pricingSourceUrl?: string;
+  pricingSyncedAt?: string;
 }
 
-// Rate only, no dollars: by_model tracking started well after the lifetime
-// counters, so its totals cover a fraction of history. See ModelSavingsRate in
-// models.rs.
 export interface ModelSavingsRate {
   model: string;
   requests: number;
   savingsPercent: number;
+  tokensSaved?: number;
+  inputPricePerMillion?: number;
+}
+
+export interface ModelInputPrice {
+  model: string;
+  inputUsdPerMillion: number;
+  syncedAt: string;
 }
 
 export interface ProviderSavingsPoint {

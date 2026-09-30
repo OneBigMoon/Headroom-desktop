@@ -5,7 +5,7 @@ repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_dir"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
-  echo "Headroom Local Community macOS packages must be built on macOS." >&2
+  echo "codexbox macOS packages must be built on macOS." >&2
   exit 1
 fi
 
@@ -16,7 +16,7 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib -- --test-threads=1
 cargo check --manifest-path src-tauri/Cargo.toml
 npx tauri build --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
-app_path="src-tauri/target/release/bundle/macos/Headroom Local Community.app"
+app_path="src-tauri/target/release/bundle/macos/codexbox.app"
 dmg_dir="src-tauri/target/release/bundle/dmg"
 version="$(node -p "require('./package.json').version")"
 
@@ -33,7 +33,7 @@ case "$(uname -m)" in
   x86_64) dmg_arch="x64" ;;
   *) dmg_arch="$(uname -m)" ;;
 esac
-dmg_path="$dmg_dir/Headroom Local Community_${version}_${dmg_arch}.dmg"
+dmg_path="$dmg_dir/codexbox_${version}_${dmg_arch}.dmg"
 staging_dir="$(mktemp -d)"
 cleanup() {
   if [[ -n "${staging_dir:-}" && -d "$staging_dir" ]]; then
@@ -43,10 +43,10 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$dmg_dir"
-ditto "$app_path" "$staging_dir/Headroom Local Community.app"
+ditto "$app_path" "$staging_dir/codexbox.app"
 ln -s /Applications "$staging_dir/Applications"
 hdiutil create \
-  -volname "Headroom Local Community" \
+  -volname "codexbox" \
   -srcfolder "$staging_dir" \
   -format UDZO \
   -ov \

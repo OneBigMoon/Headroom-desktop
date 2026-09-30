@@ -728,7 +728,29 @@ enum RemoteAccountSyncError {
 #[cfg(feature = "local-community")]
 pub fn get_pricing_status(state: &AppState) -> Result<HeadroomPricingStatus, String> {
     let now = Utc::now();
-    let claude = detect_claude_profile(state);
+    // Retain the serialized legacy field without querying another client's account.
+    let claude = ClaudeAccountProfile {
+        auth_method: ClaudeAuthMethod::Unknown,
+        email: None,
+        display_name: None,
+        account_uuid: None,
+        organization_uuid: None,
+        billing_type: None,
+        account_created_at: None,
+        subscription_created_at: None,
+        has_extra_usage_enabled: false,
+        plan_tier: ClaudePlanTier::Unknown,
+        plan_detection_source: None,
+        organization_type: None,
+        rate_limit_tier: None,
+        user_rate_limit_tier: None,
+        seat_tier: None,
+        weekly_utilization_pct: None,
+        weekly_resets_at: None,
+        five_hour_utilization_pct: None,
+        extra_usage_monthly_limit: None,
+        profile_fetch_error: None,
+    };
     let codex = fetch_codex_usage(state, None, false).map(|mut usage| {
         usage.optimization_allowed = true;
         usage.should_nudge = false;

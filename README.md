@@ -1,8 +1,15 @@
-# Headroom-desktop (free)
+# codexbox
+
+Codex-only desktop tooling, local prompt optimization, and usage visibility.
+The application is renamed from Headroom Local Community. Its existing bundle
+identifier, data paths, Codex provider markers, and ports remain unchanged so
+upgrading preserves configuration and history. Other coding clients are no longer
+offered or automatically configured; their existing configuration files are not
+deleted. This is an unofficial project, not an OpenAI product.
 
 > GitHub 项目：[`OneBigMoon/Headroom-desktop`](https://github.com/OneBigMoon/Headroom-desktop)
 
-Headroom Local Community is an unofficial, local-only desktop edition derived
+codexbox is an unofficial, local-only desktop edition derived
 from the MIT-licensed
 [`gglucass/headroom-desktop`](https://github.com/gglucass/headroom-desktop)
 project and other open-source components. It is not affiliated with or endorsed
@@ -25,7 +32,7 @@ application:
 
 | Resource | Community value |
 |---|---|
-| Product name | `Headroom Local Community` |
+| Product name | `codexbox` |
 | Bundle ID | `org.headroomlocal.community` |
 | App data | `HeadroomLocalCommunity` |
 | headroom-ai workspace | `~/.headroom-local-community` |
@@ -41,22 +48,12 @@ HuggingFace cache. The sole read-only exception is
 fingerprint; the official ledger is never modified. Official routing is never
 overwritten, and user-managed Serena entries are left untouched.
 
-Codex, Claude Code, OpenCode, and other clients retain their own upstream API
+Codex retains its own upstream API
 key or OAuth authentication. The proxy and headroom-ai state stay local.
 
 ## How it works
 
 ```text
-Claude Code / OpenCode
-  | ANTHROPIC_BASE_URL=http://127.0.0.1:6867
-  | provider base URL=http://127.0.0.1:6867/v1
-  v
-Rust intercept proxy :6867
-  v
-Managed headroom-ai backend :6868-6890
-  v
-The same upstream API selected by the coding client
-
 Codex (OpenAI API key)
   | stable provider URL=http://127.0.0.1:6891/v1
 Codex (ChatGPT OAuth)
@@ -151,7 +148,7 @@ artifacts but does not replace Authenticode trust for the NSIS installer.
 Depending on enabled features, Community may write its own app data, logs,
 preferences, caches, `~/.headroom-local-community`, Community-managed fenced
 blocks in client configuration, Serena usage hints in detected
-`~/.codex/AGENTS.md` or `~/.claude/CLAUDE.md`, Community-named MCP entries and
+`~/.codex/AGENTS.md`, Community-named MCP entries and
 guard hooks, and timestamped `.headroom-local-community-backup-*` files before
 editing client configuration. Uninstall removes only Community-owned resources
 and reverses only Community-managed client changes.
@@ -160,7 +157,7 @@ and reverses only Community-managed client changes.
 
 This repository remains available under the upstream MIT license. Preserve the
 upstream copyright notice, license, and applicable third-party notices in
-redistributions. “Headroom Local Community” must be presented as an unofficial
+redistributions. codexbox must be presented as an unofficial
 community edition, not as the upstream paid product.
 
 The project does not provide Homebrew installation. Use the stable macOS DMG or

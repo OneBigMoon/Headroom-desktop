@@ -22,12 +22,12 @@
 每个稳定 Release 应包含以下资产：
 
 ```text
-Headroom.Local.Community_<版本>_universal.dmg
-Headroom.Local.Community_universal.app.tar.gz
-Headroom.Local.Community_universal.app.tar.gz.sig
-Headroom.Local.Community_<版本>_x64-setup.exe
-Headroom.Local.Community_x64-setup.nsis.zip
-Headroom.Local.Community_x64-setup.nsis.zip.sig
+codexbox_<版本>_universal.dmg
+codexbox_universal.app.tar.gz
+codexbox_universal.app.tar.gz.sig
+codexbox_<版本>_x64-setup.exe
+codexbox_x64-setup.nsis.zip
+codexbox_x64-setup.nsis.zip.sig
 latest.json
 ```
 
@@ -47,6 +47,8 @@ https://github.com/OneBigMoon/Headroom-desktop/releases/latest/download/latest.j
 
 若 recovery Release 尚未准备好且必须立即撤下故障版本，只能在明确确认后删除该 Release，使 `releases/latest` 回到上一稳定版。保留故障标签作为审计记录，且永远不要复用该标签名：
 
+以下示例适用于 v1.0.21 起的 `codexbox_*` 资产。回到 v1.0.20 或更早版本时，请把示例中的 `codexbox` 资产前缀替换为 `Headroom.Local.Community`，并核对目标 Release 的实际资产名称。
+
 ```bash
 set -euo pipefail
 
@@ -63,8 +65,8 @@ test "$(gh api "repos/${REPO}/releases/latest" --jq '.tag_name')" = "${GOOD_TAG}
 tmp="$(mktemp -d)"
 trap 'rm -rf "${tmp}"' EXIT
 feed="https://github.com/${REPO}/releases/latest/download/latest.json"
-updater_name="Headroom.Local.Community_universal.app.tar.gz"
-windows_updater_name="Headroom.Local.Community_x64-setup.nsis.zip"
+updater_name="codexbox_universal.app.tar.gz"
+windows_updater_name="codexbox_x64-setup.nsis.zip"
 
 curl -fsSL -H 'Cache-Control: no-cache' "${feed}" -o "${tmp}/latest.json"
 jq -e --arg version "${GOOD_VERSION}" --arg tag "${GOOD_TAG}" '
@@ -74,10 +76,10 @@ jq -e --arg version "${GOOD_VERSION}" --arg tag "${GOOD_TAG}" '
 ' "${tmp}/latest.json" >/dev/null
 
 for name in \
-  "Headroom.Local.Community_${GOOD_VERSION}_universal.dmg" \
+  "codexbox_${GOOD_VERSION}_universal.dmg" \
   "${updater_name}" \
   "${updater_name}.sig" \
-  "Headroom.Local.Community_${GOOD_VERSION}_x64-setup.exe" \
+  "codexbox_${GOOD_VERSION}_x64-setup.exe" \
   "${windows_updater_name}" \
   "${windows_updater_name}.sig" \
   "latest.json"

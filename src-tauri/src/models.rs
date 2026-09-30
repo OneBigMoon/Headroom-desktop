@@ -203,6 +203,14 @@ pub struct SavingsBreakdown {
     /// Per-model compression rates, best first. Empty on backends that predate
     /// `by_model` tracking.
     pub model_rates: Vec<ModelSavingsRate>,
+    /// Official OpenAI standard input prices for every observed model that has
+    /// a published model page. Used by the activity feed as the same source of
+    /// truth as the lifetime total.
+    pub model_input_prices: Vec<ModelInputPrice>,
+    /// Public pricing reference and oldest verification timestamp among the
+    /// observed model prices.
+    pub pricing_source_url: Option<String>,
+    pub pricing_synced_at: Option<String>,
 }
 
 /// One row of the backend's `/stats-history` `by_model` block.
@@ -217,6 +225,16 @@ pub struct ModelSavingsRate {
     pub model: String,
     pub requests: u64,
     pub savings_percent: f64,
+    pub tokens_saved: u64,
+    pub input_price_per_million: Option<f64>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ModelInputPrice {
+    pub model: String,
+    pub input_usd_per_million: f64,
+    pub synced_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

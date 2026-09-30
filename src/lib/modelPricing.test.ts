@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { estimateCostSavingsUsd, formatEstimatedUsd } from "./modelPricing";
+import {
+  canonicalPricingModel,
+  estimateCostSavingsUsd,
+  formatEstimatedUsd
+} from "./modelPricing";
 
 describe("estimateCostSavingsUsd", () => {
   it("returns null for zero or negative savings", () => {
@@ -8,24 +12,33 @@ describe("estimateCostSavingsUsd", () => {
     expect(estimateCostSavingsUsd("claude-sonnet-4-6", null)).toBeNull();
   });
 
-  it("uses the fallback rate when the model is unknown or missing", () => {
-    // Fallback is Sonnet-class: $3/M, so 1M tokens = $3.
-    expect(estimateCostSavingsUsd(null, 1_000_000)).toBeCloseTo(3);
-    expect(estimateCostSavingsUsd("mystery-model-9000", 1_000_000)).toBeCloseTo(3);
+  it("does not invent a price for unknown, missing, or internal models", () => {
+    expect(estimateCostSavingsUsd(null, 1_000_000)).toBeNull();
+    expect(estimateCostSavingsUsd("mystery-model-9000", 1_000_000)).toBeNull();
+    expect(estimateCostSavingsUsd("gpt-5.3-codex-spark", 1_000_000)).toBeNull();
+    expect(estimateCostSavingsUsd("codex-auto-review", 1_000_000)).toBeNull();
   });
 
-  it("applies the right rate for each model family", () => {
-    // Opus @ $15/M
-    expect(estimateCostSavingsUsd("claude-opus-4-7", 1_000_000)).toBeCloseTo(15);
-    // Sonnet @ $3/M
-    expect(estimateCostSavingsUsd("claude-sonnet-4-6", 1_000_000)).toBeCloseTo(3);
-    // Haiku 4 @ $1/M
-    expect(estimateCostSavingsUsd("claude-haiku-4-5", 1_000_000)).toBeCloseTo(1);
-    // GPT-4o mini is cheaper than GPT-4o — ensure mini matches first.
-    expect(estimateCostSavingsUsd("gpt-4o-mini", 1_000_000)).toBeCloseTo(0.15);
-    expect(estimateCostSavingsUsd("gpt-4o", 1_000_000)).toBeCloseTo(2.5);
-    expect(estimateCostSavingsUsd("gemini-2.5-pro", 1_000_000)).toBeCloseTo(1.25);
-    expect(estimateCostSavingsUsd("gemini-2.0-flash", 1_000_000)).toBeCloseTo(0.1);
+  it("includes the current GPT-6 and GPT-5.6 release fallback prices", () => {
+    expect(estimateCostSavingsUsd("gpt-6-astra", 1_000_000)).toBeCloseTo(10);
+    expect(estimateCostSavingsUsd("gpt-6.1-sol", 1_000_000)).toBeCloseTo(2);
+    expect(estimateCostSavingsUsd("gpt-6-sol", 1_000_000)).toBeCloseTo(2);
+    expect(estimateCostSavingsUsd("gpt-6-luna", 1_000_000)).toBeCloseTo(0.1);
+    expect(estimateCostSavingsUsd("gpt-5.6-sol", 1_000_000)).toBeCloseTo(4);
+    expect(estimateCostSavingsUsd("gpt-5.6-terra", 1_000_000)).toBeCloseTo(2);
+    expect(estimateCostSavingsUsd("gpt-5.6-luna", 1_000_000)).toBeCloseTo(0.2);
+  });
+
+  it("lets the auto-synced official catalog override the release fallback", () => {
+    expect(
+      estimateCostSavingsUsd("gpt-6-sol", 1_000_000, { "gpt-6-sol": 2.25 })
+    ).toBeCloseTo(2.25);
+  });
+
+  it("normalizes provider prefixes and dated snapshots", () => {
+    expect(canonicalPricingModel("openai/gpt-6-sol-2026-09-23")).toBe("gpt-6-sol");
+    expect(canonicalPricingModel("gpt-6-luna-20260923")).toBe("gpt-6-luna");
+    expect(estimateCostSavingsUsd("openai/gpt-6-sol-2026-09-23", 1_000_000)).toBe(2);
   });
 });
 

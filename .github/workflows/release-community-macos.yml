@@ -1,4 +1,4 @@
-name: Release Headroom Local Community for macOS and Windows
+name: Release codexbox for macOS and Windows
 
 on:
   push:
@@ -149,7 +149,7 @@ jobs:
 
           bundle_root="src-tauri/target/universal-apple-darwin/release/bundle"
           app_bundle="$(find "${bundle_root}/macos" -maxdepth 1 -type d -name '*.app' -print -quit)"
-          updater="${bundle_root}/macos/Headroom Local Community.app.tar.gz"
+          updater="${bundle_root}/macos/codexbox.app.tar.gz"
           [[ -n "${app_bundle}" && -d "${app_bundle}" ]]
 
           COPYFILE_DISABLE=1 tar -czf "${updater}" \
@@ -196,9 +196,9 @@ jobs:
 
           stage_dir="release-inputs/macos"
           mkdir -p "${stage_dir}"
-          cp "${dmg}" "${stage_dir}/Headroom.Local.Community_${RELEASE_VERSION}_universal.dmg"
-          cp "${updater}" "${stage_dir}/Headroom.Local.Community_universal.app.tar.gz"
-          cp "${signature}" "${stage_dir}/Headroom.Local.Community_universal.app.tar.gz.sig"
+          cp "${dmg}" "${stage_dir}/codexbox_${RELEASE_VERSION}_universal.dmg"
+          cp "${updater}" "${stage_dir}/codexbox_universal.app.tar.gz"
+          cp "${signature}" "${stage_dir}/codexbox_universal.app.tar.gz.sig"
           [[ "$(find "${stage_dir}" -maxdepth 1 -type f | wc -l | tr -d ' ')" == "3" ]]
 
       - name: Upload verified macOS assets
@@ -285,9 +285,9 @@ jobs:
 
           stage_dir="release-inputs/windows"
           mkdir -p "${stage_dir}"
-          cp "${installer}" "${stage_dir}/Headroom.Local.Community_${RELEASE_VERSION}_x64-setup.exe"
-          cp "${updater}" "${stage_dir}/Headroom.Local.Community_x64-setup.nsis.zip"
-          cp "${signature}" "${stage_dir}/Headroom.Local.Community_x64-setup.nsis.zip.sig"
+          cp "${installer}" "${stage_dir}/codexbox_${RELEASE_VERSION}_x64-setup.exe"
+          cp "${updater}" "${stage_dir}/codexbox_x64-setup.nsis.zip"
+          cp "${signature}" "${stage_dir}/codexbox_x64-setup.nsis.zip.sig"
           [[ "$(find "${stage_dir}" -maxdepth 1 -type f | wc -l | tr -d ' ')" == "3" ]]
 
       - name: Upload verified Windows assets
@@ -344,11 +344,11 @@ jobs:
 
           mac_dir="release-inputs/macos"
           windows_dir="release-inputs/windows"
-          mac_dmg="${mac_dir}/Headroom.Local.Community_${RELEASE_VERSION}_universal.dmg"
-          mac_updater="${mac_dir}/Headroom.Local.Community_universal.app.tar.gz"
+          mac_dmg="${mac_dir}/codexbox_${RELEASE_VERSION}_universal.dmg"
+          mac_updater="${mac_dir}/codexbox_universal.app.tar.gz"
           mac_signature="${mac_updater}.sig"
-          windows_installer="${windows_dir}/Headroom.Local.Community_${RELEASE_VERSION}_x64-setup.exe"
-          windows_updater="${windows_dir}/Headroom.Local.Community_x64-setup.nsis.zip"
+          windows_installer="${windows_dir}/codexbox_${RELEASE_VERSION}_x64-setup.exe"
+          windows_updater="${windows_dir}/codexbox_x64-setup.nsis.zip"
           windows_signature="${windows_updater}.sig"
 
           node scripts/prepare-community-release.mjs \
@@ -368,8 +368,8 @@ jobs:
           [[ "$(find "${assets_dir}" -maxdepth 1 -type f | wc -l | tr -d ' ')" == "7" ]]
           jq -e \
             --arg version "${RELEASE_VERSION}" \
-            --arg mac_url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/Headroom.Local.Community_universal.app.tar.gz" \
-            --arg windows_url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/Headroom.Local.Community_x64-setup.nsis.zip" \
+            --arg mac_url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/codexbox_universal.app.tar.gz" \
+            --arg windows_url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/codexbox_x64-setup.nsis.zip" \
             '.version == $version
               and (.platforms | length == 5)
               and .platforms["darwin-aarch64"].url == $mac_url
@@ -378,12 +378,12 @@ jobs:
             "${assets_dir}/latest.json" >/dev/null
 
           staged_files=(
-            "assets/Headroom.Local.Community_${RELEASE_VERSION}_universal.dmg"
-            "assets/Headroom.Local.Community_universal.app.tar.gz"
-            "assets/Headroom.Local.Community_universal.app.tar.gz.sig"
-            "assets/Headroom.Local.Community_${RELEASE_VERSION}_x64-setup.exe"
-            "assets/Headroom.Local.Community_x64-setup.nsis.zip"
-            "assets/Headroom.Local.Community_x64-setup.nsis.zip.sig"
+            "assets/codexbox_${RELEASE_VERSION}_universal.dmg"
+            "assets/codexbox_universal.app.tar.gz"
+            "assets/codexbox_universal.app.tar.gz.sig"
+            "assets/codexbox_${RELEASE_VERSION}_x64-setup.exe"
+            "assets/codexbox_x64-setup.nsis.zip"
+            "assets/codexbox_x64-setup.nsis.zip.sig"
             "assets/latest.json"
             "release-body.md"
           )
@@ -437,22 +437,22 @@ jobs:
 
           [[ "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           [[ -s "release-staging/release-body.md" ]]
-          [[ -f "${assets_dir}/Headroom.Local.Community_${version}_universal.dmg" ]]
-          [[ -f "${assets_dir}/Headroom.Local.Community_universal.app.tar.gz" ]]
-          [[ -f "${assets_dir}/Headroom.Local.Community_universal.app.tar.gz.sig" ]]
-          [[ -f "${assets_dir}/Headroom.Local.Community_${version}_x64-setup.exe" ]]
-          [[ -f "${assets_dir}/Headroom.Local.Community_x64-setup.nsis.zip" ]]
-          [[ -f "${assets_dir}/Headroom.Local.Community_x64-setup.nsis.zip.sig" ]]
+          [[ -f "${assets_dir}/codexbox_${version}_universal.dmg" ]]
+          [[ -f "${assets_dir}/codexbox_universal.app.tar.gz" ]]
+          [[ -f "${assets_dir}/codexbox_universal.app.tar.gz.sig" ]]
+          [[ -f "${assets_dir}/codexbox_${version}_x64-setup.exe" ]]
+          [[ -f "${assets_dir}/codexbox_x64-setup.nsis.zip" ]]
+          [[ -f "${assets_dir}/codexbox_x64-setup.nsis.zip.sig" ]]
           [[ -f "${assets_dir}/latest.json" ]]
           [[ "$(find "${assets_dir}" -maxdepth 1 -type f | wc -l | tr -d ' ')" == "7" ]]
 
           staged_files=(
-            "assets/Headroom.Local.Community_${version}_universal.dmg"
-            "assets/Headroom.Local.Community_universal.app.tar.gz"
-            "assets/Headroom.Local.Community_universal.app.tar.gz.sig"
-            "assets/Headroom.Local.Community_${version}_x64-setup.exe"
-            "assets/Headroom.Local.Community_x64-setup.nsis.zip"
-            "assets/Headroom.Local.Community_x64-setup.nsis.zip.sig"
+            "assets/codexbox_${version}_universal.dmg"
+            "assets/codexbox_universal.app.tar.gz"
+            "assets/codexbox_universal.app.tar.gz.sig"
+            "assets/codexbox_${version}_x64-setup.exe"
+            "assets/codexbox_x64-setup.nsis.zip"
+            "assets/codexbox_x64-setup.nsis.zip.sig"
             "assets/latest.json"
             "release-body.md"
           )
@@ -469,12 +469,12 @@ jobs:
           [[ "${staging_digest}" == "${EXPECTED_STAGING_DIGEST}" ]]
 
           release_asset_names=(
-            "Headroom.Local.Community_${version}_universal.dmg"
-            "Headroom.Local.Community_universal.app.tar.gz"
-            "Headroom.Local.Community_universal.app.tar.gz.sig"
-            "Headroom.Local.Community_${version}_x64-setup.exe"
-            "Headroom.Local.Community_x64-setup.nsis.zip"
-            "Headroom.Local.Community_x64-setup.nsis.zip.sig"
+            "codexbox_${version}_universal.dmg"
+            "codexbox_universal.app.tar.gz"
+            "codexbox_universal.app.tar.gz.sig"
+            "codexbox_${version}_x64-setup.exe"
+            "codexbox_x64-setup.nsis.zip"
+            "codexbox_x64-setup.nsis.zip.sig"
             "latest.json"
           )
 
@@ -521,7 +521,7 @@ jobs:
               --repo "${GITHUB_REPOSITORY}" \
               --verify-tag \
               --draft \
-              --title "Headroom Local Community ${tag}" \
+              --title "codexbox ${tag}" \
               --notes-file release-staging/release-body.md
             release_state=draft
             release_count=0
@@ -551,7 +551,7 @@ jobs:
 
           [[ "$(jq -r '.tag_name' <<<"${release_json}")" == "${tag}" ]]
           [[ "$(jq -r '.prerelease' <<<"${release_json}")" == "false" ]]
-          [[ "$(jq -r '.name' <<<"${release_json}")" == "Headroom Local Community ${tag}" ]]
+          [[ "$(jq -r '.name' <<<"${release_json}")" == "codexbox ${tag}" ]]
           [[ "$(jq -r '.body' <<<"${release_json}")" == "$(cat release-staging/release-body.md)" ]]
 
           tag_sha="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${tag}" --jq '.sha')"
@@ -677,12 +677,12 @@ jobs:
           [[ "$(jq -r '.assets | length' <<<"${release_json}")" == "7" ]]
 
           asset_names=(
-            "Headroom.Local.Community_${version}_universal.dmg"
-            "Headroom.Local.Community_universal.app.tar.gz"
-            "Headroom.Local.Community_universal.app.tar.gz.sig"
-            "Headroom.Local.Community_${version}_x64-setup.exe"
-            "Headroom.Local.Community_x64-setup.nsis.zip"
-            "Headroom.Local.Community_x64-setup.nsis.zip.sig"
+            "codexbox_${version}_universal.dmg"
+            "codexbox_universal.app.tar.gz"
+            "codexbox_universal.app.tar.gz.sig"
+            "codexbox_${version}_x64-setup.exe"
+            "codexbox_x64-setup.nsis.zip"
+            "codexbox_x64-setup.nsis.zip.sig"
             "latest.json"
           )
           expected_names="$(printf '%s\n' "${asset_names[@]}" | LC_ALL=C sort)"
@@ -721,10 +721,10 @@ jobs:
           done
           [[ "${latest_verified}" == "true" ]]
 
-          mac_updater_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/Headroom.Local.Community_universal.app.tar.gz"
-          windows_updater_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/Headroom.Local.Community_x64-setup.nsis.zip"
-          mac_signature="$(tr -d '\r\n' < "${public_dir}/Headroom.Local.Community_universal.app.tar.gz.sig")"
-          windows_signature="$(tr -d '\r\n' < "${public_dir}/Headroom.Local.Community_x64-setup.nsis.zip.sig")"
+          mac_updater_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/codexbox_universal.app.tar.gz"
+          windows_updater_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/codexbox_x64-setup.nsis.zip"
+          mac_signature="$(tr -d '\r\n' < "${public_dir}/codexbox_universal.app.tar.gz.sig")"
+          windows_signature="$(tr -d '\r\n' < "${public_dir}/codexbox_x64-setup.nsis.zip.sig")"
           jq -e \
             --arg version "${version}" \
             --arg mac_updater_url "${mac_updater_url}" \
