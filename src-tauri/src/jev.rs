@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::Read;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +10,12 @@ use tauri::State;
 #[cfg(all(not(debug_assertions), target_os = "macos"))]
 use crate::keychain;
 use crate::system_one_adapter::{self, AdapterConfig, AdapterProtocol};
+
+mod automatic;
+
+pub fn run_auto_classification_if_requested() -> bool {
+    automatic::run_if_requested()
+}
 
 const JEV_URL: &str = "https://api.typesafe.ai/v1/systemone";
 #[cfg(all(not(debug_assertions), target_os = "macos"))]
@@ -70,6 +76,8 @@ pub enum JevProvider {
     Gemini,
     #[serde(rename = "opencode_go")]
     OpenCodeGo,
+    #[serde(rename = "opencode_jev")]
+    OpenCodeJev,
     #[serde(rename = "custom")]
     Custom,
 }
@@ -79,6 +87,9 @@ pub enum JevProvider {
 pub struct JevDashboard {
     pub key_configured: bool,
     pub key_persistent: bool,
+    pub auto_enabled: bool,
+    pub auto_available: bool,
+    pub auto_error: Option<String>,
     pub configured_targets: Vec<ConfiguredTarget>,
     pub busy: bool,
     pub records: Vec<JevRecord>,
@@ -92,12 +103,14 @@ pub struct ConfiguredTarget {
     pub url: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JevRecord {
     pub id: String,
     pub timestamp: String,
     pub provider: JevProvider,
+    #[serde(default)]
+    pub source: JevSource,
     pub endpoint: Option<String>,
     pub model: Option<String>,
     pub status: JevStatus,
@@ -109,16 +122,24 @@ pub struct JevRecord {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JevStatus {
     Success,
     Error,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum JevSource {
+    #[default]
+    Manual,
+    Codex,
+}
+
+#[derive(Clone, Default)]
 pub struct JevState {
-    inner: Mutex<JevInner>,
+    inner: Arc<Mutex<JevInner>>,
 }
 
 #[derive(Default)]
@@ -126,6 +147,7 @@ struct JevInner {
     key: Option<String>,
     adapter_keys: HashMap<JevProvider, AdapterCredential>,
     busy: bool,
+    auto_enabled: bool,
     records: Vec<JevRecord>,
 }
 
@@ -171,8 +193,33 @@ struct JevUsage {
 }
 
 #[tauri::command]
-pub fn get_jev_dashboard(state: State<'_, JevState>) -> Result<JevDashboard, String> {
-    dashboard(&state)
+pub async fn get_jev_dashboard(state: State<'_, JevState>) -> Result<JevDashboard, String> {
+    run_state_task(state.inner(), dashboard).await
+}
+
+#[tauri::command]
+pub async fn set_jev_auto_enabled(
+    state: State<'_, JevState>,
+    enabled: bool,
+) -> Result<JevDashboard, String> {
+    run_state_task(state.inner(), move |state| set_auto_enabled(state, enabled)).await
+}
+
+fn set_auto_enabled(state: &JevState, enabled: bool) -> Result<JevDashboard, String> {
+    let mut inner = lock_state(state)?;
+    if enabled {
+        if !cfg!(all(not(debug_assertions), target_os = "macos")) {
+            return Err("jev_auto_unavailable".into());
+        }
+        restore_jev_key_from_store(&mut inner)?;
+        if inner.key.is_none() {
+            return Err("jev_key_missing".into());
+        }
+    }
+    crate::client_adapters::set_jev_auto_enabled(enabled)
+        .map_err(|_| "jev_auto_settings_write".to_string())?;
+    inner.auto_enabled = enabled;
+    Ok(snapshot_with_auto_records(&inner))
 }
 
 #[tauri::command]
@@ -202,8 +249,12 @@ pub async fn get_jev_models(
 }
 
 #[tauri::command]
-pub fn set_jev_key(state: State<'_, JevState>, key: String) -> Result<(), String> {
-    let mut inner = lock_state(&state)?;
+pub async fn set_jev_key(state: State<'_, JevState>, key: String) -> Result<(), String> {
+    run_state_task(state.inner(), move |state| set_key(state, key)).await
+}
+
+fn set_key(state: &JevState, key: String) -> Result<(), String> {
+    let mut inner = lock_state(state)?;
     #[cfg(all(not(debug_assertions), target_os = "macos"))]
     {
         set_jev_key_with_store(
@@ -275,20 +326,39 @@ fn restore_jev_key_from_store(_inner: &mut JevInner) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(all(not(debug_assertions), target_os = "macos"))]
+fn restore_jev_key_from_store_without_interaction(inner: &mut JevInner) -> Result<(), String> {
+    restore_jev_key(inner, || {
+        keychain::read_secret_without_interaction(JEV_KEYCHAIN_SERVICE, JEV_KEYCHAIN_ACCOUNT)
+    })
+}
+
+#[cfg(not(all(not(debug_assertions), target_os = "macos")))]
+fn restore_jev_key_from_store_without_interaction(_inner: &mut JevInner) -> Result<(), String> {
+    Err("jev_auto_unavailable".into())
+}
+
 #[tauri::command]
-pub fn set_adapter_key(
+pub async fn set_adapter_key(
     state: State<'_, JevState>,
     config: AdapterConfig,
     key: String,
 ) -> Result<(), String> {
+    run_state_task(state.inner(), move |state| {
+        set_adapter_key_inner(state, config, key)
+    })
+    .await
+}
+
+fn set_adapter_key_inner(state: &JevState, config: AdapterConfig, key: String) -> Result<(), String> {
     let target = system_one_adapter::resolve(&config)?;
     let parsed_key = session_key(key)?;
     if parsed_key.is_none() && !target.local {
-        let mut inner = lock_state(&state)?;
+        let mut inner = lock_state(state)?;
         inner.adapter_keys.remove(&target.provider);
         return Ok(());
     }
-    let mut inner = lock_state(&state)?;
+    let mut inner = lock_state(state)?;
     match parsed_key {
         Some(key) => {
             inner.adapter_keys.insert(
@@ -354,25 +424,38 @@ pub async fn evaluate_jev(
     };
     let endpoint = target.as_ref().map(|target| target.url.clone());
 
-    let key = {
-        let mut inner = try_lock_state(&state)?;
+    let credential_target = target.clone();
+    let key = run_state_task(state.inner(), move |state| {
+        let mut inner = try_lock_state(state)?;
         let key = if provider == JevProvider::TypeSafe {
             restore_jev_key_from_store(&mut inner)?;
             Some(inner.key.clone().ok_or("jev_key_missing")?)
         } else {
-            let target = target.as_ref().ok_or("adapter_invalid_provider")?;
+            let target = credential_target.as_ref().ok_or("adapter_invalid_provider")?;
             adapter_key(&inner, target)?
         };
         if inner.busy {
             return Err("jev_busy".to_string());
         }
         inner.busy = true;
-        key
-    };
+        Ok(key)
+    })
+    .await?;
 
     let started = Instant::now();
     let result = tauri::async_runtime::spawn_blocking(move || match target {
-        None => dispatch(key.as_deref().unwrap_or_default(), &text),
+        None => dispatch(
+            JEV_URL,
+            "jev-latest",
+            key.as_deref().unwrap_or_default(),
+            &text,
+        ),
+        Some(target) if target.provider == JevProvider::OpenCodeJev => dispatch(
+            &target.url,
+            &target.model,
+            key.as_deref().unwrap_or_default(),
+            &text,
+        ),
         Some(target) => {
             system_one_adapter::dispatch(&target, key.as_deref(), &text).map(|decision| {
                 ParsedResponse {
@@ -400,6 +483,7 @@ pub async fn evaluate_jev(
         Ok(parsed) => {
             inner.records.push(JevRecord {
                 id: new_id(),
+                source: JevSource::Manual,
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 provider,
                 endpoint: endpoint.clone(),
@@ -413,12 +497,13 @@ pub async fn evaluate_jev(
                 error: None,
             });
             trim_records(&mut inner.records);
-            Ok(snapshot(&inner))
+            Ok(snapshot_with_auto_records(&inner))
         }
         Err(error) => {
             let safe_error = bounded_error(&error);
             inner.records.push(JevRecord {
                 id: new_id(),
+                source: JevSource::Manual,
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 provider,
                 endpoint,
@@ -451,18 +536,19 @@ fn validate_evaluation_model(config: &AdapterConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn dispatch(key: &str, text: &str) -> Result<ParsedResponse, String> {
+fn dispatch(url: &str, model: &str, key: &str, text: &str) -> Result<ParsedResponse, String> {
     let client = reqwest::blocking::Client::builder()
+        .user_agent(concat!("CodexBox/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(|_| "jev_client".to_string())?;
 
-    let request = native_request(text);
+    let request = native_request(text, model);
 
     let response = client
-        .post(JEV_URL)
+        .post(url)
         .bearer_auth(key)
         .header(reqwest::header::ACCEPT, "application/json")
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -496,10 +582,10 @@ fn dispatch(key: &str, text: &str) -> Result<ParsedResponse, String> {
     parse_response(response)
 }
 
-fn native_request(text: &str) -> serde_json::Value {
+fn native_request(text: &str, model: &str) -> serde_json::Value {
     json!({
         "state": text,
-        "model": "jev-latest",
+        "model": model,
         "questions": {
             "category": {
                 "type": "choice",
@@ -560,13 +646,17 @@ fn bounded_model(model: &str) -> Result<Option<String>, String> {
 fn dashboard(state: &JevState) -> Result<JevDashboard, String> {
     let mut inner = lock_state(state)?;
     restore_jev_key_from_store(&mut inner)?;
-    Ok(snapshot(&inner))
+    inner.auto_enabled = crate::client_adapters::is_jev_auto_enabled();
+    Ok(snapshot_with_auto_records(&inner))
 }
 
 fn snapshot(inner: &JevInner) -> JevDashboard {
     JevDashboard {
         key_configured: inner.key.is_some(),
         key_persistent: cfg!(all(not(debug_assertions), target_os = "macos")),
+        auto_enabled: inner.auto_enabled,
+        auto_available: cfg!(all(not(debug_assertions), target_os = "macos")),
+        auto_error: None,
         configured_targets: inner
             .adapter_keys
             .iter()
@@ -579,6 +669,22 @@ fn snapshot(inner: &JevInner) -> JevDashboard {
         busy: inner.busy,
         records: inner.records.clone(),
     }
+}
+
+fn snapshot_with_auto_records(inner: &JevInner) -> JevDashboard {
+    let mut result = snapshot(inner);
+    automatic::merge_records(&mut result);
+    result
+}
+
+async fn run_state_task<T: Send + 'static>(
+    state: &JevState,
+    task: impl FnOnce(&JevState) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let state = state.clone();
+    tauri::async_runtime::spawn_blocking(move || task(&state))
+        .await
+        .map_err(|_| "jev_internal".to_string())?
 }
 
 fn lock_state<'a>(state: &'a JevState) -> Result<std::sync::MutexGuard<'a, JevInner>, String> {
@@ -623,6 +729,57 @@ fn bounded_error(error: &str) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn credential_work_waits_off_caller_thread_and_shares_state() {
+        let state = JevState::default();
+        let shared = state.clone();
+        let caller_thread = std::thread::current().id();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let pending = run_state_task(&state, move |state| {
+            started_tx.send(std::thread::current().id()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .map_err(|_| "test worker timed out".to_string())?;
+            lock_state(state)?.auto_enabled = true;
+            Ok(())
+        });
+        tokio::pin!(pending);
+        tokio::select! {
+            result = &mut pending => panic!("worker returned before release: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+        let worker_thread = started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_ne!(worker_thread, caller_thread);
+        release_tx.send(()).unwrap();
+        pending.await.unwrap();
+        assert!(lock_state(&shared).unwrap().auto_enabled);
+    }
+
+    #[tokio::test]
+    async fn state_worker_failure_returns_only_safe_error() {
+        let state = JevState::default();
+        let result = run_state_task::<()>(&state, |_| panic!("synthetic worker failure")).await;
+        assert_eq!(result.unwrap_err(), "jev_internal");
+    }
+
+    #[cfg(not(all(not(debug_assertions), target_os = "macos")))]
+    #[test]
+    fn noninteractive_credentials_do_not_use_plaintext_fallback() {
+        let mut inner = JevInner::default();
+        assert_eq!(
+            restore_jev_key_from_store_without_interaction(&mut inner).unwrap_err(),
+            "jev_auto_unavailable"
+        );
+        assert!(crate::keychain::read_secret_without_interaction(
+            "synthetic-jev-service",
+            "synthetic-account"
+        )
+        .is_err());
+    }
+
     fn valid_response() -> JevResponse {
         serde_json::from_value(json!({
             "model": "jev-latest",
@@ -662,10 +819,21 @@ mod tests {
 
     #[test]
     fn native_request_puts_text_in_state() {
-        let request = native_request("classify this");
+        let request = native_request("classify this", "jev-latest");
         assert_eq!(request["state"], "classify this");
         assert!(request.get("input").is_none());
         assert_eq!(request["questions"]["category"]["type"], "choice");
+    }
+
+    #[test]
+    fn opencode_jev_uses_the_selected_native_model() {
+        for model in ["jev-1.13", "jev-1.13-free"] {
+            let request = native_request("classify this", model);
+            assert_eq!(request["model"], model);
+            assert_eq!(request["state"], "classify this");
+            assert!(request.get("messages").is_none());
+            assert_eq!(request["questions"]["category"]["type"], "choice");
+        }
     }
 
     #[test]
@@ -693,6 +861,7 @@ mod tests {
         assert_eq!(bounded_error(&"x".repeat(100)), "x".repeat(MAX_ERROR_BYTES));
         let mut records = (0..201)
             .map(|_| JevRecord {
+                source: JevSource::Manual,
                 id: "x".into(),
                 timestamp: "x".into(),
                 provider: JevProvider::TypeSafe,

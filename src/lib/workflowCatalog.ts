@@ -18,6 +18,23 @@ export type ToolCategory =
 
 type Localized = Record<ResolvedLocale, string>;
 
+export type AddonManagementPage = "addons" | "mcp" | "skills";
+
+export function isHostCuratedAddon(id: string): boolean {
+  return id === "superpowers" || id === "codex-security";
+}
+
+export function addonManagementPage(tool: {
+  id: string;
+  runtime?: string;
+  activationScope?: string | null;
+}): AddonManagementPage | null {
+  if (isHostCuratedAddon(tool.id)) return null;
+  if (["serena", "context7", "codebase-memory"].includes(tool.id)) return "mcp";
+  if (tool.runtime === "plugin" || tool.activationScope === "new_session") return "skills";
+  return "addons";
+}
+
 export const TOOL_CATEGORY_ORDER: ToolCategory[] = [
  "workflow",
  "automation",
@@ -85,11 +102,11 @@ export const toolCategoryCopy: Record<
       ko: "주 워크플로",
     },
     description: {
-      en: "OpenSpec, Superpowers, and gstack are mutually exclusive. Enabling one disables the active peer.",
-      "zh-CN": "OpenSpec、Superpowers、gstack 互斥单选；启用一个会关闭同组已启用项。",
-      "zh-TW": "OpenSpec、Superpowers、gstack 互斥單選；啟用一個會停用同組已啟用項。",
-      ja: "OpenSpec、Superpowers、gstack は排他的です。1つを有効にすると同じグループの有効項目を無効にします。",
-      ko: "OpenSpec, Superpowers, gstack은 상호 배타적이며 하나를 켜면 같은 그룹의 활성 항목을 끕니다.",
+      en: "OpenSpec and gstack are mutually exclusive. Enabling one disables the active peer.",
+      "zh-CN": "OpenSpec、gstack 互斥单选；启用一个会关闭同组已启用项。",
+      "zh-TW": "OpenSpec、gstack 互斥單選；啟用一個會停用同組已啟用項。",
+      ja: "OpenSpec、gstack は排他的です。1つを有効にすると同じグループの有効項目を無効にします。",
+      ko: "OpenSpec, gstack은 상호 배타적이며 하나를 켜면 같은 그룹의 활성 항목을 끕니다.",
     },
   },
   automation: {
@@ -171,11 +188,11 @@ Object.assign(toolCategoryCopy.learning.description, {
   ko: "코드 이해를 확인합니다. Grill Me는 현재 구현을 기준으로 한 문제씩 질문하고 이해의 빈틈을 바로잡습니다. 다른 모든 그룹과 함께 켤 수 있습니다.",
 });
 Object.assign(toolCategoryCopy.workflow.description, {
-  en: "Chooses how a development task moves from requirements to delivery: OpenSpec emphasizes specs and acceptance, Superpowers planning and TDD, and gstack product-to-release coverage; only one can be enabled in this group.",
-  "zh-CN": "决定开发任务如何从需求推进到交付：OpenSpec 偏规格与验收，Superpowers 偏计划与 TDD，gstack 偏产品到发布全流程；本组只能启用 1 个。",
-  "zh-TW": "決定開發任務如何從需求推進到交付：OpenSpec 偏規格與驗收，Superpowers 偏計畫與 TDD，gstack 偏產品到發布全流程；本組只能啟用 1 個。",
-  ja: "開発タスクを要件から納品までどう進めるかを選びます。OpenSpec は仕様と受け入れ、Superpowers は計画と TDD、gstack は製品からリリースまでを重視します。このグループでは 1 つだけ有効化できます。",
-  ko: "개발 작업을 요구사항부터 전달까지 어떻게 진행할지 선택합니다. OpenSpec은 명세와 인수 기준, Superpowers는 계획과 TDD, gstack은 제품부터 출시까지의 전체 과정을 중시합니다. 이 그룹에서는 하나만 켤 수 있습니다.",
+  en: "Chooses how a development task moves from requirements to delivery: OpenSpec emphasizes specs and acceptance, and gstack product-to-release coverage; only one can be enabled in this group.",
+  "zh-CN": "决定开发任务如何从需求推进到交付：OpenSpec 偏规格与验收，gstack 偏产品到发布全流程；本组只能启用 1 个。",
+  "zh-TW": "決定開發任務如何從需求推進到交付：OpenSpec 偏規格與驗收，gstack 偏產品到發布全流程；本組只能啟用 1 個。",
+  ja: "開発タスクを要件から納品までどう進めるかを選びます。OpenSpec は仕様と受け入れ、gstack は製品からリリースまでを重視します。このグループでは 1 つだけ有効化できます。",
+  ko: "개발 작업을 요구사항부터 전달까지 어떻게 진행할지 선택합니다. OpenSpec은 명세와 인수 기준, gstack은 제품부터 출시까지의 전체 과정을 중시합니다. 이 그룹에서는 하나만 켤 수 있습니다.",
 });
 Object.assign(toolCategoryCopy.automation.description, {
   en: "Chooses what continually drives execution: All in Luna coordinates multi-agent goals, while Ralph Loop repeats work until completion conditions; only one can be enabled, and both require an explicit start.",
@@ -203,11 +220,11 @@ export const activationScopeCopyByScope: Record<ActivationScope, Localized> = {
     ko: "새 Codex 세션에서 적용되며 Headroom을 다시 시작할 필요가 없습니다.",
   },
   client_restart: {
-    en: "Configuration is installed; restart Codex or the connected client to replace MCPs in open sessions. Headroom does not need a restart.",
-    "zh-CN": "配置已安装；需重启 Codex 或对应客户端，才能替换已打开会话中的 MCP。无需重启 Headroom。",
-    "zh-TW": "設定已安裝；需重新啟動 Codex 或對應用戶端，才能替換已開啟工作階段中的 MCP。無需重新啟動 Headroom。",
-    ja: "設定はインストール済みです。開いているセッションの MCP を置き換えるには Codex または接続先クライアントを再起動してください。Headroom の再起動は不要です。",
-    ko: "구성은 설치되었습니다. 열린 세션의 MCP를 교체하려면 Codex 또는 연결된 클라이언트를 다시 시작해야 합니다. Headroom 재시작은 필요 없습니다.",
+    en: "Configuration installed; reload MCPs in Codex or the connected client, or restart that client to use the updated tools. Headroom does not reload open client sessions.",
+    "zh-CN": "配置已安装；请在 Codex 或对应客户端重载 MCP，或重启客户端后使用更新的工具。Headroom 不会自动刷新已打开的客户端会话。",
+    "zh-TW": "設定已安裝；請在 Codex 或對應用戶端重新載入 MCP，或重新啟動用戶端後使用更新的工具。Headroom 不會自動重新載入已開啟的用戶端工作階段。",
+    ja: "設定はインストール済みです。Codex または接続先クライアントで MCP を再読み込みするか、クライアントを再起動してください。Headroom は開いているクライアントのセッションを自動更新しません。",
+    ko: "구성이 설치되었습니다. Codex 또는 연결된 클라이언트에서 MCP를 다시 로드하거나 클라이언트를 재시작하세요. Headroom은 열린 클라이언트 세션을 자동으로 새로 고치지 않습니다.",
   },
   unknown: {
     en: "Activation timing is tool-specific; check the tool details.",
@@ -266,13 +283,6 @@ export const toolCopy: Record<string, Localized> = {
     ja: "明確な要件・仕様・受け入れ証拠を伴う複数モジュール変更向け。OpenSpec CLI も導入します。Fission AI と貢献者に感謝します。",
     ko: "명확한 요구사항, 사양, 수용 증거가 있는 모듈 간 변경에 적합하며 OpenSpec CLI도 설치합니다. Fission AI와 기여자에게 감사합니다.",
   },
-  superpowers: {
-    en: "Uses Codex's official curated plugin. Best for disciplined brainstorming, planning, TDD, debugging, review, and delivery. Thanks to Jesse Vincent and contributors.",
-    "zh-CN": "复用 Codex 官方 curated 插件，避免重复 marketplace。适合强调 brainstorm、计划、TDD、系统调试、审查与交付纪律的开发。感谢 Jesse Vincent 与贡献者。",
-    "zh-TW": "重用 Codex 官方 curated 外掛，避免重複 marketplace。適合強調 brainstorm、規劃、TDD、系統除錯、審查與交付紀律的開發。感謝 Jesse Vincent 與貢獻者。",
-    ja: "Codex 公式 curated プラグインを再利用し、marketplace の重複を避けます。計画、TDD、体系的デバッグ、レビュー、納品を重視する開発向け。Jesse Vincent と貢献者に感謝します。",
-    ko: "Codex 공식 curated 플러그인을 재사용해 marketplace 중복을 피합니다. 계획, TDD, 체계적 디버깅, 리뷰, 전달 규율을 중시하는 개발에 적합합니다. Jesse Vincent와 기여자에게 감사합니다.",
-  },
   gstack: {
     en: "Best for a broad product-to-ship workflow with browser, design, QA, review, and release skills. Requires Bun and Node.js. Thanks to Garry Tan and contributors.",
     "zh-CN": "适合覆盖产品、设计、浏览器验证、QA、审查到发布的完整流程；需要 Bun 与 Node.js。感谢 Garry Tan 与贡献者。",
@@ -310,14 +320,13 @@ export const toolCopy: Record<string, Localized> = {
   },
 };
 
-toolCopy.superpowers["zh-CN"] = "复用 Codex 官方精选插件，避免重复安装市场版本。适合强调头脑风暴、计划、TDD、系统调试、审查与交付纪律的开发。感谢 Jesse Vincent 与贡献者。";
 
 export const conflictMatrixCopy: Localized = {
-  en: "Safety constraints can stack; Grill Me can coexist with every workflow. OpenSpec, Superpowers, and gstack are single-select. All in Luna and Ralph Loop are single-select. Switching is explicit and affects new sessions only; Headroom and port 6867 stay running.",
-  "zh-CN": "安全约束可叠加，Grill Me 可与所有工作流共存。OpenSpec、Superpowers、gstack 主工作流单选；All in Luna、Ralph Loop 自动执行器单选。切换必须由用户明确触发，只影响新会话；Headroom 与 6867 端口保持运行。",
-  "zh-TW": "安全約束可疊加，Grill Me 可與所有工作流程共存。OpenSpec、Superpowers、gstack 主要工作流程單選；All in Luna、Ralph Loop 自動執行器單選。切換必須由使用者明確觸發，只影響新工作階段；Headroom 與 6867 連接埠保持運行。",
-  ja: "安全制約は併用でき、Grill Me はすべてのワークフローと共存できます。OpenSpec、Superpowers、gstack は単一選択、All in Luna と Ralph Loop も単一選択です。切り替えは明示操作で新しいセッションだけに反映され、Headroom と 6867 番ポートは動作を続けます。",
-  ko: "안전 제약은 함께 사용할 수 있고 Grill Me는 모든 워크플로와 공존합니다. OpenSpec, Superpowers, gstack은 단일 선택이며 All in Luna와 Ralph Loop도 단일 선택입니다. 전환은 명시적으로 실행되어 새 세션에만 적용되고 Headroom과 6867 포트는 계속 실행됩니다.",
+  en: "Safety constraints can stack; Grill Me can coexist with every workflow. OpenSpec and gstack are single-select. All in Luna and Ralph Loop are single-select. Switching is explicit and affects new sessions only; Headroom and port 6867 stay running.",
+  "zh-CN": "安全约束可叠加，Grill Me 可与所有工作流共存。OpenSpec、gstack 主工作流单选；All in Luna、Ralph Loop 自动执行器单选。切换必须由用户明确触发，只影响新会话；Headroom 与 6867 端口保持运行。",
+  "zh-TW": "安全約束可疊加，Grill Me 可與所有工作流程共存。OpenSpec、gstack 主要工作流程單選；All in Luna、Ralph Loop 自動執行器單選。切換必須由使用者明確觸發，只影響新工作階段；Headroom 與 6867 連接埠保持運行。",
+  ja: "安全制約は併用でき、Grill Me はすべてのワークフローと共存できます。OpenSpec、gstack は単一選択、All in Luna と Ralph Loop も単一選択です。切り替えは明示操作で新しいセッションだけに反映され、Headroom と 6867 番ポートは動作を続けます。",
+  ko: "안전 제약은 함께 사용할 수 있고 Grill Me는 모든 워크플로와 공존합니다. OpenSpec, gstack은 단일 선택이며 All in Luna와 Ralph Loop도 단일 선택입니다. 전환은 명시적으로 실행되어 새 세션에만 적용되고 Headroom과 6867 포트는 계속 실행됩니다.",
 };
 
 export function toolCategory(category?: string | null): ToolCategory {
@@ -357,21 +366,3 @@ export function workflowSwitchPeers<T extends SwitchableTool>(
       tool.status !== "not_installed"
   );
 }
-
-Object.assign(toolCategoryCopy.guardrails.description, {
-  en: "Controls risky or out-of-scope actions: Stop That Shit enforces task boundaries, Agent Guard checks secrets and dangerous commands, and optional official Codex Security audits code and diffs; these roles complement each other.",
-  "zh-CN": "限制越界和危险操作：Stop That Shit 约束任务范围，Agent Guard 检查密钥与高风险命令，官方 Codex Security 可选地审计代码与差异中的安全问题；三者职责不同，可以配合使用。",
-  "zh-TW": "限制越界和危險操作：Stop That Shit 約束任務範圍，Agent Guard 檢查密鑰與高風險命令，官方 Codex Security 可選地稽核程式碼與差異中的安全問題；三者職責不同，可以配合使用。",
-  ja: "危険または範囲外の操作を制御します。Stop That Shit はタスク境界、Agent Guard は秘密情報と危険なコマンド、公式の Codex Security はコードと差分のセキュリティ監査を担当します。役割は異なり、併用できます。",
-  ko: "위험하거나 범위를 벗어난 작업을 제어합니다. Stop That Shit은 작업 경계, Agent Guard는 비밀정보와 위험한 명령, 공식 Codex Security는 코드와 diff의 보안 감사를 담당합니다. 역할이 다르므로 함께 사용할 수 있습니다.",
-});
-
-Object.assign(toolCopy, {
-  "codex-security": {
-    en: "Optional official Codex-only security audit workflow for code and diffs, threat modeling, and fix validation. Findings tracking outside Codex may require separate authorization.",
-    "zh-CN": "可选的官方 Codex 专用安全审计工作流：扫描代码与差异、进行威胁建模并验证修复。若要在 Codex 外跟踪 findings，可能需要单独授权。",
-    "zh-TW": "可選的官方 Codex 專用安全稽核工作流程：掃描程式碼與差異、進行威脅建模並驗證修復。若要在 Codex 外追蹤 findings，可能需要另外授權。",
-    ja: "コードと差分のスキャン、脅威モデリング、修正検証を行う公式 Codex 専用の任意セキュリティ監査ワークフローです。Codex 外で findings を追跡するには別途認可が必要な場合があります。",
-    ko: "코드와 diff 스캔, 수정 검증을 제공하는 공식 Codex 전용 선택형 보안 감사 워크플로입니다. Codex 외부에서 findings를 추적하려면 별도 권한이 필요할 수 있습니다.",
-  },
-});

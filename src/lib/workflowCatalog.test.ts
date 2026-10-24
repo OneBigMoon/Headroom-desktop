@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  addonManagementPage,
   activationScopeCopyByScope,
   getActivationScopeCopy,
   groupToolsByCategory,
@@ -9,6 +10,25 @@ import {
   TOOL_CATEGORY_ORDER,
   workflowSwitchPeers,
 } from "./workflowCatalog";
+
+describe("addonManagementPage", () => {
+  it("separates MCP registrations, skill workflows, and local commands", () => {
+    for (const id of ["serena", "context7", "codebase-memory"]) {
+      expect(addonManagementPage({ id })).toBe("mcp");
+    }
+    expect(addonManagementPage({ id: "openspec", runtime: "node", activationScope: "new_session" })).toBe("skills");
+    expect(addonManagementPage({ id: "caveman", runtime: "plugin" })).toBe("skills");
+    for (const id of ["rtk", "markitdown", "new-cli"]) {
+      expect(addonManagementPage({ id, activationScope: "immediate" })).toBe("addons");
+    }
+  });
+
+  it("omits host-curated plugins from every Headroom management page", () => {
+    for (const id of ["superpowers", "codex-security"]) {
+      expect(addonManagementPage({ id, runtime: "plugin", activationScope: "new_session" })).toBeNull();
+    }
+  });
+});
 
 function tool(
   id: string,
@@ -73,7 +93,9 @@ describe("activation scope copy", () => {
   it("explains immediate, new-session, and client-restart activation in Chinese", () => {
     expect(getActivationScopeCopy("immediate")["zh-CN"]).toContain("即时生效");
     expect(getActivationScopeCopy("new_session")["zh-CN"]).toContain("新 Codex 会话生效");
-    expect(getActivationScopeCopy("client_restart")["zh-CN"]).toContain("重启 Codex");
+    expect(getActivationScopeCopy("client_restart")["zh-CN"]).toContain("重载 MCP");
+    expect(getActivationScopeCopy("client_restart")["zh-CN"]).toContain("或重启客户端");
+    expect(getActivationScopeCopy("client_restart")["zh-CN"]).toContain("不会自动刷新");
   });
 
   it("falls back to an explicit unknown scope without claiming a restart", () => {
@@ -83,13 +105,19 @@ describe("activation scope copy", () => {
   });
 });
 
-describe("security workflow catalog copy", () => {
-  it("describes Codex Security as optional and distinct from the guardrails", () => {
-    expect(toolCopy["codex-security"]["zh-CN"]).toContain("可选");
-    expect(toolCopy["codex-security"]["zh-CN"]).toContain("威胁建模");
-    expect(toolCopy["codex-security"]["zh-CN"]).toContain("修复");
+describe("Headroom workflow catalog copy", () => {
+  it("lists third-party workflows and guardrails without repeating official entries", () => {
+    expect(toolCopy.superpowers).toBeUndefined();
+    expect(toolCopy["codex-security"]).toBeUndefined();
     expect(toolCategoryCopy.guardrails.description["zh-CN"]).toContain("Stop That Shit");
     expect(toolCategoryCopy.guardrails.description["zh-CN"]).toContain("Agent Guard");
-    expect(toolCategoryCopy.guardrails.description["zh-CN"]).toContain("Codex Security");
+    for (const copy of Object.values(toolCategoryCopy.workflow.description)) {
+      expect(copy).toContain("OpenSpec");
+      expect(copy).toContain("gstack");
+      expect(copy).not.toContain("Superpowers");
+    }
+    for (const copy of Object.values(toolCategoryCopy.guardrails.description)) {
+      expect(copy).not.toContain("Codex Security");
+    }
   });
 });

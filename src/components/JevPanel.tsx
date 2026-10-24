@@ -8,7 +8,7 @@ const MAX_TEXT_LENGTH = 16 * 1024;
 const MAX_INPUT_BYTES = 16 * 1024;
 const MAX_RECORDS = 200;
 const RECENT_RECORDS = 20;
-type DecisionProvider = "typesafe" | "custom" | "deepseek" | "volcengine" | "minimax_cn" | "minimax_global" | "bigmodel" | "qwen" | "mimo" | "siliconflow" | "zai" | "openrouter" | "kimi_cn" | "kimi_global" | "byteplus" | "aws_bedrock_mantle" | "tencent_tokenhub" | "modelscope" | "ppio" | "anthropic" | "gemini" | "opencode_go";
+type DecisionProvider = "typesafe" | "custom" | "deepseek" | "volcengine" | "minimax_cn" | "minimax_global" | "bigmodel" | "qwen" | "mimo" | "siliconflow" | "zai" | "openrouter" | "kimi_cn" | "kimi_global" | "byteplus" | "aws_bedrock_mantle" | "tencent_tokenhub" | "modelscope" | "ppio" | "anthropic" | "gemini" | "opencode_go" | "opencode_jev";
 type AdapterProtocol = "open_ai" | "anthropic";
 type UrlMode = "full" | "base";
 type CatalogProvider = Exclude<DecisionProvider, "typesafe" | "custom">;
@@ -21,6 +21,7 @@ const OPENCODE_GO_ENDPOINTS: Record<AdapterProtocol, string> = {
 
 export const PROVIDERS: Record<Exclude<DecisionProvider, "custom">, { label: string; url: string; model: string }> = {
   typesafe: { label: "TypeSafe Jev", url: "https://api.typesafe.ai/v1/systemone", model: "jev-latest" },
+  opencode_jev: { label: "OpenCode Jev（原生）", url: "https://opencode.ai/inference/systemone/v1/systemone", model: "jev-1.13" },
   deepseek: { label: "DeepSeek", url: "https://api.deepseek.com/chat/completions", model: "deepseek-chat" },
   volcengine: { label: "火山引擎", url: "https://ark.cn-beijing.volces.com/api/v3/chat/completions", model: "" },
   minimax_cn: { label: "MiniMax CN", url: "https://api.minimax.cn/v1/chat/completions", model: "MiniMax-M3" },
@@ -43,6 +44,7 @@ export const PROVIDERS: Record<Exclude<DecisionProvider, "custom">, { label: str
   opencode_go: { label: "OpenCode Go", url: OPENCODE_GO_ENDPOINTS.open_ai, model: "deepseek-v4.1-flash" },
 };
 const OFFLINE_MODELS: Record<CatalogProvider, string[]> = {
+  opencode_jev: ["jev-1.13", "jev-1.13-free"],
   deepseek: ["deepseek-chat", "deepseek-reasoner"],
   volcengine: [],
   minimax_cn: ["MiniMax-M3", "MiniMax-M2.7"],
@@ -110,6 +112,7 @@ const INITIAL_MODELS: Record<DecisionProvider, string> = {
   openrouter: PROVIDERS.openrouter.model,
   gemini: PROVIDERS.gemini.model,
   opencode_go: PROVIDERS.opencode_go.model,
+  opencode_jev: PROVIDERS.opencode_jev.model,
 };
 
 function validCustomUrl(raw: string, protocol: AdapterProtocol, mode: UrlMode): string | null {
@@ -125,6 +128,7 @@ function validCustomUrl(raw: string, protocol: AdapterProtocol, mode: UrlMode): 
 
 export interface JevRecord {
   id: string;
+  source?: "manual" | "codex";
   timestamp: string;
   provider: DecisionProvider;
   endpoint: string | null;
@@ -141,12 +145,18 @@ export interface JevRecord {
 interface JevDashboard {
   keyConfigured: boolean;
   keyPersistent: boolean;
+  autoEnabled: boolean;
+  autoAvailable: boolean;
+  autoError: string | null;
   configuredTargets: { provider: DecisionProvider; protocol: AdapterProtocol; url: string }[];
   busy: boolean;
   records: JevRecord[];
 }
 
-const EMPTY_DASHBOARD: JevDashboard = { keyConfigured: false, keyPersistent: false, configuredTargets: [], busy: false, records: [] };
+const EMPTY_DASHBOARD: JevDashboard = { keyConfigured: false, keyPersistent: false, autoEnabled: false, autoAvailable: false, autoError: null, configuredTargets: [], busy: false, records: [] };
+// Officially priced native Jev versions and their current aliases (checked 2026-10-24).
+const TYPESAFE_INPUT_USD_PER_MILLION = 0.042;
+const PRICED_TYPESAFE_MODELS = new Set(["jev-latest", "jev-preview", "jev-1.13.0", "jev-1.14.0"]);
 const EXAMPLE_TEXT = "请检查这段 Rust 代码为什么无法通过编译。";
 
 function errorMessage(error: unknown): string {
@@ -159,6 +169,8 @@ function errorMessage(error: unknown): string {
     jev_key_store_write: "TypeSafe Key 未保存，请检查系统钥匙串是否可用，然后重试。",
     jev_key_store_delete: "无法从系统钥匙串删除 TypeSafe Key，请稍后重试。",
     jev_key_store_invalid: "已保存的 TypeSafe Key 格式无效，请在系统钥匙串中移除后重新设置。",
+    jev_auto_unavailable: "自动评估需要正式 macOS 构建和已保存的 TypeSafe 官方 Key。",
+    jev_auto_settings_write: "自动评估设置未保存，请稍后重试。",
     adapter_invalid_url: "接口 URL 无效：远程服务须使用 HTTPS；本地 HTTP 仅允许 localhost。不要在 URL 中放入 Key。",
     adapter_invalid_model: "模型 ID 无效，请填写提供方给出的模型 ID。",
     adapter_invalid_protocol: "请选择受支持的接口协议。",
@@ -201,6 +213,12 @@ function formatMetric(value: number | null, suffix = ""): string {
   return value === null ? "暂无数据" : `${formatNumber(value)}${suffix}`;
 }
 
+function formatEstimatedCost(value: number | null): string {
+  if (value === null) return "暂无用量估值";
+  if (value > 0 && value < 0.000001) return "~<$0.000001";
+  return `~$${value.toFixed(value > 0 && value < 1 ? 6 : 2)}`;
+}
+
 export function JevPanel() {
   const [dashboard, setDashboard] = useState<JevDashboard>(EMPTY_DASHBOARD);
   const [provider, setProvider] = useState<DecisionProvider>("typesafe");
@@ -229,8 +247,12 @@ export function JevPanel() {
   const [text, setText] = useState("");
   const [consent, setConsent] = useState(false);
   const [evaluating, setEvaluating] = useState(false);
+  const [autoBusy, setAutoBusy] = useState(false);
   const initialLoadStarted = useRef(false);
   const evaluateInFlight = useRef(false);
+  const dashboardReadInFlight = useRef(false);
+  const autoUpdateInFlight = useRef(false);
+  const autoRevision = useRef(0);
   const model = models[provider];
   const workspaceInput = workspaceId.trim();
   const workspaceValid = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(workspaceInput);
@@ -265,26 +287,37 @@ export function JevPanel() {
     else if (!keyConfigured && provider !== "opencode_go" && provider !== "openrouter") catalogHint = "设置此提供方的 Key 后可读取官方模型目录。";
   }
 
-  const loadDashboard = useCallback(async (initial = false) => {
+  const loadDashboard = useCallback(async (initial = false, quiet = false) => {
+    if (dashboardReadInFlight.current || autoUpdateInFlight.current) return;
     if (initial && initialLoadStarted.current) return;
     if (initial) initialLoadStarted.current = true;
+    dashboardReadInFlight.current = true;
+    const revision = autoRevision.current;
     if (initial) setLoading(true);
-    else setRefreshing(true);
+    else if (!quiet) setRefreshing(true);
     try {
       const next = await invoke<JevDashboard>("get_jev_dashboard");
+      if (revision !== autoRevision.current) return;
       setDashboard({ ...next, records: next.records.slice(-MAX_RECORDS) });
-      setError(null);
+      if (!quiet) setError(null);
     } catch (err) {
-      setError(errorMessage(err));
+      if (!quiet && revision === autoRevision.current) setError(errorMessage(err));
     } finally {
+      dashboardReadInFlight.current = false;
       if (initial) setLoading(false);
-      else setRefreshing(false);
+      else if (!quiet) setRefreshing(false);
     }
   }, []);
 
   useEffect(() => {
     void loadDashboard(true);
   }, [loadDashboard]);
+
+  useEffect(() => {
+    if (!dashboard.autoEnabled) return;
+    const interval = window.setInterval(() => void loadDashboard(false, true), 4000);
+    return () => window.clearInterval(interval);
+  }, [dashboard.autoEnabled, loadDashboard]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => setCatalogWorkspaceId(workspaceId.trim()), 500);
@@ -374,6 +407,23 @@ export function JevPanel() {
     }
   };
 
+  const toggleAuto = async () => {
+    if (autoUpdateInFlight.current || (!dashboard.autoEnabled && (!dashboard.autoAvailable || !dashboard.keyConfigured || !dashboard.keyPersistent))) return;
+    autoUpdateInFlight.current = true;
+    autoRevision.current += 1;
+    setAutoBusy(true);
+    try {
+      const next = await invoke<JevDashboard>("set_jev_auto_enabled", { enabled: !dashboard.autoEnabled });
+      setDashboard({ ...next, records: next.records.slice(-MAX_RECORDS) });
+      setError(null);
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      autoUpdateInFlight.current = false;
+      setAutoBusy(false);
+    }
+  };
+
   const evaluate = async () => {
     if (!providerReady || !consent || !text.trim() || new TextEncoder().encode(text).length > MAX_INPUT_BYTES || evaluating || dashboard.busy || evaluateInFlight.current) return;
     evaluateInFlight.current = true;
@@ -404,6 +454,8 @@ export function JevPanel() {
   const missingTokenCount = records.length - tokenRecords.length;
   const outputTokenRecords = records.filter((record) => record.outputTokens !== null);
   const outputTokenSum = outputTokenRecords.reduce((sum, record) => sum + (record.outputTokens ?? 0), 0);
+  const pricedRecords = records.filter((record) => record.provider === "typesafe" && record.model !== null && PRICED_TYPESAFE_MODELS.has(record.model) && record.inputTokens !== null && Number.isFinite(record.inputTokens) && record.inputTokens >= 0);
+  const estimatedCost = pricedRecords.length === 0 ? null : pricedRecords.reduce((sum, record) => sum + (record.inputTokens ?? 0), 0) * TYPESAFE_INPUT_USD_PER_MILLION / 1_000_000;
   const inputBytes = new TextEncoder().encode(text).length;
   const successRate = records.length === 0 ? null : (successfulRecords.length / records.length) * 100;
 
@@ -411,7 +463,7 @@ export function JevPanel() {
     <div className="jev-panel">
       <SectionCard
         title="类型化决策"
-        subtitle="TypeSafe Jev 与兼容模型的手动分类决策。仅保留本次会话最近 200 条记录。"
+        subtitle="手动分类与 TypeSafe Jev 自动评估 Codex。自动历史与本次手动评估合并，最多显示最近 200 条。"
       >
         <div className="jev-panel__toolbar">
         <span>决策提供方</span>
@@ -441,6 +493,16 @@ export function JevPanel() {
 
         {error ? <p className="jev-panel__error" role="alert">{error}</p> : null}
         {loading ? <p className="jev-panel__loading" role="status">正在读取会话数据...</p> : null}
+
+        <section className="jev-panel__evaluate" aria-labelledby="jev-auto-title">
+          <label className="jev-panel__consent">
+            <input type="checkbox" role="switch" checked={dashboard.autoEnabled} onChange={() => void toggleAuto()} disabled={loading || autoBusy || (!dashboard.autoEnabled && (!dashboard.autoAvailable || !dashboard.keyConfigured || !dashboard.keyPersistent))} aria-describedby="jev-auto-description" />
+            <span id="jev-auto-title">自动评估 Codex 请求</span>
+          </label>
+          <p id="jev-auto-description" className="jev-panel__hint">默认关闭。开启后，在 CodexBox 运行并优化 Codex 时，后台将最新用户文本发送给 TypeSafe 官方 jev-latest 分类，可能产生费用。退出或旁路时停止分类，Codex 继续运行；分类结果不改变请求路由。</p>
+          {!dashboard.autoAvailable || !dashboard.keyPersistent ? <p className="jev-panel__hint">自动评估需要正式 macOS 构建和钥匙串中的 TypeSafe 官方 Key。</p> : !dashboard.keyConfigured ? <p className="jev-panel__hint">先设置 TypeSafe 官方 Key，再开启自动评估。其他提供方仅用于手动评估。</p> : null}
+          {dashboard.autoError ? <p className="jev-panel__error" role="alert">{errorMessage(dashboard.autoError)}</p> : null}
+        </section>
 
         {provider !== "typesafe" ? (
           <div className="jev-panel__connection">
@@ -517,7 +579,8 @@ export function JevPanel() {
               {catalogCanSync ? <button type="button" className="jev-panel__button jev-panel__button--quiet jev-panel__catalog-refresh" disabled={catalogStatus === "loading"} onClick={() => setCatalogRefresh((current) => current + 1)}>刷新模型目录</button> : null}
             </>
           ) : null}
-            <p className="jev-panel__hint">{protocol === "open_ai" ? "使用 Chat Completions 兼容协议" : "使用 Anthropic Messages 协议"}。{provider === "custom" ? "模型 ID 请以你的服务商控制台为准。" : "模型列表按当前提供方与协议筛选。"}</p>
+            <p className="jev-panel__hint">{provider === "opencode_jev" ? "使用原生 System One 协议" : protocol === "open_ai" ? "使用 Chat Completions 兼容协议" : "使用 Anthropic Messages 协议"}。{provider === "custom" ? "模型 ID 请以你的服务商控制台为准。" : "模型列表按当前提供方与协议筛选。"}</p>
+            {provider === "opencode_jev" ? <p className="jev-panel__hint">使用 OpenCode Console 的 API Key；请先在控制台启用所选 Jev 模型。原生接口返回分类与置信度。</p> : null}
             {provider === "opencode_go" ? <p className="jev-panel__hint">请使用 OpenCode Go 的 API Key，模型 ID 不加 opencode-go/ 前缀。Go 面向编码代理；这里仅手动发送单次分类请求，Responses-only 模型暂不支持。</p> : null}
           </div>
         ) : <p className="jev-panel__hint">TypeSafe 原生 System One 接口，模型 jev-latest。</p>}
@@ -525,7 +588,7 @@ export function JevPanel() {
         <div className="jev-panel__key-row">
           {keyConfigured ? <span className="jev-panel__hint">{provider === "typesafe" ? "TypeSafe 官方 Key" : `${provider === "custom" ? "自定义接口" : PROVIDERS[provider].label} Key`} 已连接，无需重复设置。</span> : (
             <>
-              <label htmlFor="jev-key">{provider === "typesafe" ? "TypeSafe Key" : provider === "opencode_go" ? "OpenCode Go API Key" : "提供方 API Key"}</label>
+              <label htmlFor="jev-key">{provider === "typesafe" ? "TypeSafe Key" : provider === "opencode_jev" ? "OpenCode Console API Key" : provider === "opencode_go" ? "OpenCode Go API Key" : "提供方 API Key"}</label>
               <input
                 id="jev-key"
                 type="password"
@@ -547,9 +610,9 @@ export function JevPanel() {
           ) : null}
         </div>
         <p className="jev-panel__hint">{dashboard.keyPersistent ? "TypeSafe 官方 Key 保存在 macOS 钥匙串，重启后自动恢复，点“断开”可删除；" : "此构建的 TypeSafe Key 只保留在当前运行期间，退出后需重新设置；"}其他提供方的 Key 仍只保留在本次运行期间。TypeSafe Key 不会用于其他提供方；切换自定义 URL 不会复用旧地址的 Key。本机无鉴权接口可留空。</p>
-        {provider !== "typesafe" ? <p className="jev-panel__hint">兼容模型生成的是 Jev 式 Choice，不是 TypeSafe Jev 原模型；不提供经校准的置信度。</p> : null}
+        {provider !== "typesafe" && provider !== "opencode_jev" ? <p className="jev-panel__hint">兼容模型生成的是 Jev 式 Choice，不是 TypeSafe Jev 原模型；不提供经校准的置信度。</p> : null}
 
-        <div className="jev-panel__metrics" aria-label="会话指标">
+        <div className="jev-panel__metrics" aria-label="最近 200 条指标">
           <div><span>请求数</span><strong>{formatNumber(records.length)}</strong></div>
           <div><span>问题数</span><strong>{formatNumber(records.length)}</strong></div>
           <div><span>成功率</span><strong>{successRate === null ? "暂无数据" : `${successRate.toFixed(1)}%`}</strong></div>
@@ -557,9 +620,10 @@ export function JevPanel() {
             <div><span>输入 token 总数</span><strong>{tokenRecords.length === 0 ? "暂无数据" : formatNumber(tokenSum)}</strong><small>{missingTokenCount > 0 ? `${missingTokenCount} 条缺少 token 数据` : "完整记录"}</small></div>
             <div><span>输出 token（已上报）</span><strong>{outputTokenRecords.length === 0 ? "暂无数据" : formatNumber(outputTokenSum)}</strong><small>{outputTokenRecords.length}/{records.length} 条有数据；未返回不计为 0</small></div>
           <div><span>质量</span><strong>NOT EVALUATED</strong><small>confidence != accuracy</small></div>
-          <div><span>成本</span><strong>未提供账单金额</strong></div>
+          <div><span>{provider === "typesafe" ? "TypeSafe 费用估值（USD）" : "成本"}</span><strong>{provider === "typesafe" ? formatEstimatedCost(estimatedCost) : "未提供账单金额"}</strong>{provider === "typesafe" ? <small>已计价 {pricedRecords.length}/{records.length} 条；其余用量或价格未知</small> : null}</div>
           <div><span>节省</span><strong>无基线</strong></div>
         </div>
+        {provider === "typesafe" ? <p className="jev-panel__hint">Jev 1.13 / 1.14 及当前 jev-latest、jev-preview 按 $0.042/百万输入 Token 估算，输出免费。仅统计已上报用量，未知版本不计价，未扣免费额度或折扣；实际金额以 TypeSafe 账单为准。分类本身没有压缩节省基线。</p> : null}
 
         <form className="jev-panel__evaluate" onSubmit={(event) => { event.preventDefault(); void evaluate(); }}>
           <div className="jev-panel__evaluate-heading">
@@ -587,10 +651,11 @@ export function JevPanel() {
             <div className="jev-panel__table-wrap">
               <table>
                 <caption className="jev-panel__sr-only">最近 20 条类型化决策记录</caption>
-                <thead><tr><th scope="col">时间</th><th scope="col">模型</th><th scope="col">状态</th><th scope="col">延迟</th><th scope="col">输入 token</th><th scope="col">输出 token</th><th scope="col">choice</th><th scope="col">confidence</th><th scope="col">错误</th></tr></thead>
+              <thead><tr><th scope="col">时间</th><th scope="col">来源</th><th scope="col">模型</th><th scope="col">状态</th><th scope="col">延迟</th><th scope="col">输入 token</th><th scope="col">输出 token</th><th scope="col">choice</th><th scope="col">confidence</th><th scope="col">错误</th></tr></thead>
                 <tbody>{records.slice(-RECENT_RECORDS).reverse().map((record) => (
                   <tr key={record.id}>
                     <td>{formatTimestamp(record.timestamp)}</td>
+                  <td>{record.source === "codex" ? "Codex 自动" : "手动"}</td>
                     <td>{record.model ?? "暂无"}</td>
                     <td><span className={`jev-panel__record-status jev-panel__record-status--${record.status}`}>{record.status === "success" ? "成功" : "失败"}</span></td>
                     <td>{formatMetric(record.latencyMs, " ms")}</td>

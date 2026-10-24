@@ -96,6 +96,7 @@ fn catalog_url(config: &AdapterConfig) -> Result<String, String> {
             Ok(format!("https://{host}/v1/models"))
         }
         JevProvider::TypeSafe
+        | JevProvider::OpenCodeJev
         | JevProvider::OpenAi
         | JevProvider::Custom
         | JevProvider::BigModel

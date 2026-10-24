@@ -70,6 +70,23 @@ optimization through `:6867`; a paused, closed, or crashed Headroom process
 leaves the router running in direct mode, so an already-running Codex session
 does not need its configuration rewritten.
 
+Pausing, quitting, or restarting sends new connections directly to the native
+provider before retiring the optimization backend. Existing connections keep
+their backend until they close, including persistent WebSocket sessions. On
+quit the window hides immediately while the old process finishes this work in
+the background; reopening cancels a pending quit. Pausing returns immediately,
+and resuming cancels its pending backend shutdown. A restart waits for these
+connections before relaunching. A request arriving at the retirement boundary
+may receive a retryable 503 and retry through the native route.
+
+Internal forced recovery still bounds its drain to 120 seconds. Force-quitting
+cannot preserve connections owned by the killed process.
+
+Compatible legacy router helpers remain alive across an app update rather than
+having their active sockets killed. New helpers release the listening port for
+the replacement while continuing to serve their existing connections on macOS
+and Linux. Windows installers still require the old helper to exit.
+
 ### Codex plugin boundary and controls
 
 Headroom's Codex integration is a provider/router connector, not a standard
@@ -93,6 +110,12 @@ keeps the capabilities it already resolved. See the [Codex plugin
 documentation](https://learn.chatgpt.com/docs/plugins), [MCP configuration
 documentation](https://learn.chatgpt.com/docs/extend/mcp), and [provider
 configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+
+MCP and Skills have separate sidebar pages for custom Codex MCP configuration,
+local skill discovery, and local-directory or public Git skill import. Existing
+managed package controls remain available in the corresponding page. See
+[MCP and Skills management](docs/mcp-skills-management.md) for supported scopes,
+import behavior, and when a client reload is needed.
 
 Anonymous headroom-ai telemetry, Sentry, Aptabase, account APIs, and the
 official updater are disabled in this edition.

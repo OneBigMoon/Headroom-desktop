@@ -1,35 +1,35 @@
 import { useI18n } from "../lib/i18n";
 import type { DashboardState } from "../lib/types";
+import { isHostCuratedAddon, workflowSwitchPeers } from "../lib/workflowCatalog";
 
 export type AddonPresetTarget = { enabled: boolean; mode?: string };
 
 export const RECOMMENDED_ADDON_PRESET: Record<string, AddonPresetTarget> = {
-  openspec: { enabled: false },
-  superpowers: { enabled: true },
+  openspec: { enabled: true },
   gstack: { enabled: false },
   "allinluna": { enabled: false },
   "ralph-loop": { enabled: false },
   "stop-that-shit": { enabled: true },
   "agent-guard": { enabled: true },
-  "codex-security": { enabled: false },
   serena: { enabled: true },
-  "codebase-memory": { enabled: true },
+  "codebase-memory": { enabled: false },
   context7: { enabled: true },
   ponytail: { enabled: true, mode: "full" },
   caveman: { enabled: false },
   rtk: { enabled: true },
   markitdown: { enabled: true },
-  "grill-me": { enabled: true },
+  "grill-me": { enabled: false },
 };
 
-function matchesPreset(dashboard: DashboardState): boolean {
+export function matchesRecommendedAddonPreset(dashboard: DashboardState): boolean {
   const matches = Object.entries(RECOMMENDED_ADDON_PRESET).every(([id, target]) => {
     const tool = dashboard.tools.find((candidate) => candidate.id === id);
     if (!tool) return false;
     if (target.enabled !== (tool.status !== "not_installed" && tool.enabled)) return false;
+    if (target.enabled && workflowSwitchPeers(dashboard.tools, id).length > 0) return false;
     return !target.mode || target.mode === tool.defaultMode;
   });
-  return matches && dashboard.tools.every((tool) => tool.required || RECOMMENDED_ADDON_PRESET[tool.id] || !tool.enabled);
+  return matches && dashboard.tools.every((tool) => tool.required || isHostCuratedAddon(tool.id) || RECOMMENDED_ADDON_PRESET[tool.id] || !tool.enabled);
 }
 
 /**
@@ -43,12 +43,16 @@ function matchesPreset(dashboard: DashboardState): boolean {
 export function listPresetDisables(
   dashboard: DashboardState
 ): Array<{ id: string; name: string }> {
+  const conflictingPeers = new Set(
+    Object.entries(RECOMMENDED_ADDON_PRESET)
+      .filter(([, target]) => target.enabled)
+      .flatMap(([id]) => workflowSwitchPeers(dashboard.tools, id).map((peer) => peer.id))
+  );
   return dashboard.tools
     .filter((tool) => {
       const target = RECOMMENDED_ADDON_PRESET[tool.id];
       return (
-        target !== undefined &&
-        !target.enabled &&
+        (target?.enabled === false || conflictingPeers.has(tool.id)) &&
         tool.enabled &&
         tool.status !== "not_installed"
       );
@@ -70,7 +74,7 @@ export function AddonPresetBar({
   onSelectCustom: () => void;
 }) {
   const { t } = useI18n();
-  const recommended = matchesPreset(dashboard);
+  const recommended = matchesRecommendedAddonPreset(dashboard);
   return (
     <div className="addon-preset-bar" role="group" aria-label={t("aria.addonPresets")}>
       <button

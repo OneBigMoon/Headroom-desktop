@@ -3274,6 +3274,12 @@ impl AppState {
         match started {
             Ok(child) => {
                 *self.headroom_process.lock() = Some(child);
+                if !crate::SHUTTING_DOWN.load(std::sync::atomic::Ordering::Acquire)
+                    && !crate::EXIT_TEARDOWN_STARTED.load(std::sync::atomic::Ordering::Acquire)
+                    && !self.runtime_is_paused()
+                {
+                    crate::proxy_intercept::resume_codex_requests();
+                }
                 *self.last_startup_error.lock() = None;
                 // Fresh child: a death recorded for its predecessor is no
                 // longer diagnostic of the current episode.
@@ -3456,6 +3462,7 @@ impl AppState {
 
     pub fn resume_runtime(&self) -> Result<()> {
         self.set_runtime_paused(false);
+        crate::proxy_intercept::resume_codex_requests();
         // Any successful resume clears the auto-pause flag so the self-heal
         // loop stops retrying and the banner drops the "stopped unexpectedly"
         // framing.
@@ -3494,11 +3501,18 @@ impl AppState {
     }
 
     pub fn stop_headroom(&self) {
+        self.stop_headroom_if(false);
+    }
+
+    pub fn stop_headroom_if_paused(&self) {
+        self.stop_headroom_if(true);
+    }
+
+    fn stop_headroom_if(&self, only_if_paused: bool) {
         // The detached Codex router is the stable endpoint for already-running
         // Codex sessions.  Put it on its native/direct path before stopping
         // 6867 so a backend restart, pricing gate, watchdog rescue, or quit
         // cannot leave a live heartbeat relaying into a dead intercept.
-        crate::codex_router::stop_heartbeat();
         // `ensure_headroom_running` holds this lock across a blocking backend
         // start, so a launch racing this stop can hold it for the length of that
         // spawn. Quit must not wait on it: `restart_app` calls us before it can
@@ -3518,6 +3532,10 @@ impl AppState {
                 );
                 None
             });
+        if only_if_paused && (_lifecycle_guard.is_none() || !self.runtime_is_paused()) {
+            return;
+        }
+        crate::codex_router::stop_heartbeat();
         // Every app-initiated stop is a down window we caused: a watchdog
         // restart, a pricing-gate pause, a port rebind, quit. The down->up
         // transition that follows is not an outage worth paging, and when the
@@ -3530,6 +3548,7 @@ impl AppState {
         crate::proxy_intercept::suppress_codex_reconnect_reports_for(
             std::time::Duration::from_secs(300),
         );
+        crate::proxy_intercept::drain_codex_requests();
         self.set_runtime_starting(false);
         let mut process = self.headroom_process.lock();
 

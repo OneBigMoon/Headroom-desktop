@@ -1062,6 +1062,137 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-local-community-proxy":
     except Exception:
         pass
 
+    # Jev auto observer: semantic HTTP/WS payloads, never the transport bytes.
+    try:
+        if (_hd_os.environ.get("HEADROOM_JEV_EXECUTABLE")
+                and _hd_os.environ.get("HEADROOM_JEV_CONFIG")):
+            import collections as _hd_ja_collections
+            import hashlib as _hd_ja_hashlib
+            import json as _hd_ja_json
+            import queue as _hd_ja_queue_module
+            import subprocess as _hd_ja_subprocess
+            import threading as _hd_ja_threading
+            import headroom.proxy.handlers.openai as _hd_ja_openai
+
+            _hd_ja_executable = _hd_os.environ["HEADROOM_JEV_EXECUTABLE"]
+            _hd_ja_config = _hd_os.environ["HEADROOM_JEV_CONFIG"]
+            _hd_ja_queue = _hd_ja_queue_module.Queue(maxsize=8)
+            _hd_ja_recent = _hd_ja_collections.OrderedDict()
+            _hd_ja_lock = _hd_ja_threading.Lock()
+            _hd_ja_worker_thread = None
+
+            def _hd_ja_enabled():
+                try:
+                    with open(_hd_ja_config, encoding="utf-8") as config_file:
+                        config = _hd_ja_json.load(config_file)
+                    return isinstance(config, dict) and config.get("jevAutoEnabled") is True
+                except Exception:
+                    return False
+
+            def _hd_ja_job(payload, kwargs, handler_id):
+                if not isinstance(payload, dict) or not isinstance(payload.get("input"), list):
+                    return None
+                for index in range(len(payload["input"]) - 1, -1, -1):
+                    message = payload["input"][index]
+                    if not isinstance(message, dict) or message.get("role") != "user":
+                        continue
+                    if message.get("type", "message") != "message":
+                        return None
+                    content = message.get("content")
+                    if isinstance(content, str):
+                        text = content
+                    elif isinstance(content, list):
+                        text = "\n".join(
+                            part["text"] for part in content
+                            if isinstance(part, dict)
+                            and part.get("type") in ("text", "input_text")
+                            and isinstance(part.get("text"), str)
+                        )
+                    else:
+                        return None
+                    if not text.strip() or len(text.encode("utf-8")) > 16 * 1024:
+                        return None
+
+                    scope = payload.get("prompt_cache_key")
+                    if not isinstance(scope, str) or not scope:
+                        for source in (payload, payload.get("metadata"), kwargs.get("savings_tags")):
+                            if not isinstance(source, dict):
+                                continue
+                            scope = next((source[name] for name in
+                                          ("session_id", "thread_id", "conversation_id")
+                                          if isinstance(source.get(name), str) and source[name]), None)
+                            if scope:
+                                break
+                    if not scope:
+                        scope = kwargs.get("request_id") or str(handler_id)
+                    identity = [scope, message.get("id") or index, text]
+                    dedup_key = _hd_ja_hashlib.sha256(
+                        _hd_ja_json.dumps(identity, ensure_ascii=False).encode("utf-8")
+                    ).hexdigest()
+                    return {"text": text, "dedupKey": dedup_key}
+                return None
+
+            def _hd_ja_worker():
+                while True:
+                    job = _hd_ja_queue.get()
+                    try:
+                        if _hd_ja_enabled():
+                            _hd_ja_subprocess.run(
+                                [_hd_ja_executable, "--jev-auto-classify"],
+                                input=_hd_ja_json.dumps(job, ensure_ascii=False),
+                                encoding="utf-8",
+                                stdout=_hd_ja_subprocess.DEVNULL,
+                                stderr=_hd_ja_subprocess.DEVNULL,
+                                timeout=18,
+                                check=False,
+                                creationflags=getattr(_hd_ja_subprocess, "CREATE_NO_WINDOW", 0),
+                            )
+                    except Exception:
+                        pass
+                    finally:
+                        _hd_ja_queue.task_done()
+
+            def _hd_ja_submit(job):
+                global _hd_ja_worker_thread
+                with _hd_ja_lock:
+                    key = job["dedupKey"]
+                    if key in _hd_ja_recent:
+                        _hd_ja_recent.move_to_end(key)
+                        return
+                    if _hd_ja_worker_thread is None or not _hd_ja_worker_thread.is_alive():
+                        _hd_ja_worker_thread = _hd_ja_threading.Thread(
+                            target=_hd_ja_worker, name="headroom-jev-auto", daemon=True
+                        )
+                        _hd_ja_worker_thread.start()
+                    try:
+                        _hd_ja_queue.put_nowait(job)
+                    except _hd_ja_queue_module.Full:
+                        return
+                    _hd_ja_recent[key] = None
+                    if len(_hd_ja_recent) > 256:
+                        _hd_ja_recent.popitem(last=False)
+
+            _hd_ja_original = (
+                _hd_ja_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor
+            )
+
+            async def _hd_ja_compress(self, payload, **kwargs):
+                try:
+                    if kwargs.get("client") == "codex" and _hd_ja_enabled():
+                        job = _hd_ja_job(payload, kwargs, id(self))
+                        if job is not None:
+                            _hd_ja_submit(job)
+                except Exception:
+                    pass
+                return await _hd_ja_original(self, payload, **kwargs)
+
+            _hd_ja_openai.OpenAIHandlerMixin._compress_openai_responses_payload_in_executor = (
+                _hd_ja_compress
+            )
+    except Exception:
+        pass
+    # End Jev auto observer.
+
     # cc-switch reconciler self-URL guard (remove once a wheel ships it).
     # See the module docstring for the failure mode this breaks.
     try:
@@ -1156,6 +1287,21 @@ if _hd_os.environ.get("HEADROOM_SDK") == "headroom-local-community-proxy":
     except Exception:
         pass
 "#;
+
+fn configure_jev_auto_observer_env(
+    command: &mut Command,
+    executable: Option<&Path>,
+    config: &Path,
+) {
+    command
+        .env_remove("HEADROOM_JEV_EXECUTABLE")
+        .env_remove("HEADROOM_JEV_CONFIG");
+    if let Some(executable) = executable {
+        command
+            .env("HEADROOM_JEV_EXECUTABLE", executable)
+            .env("HEADROOM_JEV_CONFIG", config);
+    }
+}
 
 /// Pre-upstream concurrency passed to the backend: 2x logical cores,
 /// clamped to [8, 64]. See the spawn-site comment for why the proxy's own
@@ -3746,6 +3892,11 @@ impl ToolManager {
                 command.current_dir(&self.runtime.root_dir);
                 crate::edition::apply_runtime_env(&mut command);
                 apply_httpx_compatible_proxy_env(&mut command);
+                configure_jev_auto_observer_env(
+                    &mut command,
+                    std::env::current_exe().ok().as_deref(),
+                    &crate::client_adapters::setup_state_path(),
+                );
                 #[cfg(unix)]
                 {
                     use std::os::unix::process::CommandExt;
@@ -6905,6 +7056,7 @@ impl ToolManager {
     }
 
     fn install_headroom_mcp(&self) -> Result<McpInstallMethod> {
+        let _config_lock = crate::extension_config::lock_codex_config();
         let entrypoint = self.headroom_entrypoint();
         if !crate::edition::LOCAL_COMMUNITY {
             let entrypoint_arg = entrypoint.to_string_lossy().into_owned();
@@ -8290,6 +8442,7 @@ impl ToolManager {
             .root_dir
             .join(format!("serena-venv.backup-{}", uuid::Uuid::new_v4()));
         let had_old = final_venv.exists();
+        let enabled = self.tool_enabled("serena");
         if had_old {
             std::fs::rename(&final_venv, &backup).context("staging existing Serena venv")?;
         }
@@ -8299,9 +8452,12 @@ impl ToolManager {
             // baked that path into every launcher; re-home them now that the
             // directory has its real name or nothing in the venv can start.
             rehome_venv_launchers(&final_venv)?;
-            self.register_serena_mcp()?;
-            set_serena_global_gitignore(true);
-            let enabled = self.tool_enabled("serena");
+            if enabled {
+                self.register_serena_mcp()?;
+                set_serena_global_gitignore(true);
+            } else {
+                self.unregister_serena_mcp()?;
+            }
             self.write_tool_receipt("serena", json!({ "version": version, "enabled": enabled }))?;
             Ok(())
         }();
@@ -8318,7 +8474,7 @@ impl ToolManager {
                 if let Err(restore_err) = std::fs::rename(&backup, &final_venv) {
                     recovery.push(format!("failed to restore Serena venv: {restore_err}"));
                 } else {
-                    let mcp_result = if self.tool_enabled("serena") {
+                    let mcp_result = if enabled {
                         self.register_serena_mcp()
                     } else {
                         self.unregister_serena_mcp()
@@ -8475,17 +8631,25 @@ impl ToolManager {
             "context7 failed its smoke test (npx download or startup). Context7 needs Node.js 20.18.1 or newer",
         )?;
         let previous = self.read_tool_receipt("context7");
-        self.register_context7_mcp(&version)?;
         let enabled = self.tool_enabled("context7");
+        if enabled {
+            self.register_context7_mcp(&version)?;
+        } else {
+            self.unregister_context7_mcp()?;
+        }
         if let Err(err) = self.write_tool_receipt(
             "context7",
             json!({ "version": version, "enabled": enabled }),
         ) {
-            let restore = previous
-                .as_ref()
-                .and_then(|r| r.get("version").and_then(Value::as_str))
-                .map(|old| self.register_context7_mcp(old))
-                .unwrap_or_else(|| self.unregister_context7_mcp());
+            let restore = if enabled {
+                previous
+                    .as_ref()
+                    .and_then(|r| r.get("version").and_then(Value::as_str))
+                    .map(|old| self.register_context7_mcp(old))
+                    .unwrap_or_else(|| self.unregister_context7_mcp())
+            } else {
+                self.unregister_context7_mcp()
+            };
             if let Err(restore_err) = restore {
                 return Err(err.context(format!(
                     "writing Context7 receipt failed; restoring previous MCP registration also failed: {restore_err}"
@@ -8955,6 +9119,7 @@ impl ToolManager {
     }
 
     fn run_mcp_helper(&self, args: &[&str]) -> Result<()> {
+        let _config_lock = crate::extension_config::lock_codex_config();
         // ClaudeRegistrar may shell out to the `claude` CLI, which can take a
         // few seconds per agent; 60s covers both registrars comfortably.
         let result = run_command_with_timeout(
@@ -9091,6 +9256,7 @@ impl ToolManager {
         host: PluginHost,
         args: &[&str],
     ) -> Result<()> {
+        let _config_lock = crate::extension_config::lock_codex_config();
         if !matches!(host, PluginHost::Codex) {
             bail!("managed addon CLI execution is Codex-only");
         }
@@ -11726,6 +11892,7 @@ fn render_codex_plugin_enabled(
 /// and verify after the rename; a changed file is merged and retried rather
 /// than blindly overwriting a concurrent user update.
 fn set_codex_plugin_enabled(plugin: &PluginAddon, enabled: bool) -> Result<()> {
+    let _config_lock = crate::extension_config::lock_codex_config();
     const MAX_ATTEMPTS: usize = 3;
     let path = crate::client_adapters::codex_home().join("config.toml");
     for attempt in 0..MAX_ATTEMPTS {
@@ -15930,6 +16097,66 @@ No actionable patterns found.
     }
 
     #[test]
+    fn jev_auto_observer_env_uses_app_paths_and_preserves_data_dir() {
+        let mut command = std::process::Command::new("python");
+        command.env("HEADROOM_DATA_DIR", "isolated-test-data");
+        let executable = Path::new("test app/executable");
+        let config = Path::new("test data/client-setup.json");
+        super::configure_jev_auto_observer_env(&mut command, Some(executable), config);
+        let env: std::collections::HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("HEADROOM_JEV_EXECUTABLE")),
+            Some(&Some(executable.as_os_str()))
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("HEADROOM_JEV_CONFIG")),
+            Some(&Some(config.as_os_str()))
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("HEADROOM_DATA_DIR")),
+            Some(&Some(std::ffi::OsStr::new("isolated-test-data")))
+        );
+    }
+
+    #[test]
+    fn jev_auto_observer_env_disables_inherited_observer_when_executable_is_missing() {
+        let mut command = std::process::Command::new("python");
+        command
+            .env("HEADROOM_JEV_EXECUTABLE", "stale-executable")
+            .env("HEADROOM_JEV_CONFIG", "stale-config");
+        super::configure_jev_auto_observer_env(
+            &mut command,
+            None,
+            Path::new("test data/client-setup.json"),
+        );
+        let env: std::collections::HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("HEADROOM_JEV_EXECUTABLE")),
+            Some(&None)
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("HEADROOM_JEV_CONFIG")),
+            Some(&None)
+        );
+    }
+
+    #[test]
+    fn sitecustomize_jev_auto_observer_preserves_inference() {
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/test_jev_auto_hook.py");
+        let python = if cfg!(windows) { "python" } else { "python3" };
+        let output = crate::proc::command(python)
+            .arg(script)
+            .output()
+            .expect("run Jev observer regression tests");
+        assert!(
+            output.status.success(),
+            "Jev observer regression tests failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
     fn sitecustomize_restores_codex_additional_tools_when_compression_raises() {
         let py = super::SITECUSTOMIZE_PY;
         let guard = &py[py
@@ -19441,6 +19668,72 @@ after
                 "{tool} entry conflicts with user-managed configuration"
             )));
             assert!(helper.contains("elif result.status == RegisterStatus.MISMATCH:"));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn mcp_addon_updates_and_rollback_preserve_enabled_state() {
+        for id in ["serena", "context7"] {
+            for enabled in [false, true] {
+                for fail_receipt in [false, true] {
+                    let (root, runtime, manager) = seed_test_runtime("mcp-update-enabled");
+                    let _home = HomeGuard::new(&root);
+                    let receipt = runtime.tools_dir.join(format!("{id}.json"));
+                    fs::write(
+                        &receipt,
+                        serde_json::to_vec(&serde_json::json!({
+                            "version": "1.0.0", "enabled": enabled
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                    let calls = root.join("mcp-calls");
+                    let sabotage = if fail_receipt {
+                        format!(
+                            "if [ -f '{0}' ]; then mv '{0}' '{0}.saved'; mkdir '{0}'; fi\n",
+                            receipt.display()
+                        )
+                    } else {
+                        String::new()
+                    };
+                    write_executable(
+                        &runtime.managed_python(),
+                        &format!(
+                            "#!/bin/sh\nprintf '%s\\n' \"$3\" >> '{}'\n{sabotage}exit 0\n",
+                            calls.display(),
+                            sabotage = sabotage
+                        ),
+                    );
+                    write_cli_shim(&root.join(".local/bin"), "npx", "#!/bin/sh\nexit 0\n", "");
+                    write_executable(
+                        &runtime.standalone_python(),
+                        &format!(
+                            "#!/bin/sh\nmkdir -p \"$4/bin\"\nprintf '#!/bin/sh\\nexit 0\\n' > \"$4/bin/{0}\"\ncp \"$4/bin/{0}\" \"$4/bin/serena\"\nchmod +x \"$4/bin/{0}\" \"$4/bin/serena\"\n",
+                            super::python_exe_name()
+                        ),
+                    );
+                    write_executable(&manager.serena_entrypoint(), "#!/bin/sh\nexit 0\n");
+                    let result = if id == "serena" {
+                        manager.install_serena_version(Some("1.7.0"))
+                    } else {
+                        manager.install_context7_version(Some("4.1.1"))
+                    };
+                    assert_eq!(result.is_err(), fail_receipt, "{id}: {result:?}");
+                    let calls = fs::read_to_string(&calls).expect("MCP helper called");
+                    let action = if enabled { "register" } else { "unregister" };
+                    assert_eq!(
+                        calls.lines().collect::<Vec<_>>(),
+                        vec![action; if fail_receipt { 2 } else { 1 }],
+                        "{id}: enabled={enabled}, rollback={fail_receipt}"
+                    );
+                    if !fail_receipt {
+                        assert_eq!(manager.tool_enabled(id), enabled);
+                    }
+                    fs::remove_dir_all(&root).unwrap();
+                }
+            }
         }
     }
 

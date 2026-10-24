@@ -9,6 +9,7 @@ mod codex_router;
 mod system_one_adapter;
 mod device;
 mod edition;
+mod extension_config;
 mod insights;
 pub mod instruction_governance;
 mod jev;
@@ -16,6 +17,7 @@ mod jev_catalog;
 mod keychain;
 mod logging;
 mod memory_scrubber;
+mod mcp_manager;
 mod model_pricing;
 mod models;
 mod output_savings;
@@ -25,6 +27,7 @@ mod proc;
 mod proxy_intercept;
 mod savings_canary;
 mod state;
+mod skill_manager;
 mod storage;
 mod tool_manager;
 mod usage_counters;
@@ -115,6 +118,7 @@ type InstallPendingUpdateFuture<'a> = Pin<Box<dyn Future<Output = Result<(), Str
 enum QuitSource {
     SettingsButton,
     TrayMenu,
+    NativeQuit,
 }
 
 impl QuitSource {
@@ -122,6 +126,7 @@ impl QuitSource {
         match self {
             Self::SettingsButton => "settings_button",
             Self::TrayMenu => "tray_menu",
+            Self::NativeQuit => "native_quit",
         }
     }
 }
@@ -255,6 +260,9 @@ static PORT_CONFLICT_CAPTURED: AtomicBool = AtomicBool::new(false);
 // second cleanup call can otherwise overwrite the remembered snapshots while
 // the first one is still restoring client routes.
 static EXIT_CLEAR_DONE: AtomicBool = AtomicBool::new(false);
+static EXIT_TEARDOWN_STARTED: AtomicBool = AtomicBool::new(false);
+static EXIT_TEARDOWN_COMPLETE: AtomicBool = AtomicBool::new(false);
+static EXIT_RETIRING: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
 
 // Presence means the previous desktop process did not reach a normal exit
 // path. A fresh launch uses this marker to restore client routes away from
@@ -841,6 +849,8 @@ async fn check_for_app_update(
             // main executable; the authenticated request never targets an
             // unrelated process occupying 6891.
             codex_router::stop_heartbeat();
+            proxy_intercept::begin_codex_retirement();
+            proxy_intercept::retire_codex_requests();
             #[cfg(target_os = "windows")]
             if let Err(err) = codex_router::shutdown_and_wait() {
                 // An unverified listener is never killed. The installer will
@@ -962,6 +972,13 @@ async fn restart_app(app: AppHandle) {
     log::info!("restart_app: tearing down for relaunch");
     SHUTTING_DOWN.store(true, Ordering::Release);
 
+    codex_router::stop_heartbeat();
+    proxy_intercept::begin_codex_retirement();
+    for window in app.webview_windows().values() {
+        let _ = window.hide();
+    }
+    proxy_intercept::retire_codex_requests();
+
     // Tauri 2.x has an open bug on macOS (tauri-apps/tauri#13923, #11392)
     // where `request_restart()` and `restart()` exit the process but never
     // relaunch — especially with `tauri-plugin-single-instance` loaded.
@@ -1029,6 +1046,7 @@ async fn restart_app(app: AppHandle) {
         finish_runtime_session();
     }
     analytics::shutdown(&app);
+    EXIT_TEARDOWN_COMPLETE.store(true, Ordering::Release);
 
     // macOS hands the relaunch to the detached relauncher above, so it exits
     // rather than request_restart(): letting tauri spawn the new process too
@@ -4628,7 +4646,13 @@ async fn pause_headroom(app: AppHandle) -> Result<(), String> {
         activate_codex_router_if_runtime_ready(&state);
         return Err(command_error(err));
     }
-    state.stop_headroom();
+    proxy_intercept::begin_codex_retirement();
+    let retiring_app = app.clone();
+    std::thread::spawn(move || {
+        if proxy_intercept::retire_codex_requests() {
+            retiring_app.state::<AppState>().stop_headroom_if_paused();
+        }
+    });
     analytics::track_event(&app, "runtime_paused", None);
     Ok(())
 }
@@ -4892,6 +4916,7 @@ async fn uninstall_and_quit(app: AppHandle) -> Result<Vec<String>, String> {
     // process exits, so the confirmation toast can render.
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(300));
+        EXIT_TEARDOWN_COMPLETE.store(true, Ordering::Release);
         handle.exit(0);
     });
 
@@ -4945,6 +4970,24 @@ fn handle_uninstall_flag() {
 }
 
 fn exit_headroom(app: &AppHandle, source: QuitSource) {
+    if EXIT_TEARDOWN_STARTED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let retirement = Arc::new(AtomicBool::new(true));
+    *EXIT_RETIRING.lock() = Some(retirement.clone());
+    codex_router::stop_heartbeat();
+    proxy_intercept::begin_codex_retirement();
+    for window in app.webview_windows().values() {
+        let _ = window.hide();
+    }
+    let app = app.clone();
+    std::thread::spawn(move || finish_exit_headroom(&app, source, retirement));
+}
+
+fn finish_exit_headroom(app: &AppHandle, source: QuitSource, retirement: Arc<AtomicBool>) {
+    if !proxy_intercept::retire_codex_requests() || !retirement.swap(false, Ordering::AcqRel) {
+        return;
+    }
     SHUTTING_DOWN.store(true, Ordering::Release);
     let runtime_paused = {
         let state: tauri::State<'_, AppState> = app.state();
@@ -4956,9 +4999,7 @@ fn exit_headroom(app: &AppHandle, source: QuitSource) {
         if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
             let _ = client_adapters::clear_client_setups_preserving_codex();
         }
-        // The router is already in Direct mode before stopping 6867, so an
-        // in-flight Codex request cannot be sent to a backend that has gone
-        // away. Other clients were restored by the preserving cleanup above.
+        // New requests go Direct while existing backend streams drain.
         state.stop_headroom();
         runtime_paused
     };
@@ -4972,8 +5013,22 @@ fn exit_headroom(app: &AppHandle, source: QuitSource) {
     if let Some(client) = sentry::Hub::current().client() {
         client.flush(Some(std::time::Duration::from_secs(2)));
     }
+    client_adapters::retag_codex_threads_to_native();
     finish_runtime_session();
+    EXIT_TEARDOWN_COMPLETE.store(true, Ordering::Release);
     app.exit(0);
+}
+
+fn cancel_pending_exit(app: &AppHandle) {
+    let retirement = EXIT_RETIRING.lock().clone();
+    if retirement.is_some_and(|retirement| retirement.swap(false, Ordering::AcqRel)) {
+        EXIT_TEARDOWN_STARTED.store(false, Ordering::Release);
+        let state = app.state::<AppState>();
+        if !state.runtime_is_paused() {
+            proxy_intercept::resume_codex_requests();
+            activate_codex_router_if_runtime_ready(&state);
+        }
+    }
 }
 
 fn app_quit_requested_properties(source: QuitSource, runtime_paused: bool) -> Value {
@@ -4989,6 +5044,8 @@ fn app_quit_requested_properties(source: QuitSource, runtime_paused: bool) -> Va
 /// failed probe leaves the router Direct, which is the safe state for Codex.
 fn activate_codex_router_if_runtime_ready(state: &AppState) {
     if SHUTTING_DOWN.load(Ordering::Acquire)
+        || EXIT_TEARDOWN_STARTED.load(Ordering::Acquire)
+        || proxy_intercept::codex_requests_draining()
         || state.runtime_is_paused()
         || !state.runtime_ready()
         || !client_adapters::is_codex_enabled()
@@ -5097,6 +5154,9 @@ fn restore_clients_when_runtime_ready(app: AppHandle) {
 }
 
 pub fn run() {
+    if jev::run_auto_classification_if_requested() {
+        return;
+    }
     #[cfg(not(feature = "local-community"))]
     let _sentry = sentry::init((
         SENTRY_DSN.unwrap_or(""),
@@ -5200,6 +5260,7 @@ pub fn run() {
 
     let builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_deep_link::init());
 
@@ -5542,7 +5603,20 @@ pub fn run() {
         .manage(jev::JevState::default())
         .manage(PendingAppUpdate(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
+            mcp_manager::list_mcp_servers,
+            mcp_manager::save_mcp_server,
+            mcp_manager::set_mcp_server_enabled,
+            mcp_manager::delete_mcp_server,
+            mcp_manager::import_mcp_servers,
+            skill_manager::list_skills,
+            skill_manager::scan_skill_source,
+            skill_manager::scan_git_skills,
+            skill_manager::read_skill,
+            skill_manager::import_skill,
+            skill_manager::import_git_skill,
+            skill_manager::set_skill_enabled,
             jev::get_jev_dashboard,
+            jev::set_jev_auto_enabled,
             jev::get_jev_models,
             jev::set_jev_key,
             jev::set_adapter_key,
@@ -5628,42 +5702,24 @@ pub fn run() {
                 let _ = show_user_window(app);
             }
 
-            // Tear down the proxy on every exit path (Cmd-Q, dock quit, signal,
-            // or our explicit quit/restart commands). Without this, the proxy
-            // outlives the desktop and the next launch reuses an orphan.
-            if matches!(
-                event,
-                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
-            ) {
-                SHUTTING_DOWN.store(true, Ordering::Release);
-                codex_router::stop_heartbeat();
-                // Step markers: this teardown runs on the UI thread, so a step
-                // that blocks freezes the app mid-quit and emits nothing (Sentry
-                // only receives warn!/error!). The last marker in the log names
-                // the step that hung.
-                let state: tauri::State<'_, AppState> = app.state();
-                // Gracefully reverse non-Codex routes on quit. Codex keeps its
-                // stable 6891 provider block; the detached router is already in
-                // Direct mode, and the other clients are snapshotted for the
-                // next launch. Guarded to run once because Tauri emits both
-                // ExitRequested and Exit.
-                if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
-                    log::info!("exit: clear_client_setups");
-                    if let Err(err) = client_adapters::clear_client_setups_preserving_codex() {
-                        log::warn!("exit: clear_client_setups failed: {err}");
+            match event {
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    if !EXIT_TEARDOWN_COMPLETE.load(Ordering::Acquire) {
+                        api.prevent_exit();
+                        exit_headroom(app, QuitSource::NativeQuit);
                     }
                 }
-                log::info!("exit: stop_headroom");
-                state.stop_headroom();
-                // Hand Codex threads back to the native provider so its history
-                // menu stays whole while Headroom is not running. Cmd-Q / dock
-                // quit / signals skip exit_headroom -> clear_client_setups, so
-                // this is the only retag they get; the next launch re-applies the
-                // headroom tag via restore_client_setups. Best-effort.
-                log::info!("exit: retag_codex_threads_to_native");
-                client_adapters::retag_codex_threads_to_native();
-                finish_runtime_session();
-                log::info!("exit: teardown complete");
+                tauri::RunEvent::Exit if !EXIT_TEARDOWN_COMPLETE.load(Ordering::Acquire) => {
+                    SHUTTING_DOWN.store(true, Ordering::Release);
+                    codex_router::stop_heartbeat();
+                    if !EXIT_CLEAR_DONE.swap(true, Ordering::AcqRel) {
+                        let _ = client_adapters::clear_client_setups_preserving_codex();
+                    }
+                    app.state::<AppState>().stop_headroom();
+                    client_adapters::retag_codex_threads_to_native();
+                    finish_runtime_session();
+                }
+                _ => {}
             }
         });
 }
@@ -6226,14 +6282,10 @@ fn stream_headroom_learn_output(
     })
 }
 
-/// Headroom 0.35.0 invokes the Codex analyzer as `codex exec` while the
-/// desktop deliberately runs Learn from its app-owned runtime directory.
-/// Current Codex releases reject that non-repository working directory unless
-/// `--skip-git-repo-check` is present. Learn must also be isolated from the
-/// user's model effort, rules, plugins, and MCP servers: those can turn this
-/// one-shot analyzer into a five-minute timeout. Keep the workaround in a tiny
-/// PATH wrapper so it affects only the Learn subprocess, never the user's
-/// normal Codex CLI or configuration.
+/// Only add the repository-check flag for older Headroom analyzers that omit it.
+/// Isolate Learn from user effort, rules, plugins and MCP servers, which can
+/// turn this one-shot analyzer into a five-minute timeout. This PATH wrapper
+/// affects only Learn, never the user's normal Codex CLI or configuration.
 fn write_codex_learn_wrapper(wrapper_dir: &Path) -> Result<std::path::PathBuf, String> {
     std::fs::create_dir_all(wrapper_dir)
         .map_err(|err| format!("Could not create Codex Learn wrapper directory: {err}"))?;
@@ -6242,9 +6294,11 @@ fn write_codex_learn_wrapper(wrapper_dir: &Path) -> Result<std::path::PathBuf, S
     let (wrapper_path, contents) = (
         wrapper_dir.join("codex.cmd"),
         "@echo off\r\n\
+setlocal\r\n\
+set \"HEADROOM_SKIP_GIT_CHECK=--skip-git-repo-check\"\r\n\
+for %%A in (%*) do if \"%%~A\"==\"--skip-git-repo-check\" set \"HEADROOM_SKIP_GIT_CHECK=\"\r\n\
 if /I \"%~1\"==\"exec\" (\r\n\
-  shift\r\n\
-  \"%HEADROOM_REAL_CODEX%\" exec --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules -c \"model_reasoning_effort='low'\" %*\r\n\
+  \"%HEADROOM_REAL_CODEX%\" %* %HEADROOM_SKIP_GIT_CHECK% --ephemeral --ignore-user-config --ignore-rules -c \"model_reasoning_effort='low'\"\r\n\
 ) else (\r\n\
   \"%HEADROOM_REAL_CODEX%\" %*\r\n\
 )\r\n",
@@ -6256,7 +6310,11 @@ if /I \"%~1\"==\"exec\" (\r\n\
         "#!/bin/sh\n\
 if [ \"$1\" = \"exec\" ]; then\n\
   shift\n\
-  exec \"$HEADROOM_REAL_CODEX\" exec --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules -c \"model_reasoning_effort='low'\" \"$@\"\n\
+  skip_git_check=--skip-git-repo-check\n\
+  for arg do\n\
+    if [ \"$arg\" = \"--skip-git-repo-check\" ]; then skip_git_check=; break; fi\n\
+  done\n\
+  exec \"$HEADROOM_REAL_CODEX\" exec --ephemeral --ignore-user-config --ignore-rules -c \"model_reasoning_effort='low'\" ${skip_git_check:+\"$skip_git_check\"} \"$@\"\n\
 fi\n\
 exec \"$HEADROOM_REAL_CODEX\" \"$@\"\n",
     );
@@ -8084,6 +8142,7 @@ fn show_user_window(app: &AppHandle) -> tauri::Result<()> {
 }
 
 fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result<()> {
+    cancel_pending_exit(app);
     let Some(window) = app.get_webview_window("main") else {
         return Err(tauri::Error::WebviewNotFound);
     };
@@ -8105,6 +8164,7 @@ fn show_main_window(app: &AppHandle, anchor_rect: Option<Rect>) -> tauri::Result
 }
 
 fn show_launcher_window(app: &AppHandle) -> tauri::Result<()> {
+    cancel_pending_exit(app);
     let Some(window) = app.get_webview_window("launcher") else {
         return Err(tauri::Error::WebviewNotFound);
     };
@@ -10868,16 +10928,21 @@ Some unrelated content.
         let wrapper_dir = tempfile::tempdir().expect("wrapper tempdir");
         let wrapper = super::write_codex_learn_wrapper(wrapper_dir.path()).expect("wrapper");
 
-        let exec_output = crate::proc::command(&wrapper)
-            .args(["exec", "--help"])
-            .env("HEADROOM_REAL_CODEX", "/bin/echo")
-            .output()
-            .expect("run exec wrapper");
-        assert!(exec_output.status.success());
-        assert_eq!(
-            String::from_utf8_lossy(&exec_output.stdout).trim(),
-            "exec --skip-git-repo-check --ephemeral --ignore-user-config --ignore-rules -c model_reasoning_effort='low' --help"
-        );
+        for args in [
+            vec!["exec", "--help"],
+            vec!["exec", "--skip-git-repo-check", "--help"],
+        ] {
+            let exec_output = crate::proc::command(&wrapper)
+                .args(args)
+                .env("HEADROOM_REAL_CODEX", "/bin/echo")
+                .output()
+                .expect("run exec wrapper");
+            assert!(exec_output.status.success());
+            assert_eq!(
+                String::from_utf8_lossy(&exec_output.stdout).trim(),
+                "exec --ephemeral --ignore-user-config --ignore-rules -c model_reasoning_effort='low' --skip-git-repo-check --help"
+            );
+        }
 
         let passthrough = crate::proc::command(&wrapper)
             .arg("login")

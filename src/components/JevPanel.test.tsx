@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { JevPanel, type JevRecord } from "./JevPanel";
 
@@ -15,12 +15,15 @@ const record: JevRecord = {
 const dashboard = {
   keyConfigured: false,
   keyPersistent: true,
+  autoEnabled: false,
+  autoAvailable: true,
+  autoError: null,
   configuredTargets: [{ provider: "deepseek", protocol: "open_ai", url: deepseekUrl }],
   busy: false,
   records: [record],
 };
 
-const providerTriggerName = /TypeSafe Jev|自定义模型|DeepSeek|火山引擎|MiniMax|BigModel|阿里云百炼|Xiaomi MiMo|硅基流动|Z\.ai|OpenRouter|Kimi|BytePlus|AWS Bedrock|腾讯|ModelScope|PPIO|Anthropic|Google Gemini|OpenCode Go/;
+const providerTriggerName = /TypeSafe Jev|自定义模型|DeepSeek|火山引擎|MiniMax|BigModel|阿里云百炼|Xiaomi MiMo|硅基流动|Z\.ai|OpenRouter|Kimi|BytePlus|AWS Bedrock|腾讯|ModelScope|PPIO|Anthropic|Google Gemini|OpenCode Go|OpenCode Jev/;
 
 async function chooseProvider(user: ReturnType<typeof userEvent.setup>, label: string) {
   await user.click(screen.getByRole("button", { name: providerTriggerName }));
@@ -32,6 +35,136 @@ describe("JevPanel", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     invokeMock.mockResolvedValue(dashboard);
+  });
+
+  afterEach(() => vi.useRealTimers());
+
+  it("keeps automatic classification off and unavailable without a saved TypeSafe key", async () => {
+    render(<JevPanel />);
+    await screen.findByLabelText("待评估文本");
+    const toggle = screen.getByRole("switch", { name: "自动评估 Codex 请求" });
+    expect(toggle).not.toBeChecked();
+    expect(toggle).toBeDisabled();
+    expect(screen.getByText(/先设置 TypeSafe 官方 Key/)).toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("set_jev_auto_enabled", expect.anything());
+  });
+
+  it("enables TypeSafe automation only after its setting is saved", async () => {
+    let finishSave!: (value: unknown) => void;
+    const configured = { ...dashboard, keyConfigured: true };
+    invokeMock.mockImplementation((command: string) => command === "set_jev_auto_enabled"
+      ? new Promise((resolve) => { finishSave = resolve; })
+      : Promise.resolve(configured));
+    render(<JevPanel />);
+    await screen.findByText("TypeSafe 官方 Key 已连接，无需重复设置。");
+    const toggle = screen.getByRole("switch", { name: "自动评估 Codex 请求" });
+    fireEvent.click(toggle);
+    expect(invokeMock).toHaveBeenCalledWith("set_jev_auto_enabled", { enabled: true });
+    expect(toggle).not.toBeChecked();
+    expect(toggle).toBeDisabled();
+    await act(async () => finishSave({ ...configured, autoEnabled: true }));
+    expect(toggle).toBeChecked();
+    expect(toggle).not.toBeDisabled();
+    expect(invokeMock).not.toHaveBeenCalledWith("evaluate_jev", expect.anything());
+  });
+
+  it("keeps the previous automatic setting on save failure", async () => {
+    invokeMock.mockImplementation((command: string) => command === "set_jev_auto_enabled"
+      ? Promise.reject("jev_auto_settings_write")
+      : Promise.resolve({ ...dashboard, keyConfigured: true }));
+    render(<JevPanel />);
+    await screen.findByText("TypeSafe 官方 Key 已连接，无需重复设置。");
+    fireEvent.click(screen.getByRole("switch", { name: "自动评估 Codex 请求" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("自动评估设置未保存，请稍后重试。");
+    expect(screen.getByRole("switch", { name: "自动评估 Codex 请求" })).not.toBeChecked();
+  });
+
+  it("allows disabling automation after the key becomes unavailable", async () => {
+    const unavailable = { ...dashboard, autoEnabled: true, autoAvailable: false, keyPersistent: false };
+    invokeMock.mockImplementation((command: string) => Promise.resolve(command === "set_jev_auto_enabled"
+      ? { ...unavailable, autoEnabled: false } : unavailable));
+    render(<JevPanel />);
+    await screen.findByLabelText("待评估文本");
+    const toggle = screen.getByRole("switch", { name: "自动评估 Codex 请求" });
+    expect(toggle).toBeChecked();
+    expect(toggle).not.toBeDisabled();
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).not.toBeChecked());
+    expect(invokeMock).toHaveBeenCalledWith("set_jev_auto_enabled", { enabled: false });
+  });
+
+  it("polls enabled automation without overlapping reads and shows record sources", async () => {
+    vi.useFakeTimers();
+    let finishRefresh!: (value: unknown) => void;
+    const native = { ...record, provider: "typesafe", endpoint: null, model: "jev-latest" };
+    const enabled = { ...dashboard, keyConfigured: true, autoEnabled: true, records: [native] };
+    invokeMock.mockResolvedValueOnce(enabled).mockImplementation(() => new Promise((resolve) => { finishRefresh = resolve; }));
+    const { unmount } = render(<JevPanel />);
+    await act(async () => {});
+    expect(screen.getByRole("cell", { name: "手动" })).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(4000); });
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(12000); });
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+    await act(async () => finishRefresh({ ...enabled, records: [native, { ...native, id: "auto", source: "codex" }] }));
+    expect(screen.getByRole("cell", { name: "Codex 自动" })).toBeInTheDocument();
+    unmount();
+    await act(async () => { await vi.advanceTimersByTimeAsync(8000); });
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not poll while automatic classification is off", async () => {
+    vi.useFakeTimers();
+    render(<JevPanel />);
+    await act(async () => {});
+    await act(async () => { await vi.advanceTimersByTimeAsync(12000); });
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("prices only reported TypeSafe jev-latest input usage and keeps unknowns explicit", async () => {
+    const native = { ...record, provider: "typesafe", endpoint: null, model: "jev-latest" };
+    invokeMock.mockResolvedValue({ ...dashboard, records: [
+      { ...native, id: "known", inputTokens: 2_000_000, outputTokens: 5_000_000 },
+      { ...native, id: "missing", inputTokens: null },
+      { ...native, id: "unpriced", model: "unpublished-model", inputTokens: 1_000_000_000 },
+    ] });
+    render(<JevPanel />);
+    expect(await screen.findByText("~$0.084000")).toBeInTheDocument();
+    expect(screen.getByText("已计价 1/3 条；其余用量或价格未知")).toBeInTheDocument();
+    expect(screen.getByText(/未扣免费额度或折扣；实际金额以 TypeSafe 账单为准/)).toBeInTheDocument();
+    expect(screen.getByText("无基线")).toBeInTheDocument();
+  });
+
+  it.each([[0, "~$0.00"], [1, "~<$0.000001"]] as const)("distinguishes reported zero and tiny TypeSafe costs (%s)", async (inputTokens, expected) => {
+    invokeMock.mockResolvedValue({ ...dashboard, records: [{ ...record, provider: "typesafe", endpoint: null, model: "jev-latest", inputTokens }] });
+    render(<JevPanel />);
+    expect(await screen.findByText(expected)).toBeInTheDocument();
+  });
+
+  it.each(["jev-latest", "jev-preview", "jev-1.13.0", "jev-1.14.0"])("prices TypeSafe's resolved official model %s", async (model) => {
+    invokeMock.mockResolvedValue({ ...dashboard, records: [{ ...record, provider: "typesafe", source: "codex", endpoint: null, model, inputTokens: 1350, outputTokens: 0 }] });
+    render(<JevPanel />);
+    expect(await screen.findByText("~$0.000057")).toBeInTheDocument();
+    expect(screen.getByText("已计价 1/1 条；其余用量或价格未知")).toBeInTheDocument();
+  });
+
+  it.each(["jev-1.13", "jev-1.13-free"])("uses OpenCode Console native Jev with %s", async (model) => {
+    render(<JevPanel />);
+    const user = userEvent.setup();
+    await screen.findByLabelText("待评估文本");
+    await chooseProvider(user, "OpenCode Jev（原生）");
+    expect(screen.getByText(/使用原生 System One 协议/)).toBeInTheDocument();
+    expect(screen.queryByLabelText("OpenCode Go 接口协议")).toBeNull();
+    await user.selectOptions(screen.getByLabelText("选择模型"), model);
+    await user.type(screen.getByLabelText("OpenCode Console API Key"), "console-test-key");
+    invokeMock.mockResolvedValue({ ...dashboard, configuredTargets: [{ provider: "opencode_jev", protocol: "open_ai", url: "https://opencode.ai/inference/systemone/v1/systemone" }] });
+    await user.click(screen.getByRole("button", { name: "设置 key" }));
+    const config = { provider: "opencode_jev", protocol: null, url: null, model };
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_adapter_key", { config, key: "console-test-key" }));
+    await user.type(screen.getByLabelText("待评估文本"), "review this code");
+    await user.click(screen.getByLabelText(/我同意/));
+    await user.click(screen.getByRole("button", { name: "发送并评估" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("evaluate_jev", { text: "review this code", config }));
   });
 
   it("loads dashboard without sending text or keys", async () => {
@@ -257,11 +390,11 @@ describe("JevPanel", () => {
     expect(screen.getByRole("button", { name: "发送并评估" })).toBeDisabled();
   });
 
-  it("reports unknown quality and cost without fake estimates", async () => {
+  it("reports unknown quality and missing usage without inventing a cost", async () => {
     render(<JevPanel />);
     await screen.findByLabelText("待评估文本");
     expect(screen.getByText("NOT EVALUATED")).toBeInTheDocument();
-    expect(screen.getByText("未提供账单金额")).toBeInTheDocument();
+    expect(screen.getByText("暂无用量估值")).toBeInTheDocument();
     expect(screen.getByText("无基线")).toBeInTheDocument();
   });
 
@@ -314,7 +447,7 @@ describe("JevPanel", () => {
       "火山引擎", "MiniMax CN", "MiniMax Global", "BigModel", "Xiaomi MiMo", "硅基流动", "Z.ai",
       "Kimi CN", "Kimi Global", "BytePlus", "AWS Bedrock", "腾讯云", "模力方舟 ModelScope", "PPIO",
     ];
-    expect(within(dialog).getAllByRole("radio")).toHaveLength(22);
+    expect(within(dialog).getAllByRole("radio")).toHaveLength(23);
     for (const label of newProviderLabels) {
       expect(within(dialog).getByRole("radio", { name: label })).toBeInTheDocument();
     }

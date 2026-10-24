@@ -281,6 +281,16 @@ pub fn set_auto_learn_enabled(enabled: bool) -> Result<()> {
     write_setup_state(&mut state)
 }
 
+pub fn is_jev_auto_enabled() -> bool {
+    load_setup_state().jev_auto_enabled
+}
+
+pub fn set_jev_auto_enabled(enabled: bool) -> Result<()> {
+    let mut state = load_setup_state();
+    state.jev_auto_enabled = enabled;
+    write_setup_state(&mut state)
+}
+
 /// Enable or disable RTK from the tool status toggle. Disabling tears down the
 /// RTK PATH export, the Claude Code hook, and the Codex AGENTS.md nudge (without
 /// touching `ANTHROPIC_BASE_URL` routing) and persists the opt-out so bootstrap
@@ -2110,6 +2120,7 @@ fn strip_headroom_mcp_toml(content: &str) -> String {
 /// Strip Headroom-owned MCP tables from a Codex/Grok `config.toml`. Returns
 /// the path when the file changed.
 fn strip_headroom_mcp_from_toml_file(path: &Path) -> Result<Option<String>> {
+    let _config_lock = crate::extension_config::lock_codex_config();
     if !path.exists() {
         return Ok(None);
     }
@@ -2516,6 +2527,8 @@ struct ClientSetupState {
     /// is spawned without the passive traffic-learning flags.
     #[serde(default)]
     auto_learn_disabled: bool,
+    #[serde(default)]
+    jev_auto_enabled: bool,
     /// Set when an unreadable state file could not be quarantined. While the
     /// original source remains present, refuse to publish a fresh state over
     /// it; otherwise a transient parse failure would destroy the only
@@ -2734,7 +2747,7 @@ pub(crate) fn quarantine_unparsable(path: &Path, reason: &str) -> bool {
     }
 }
 
-fn setup_state_path() -> PathBuf {
+pub(crate) fn setup_state_path() -> PathBuf {
     config_file(&app_data_dir(), "client-setup.json")
 }
 
@@ -4408,20 +4421,40 @@ fn strip_codex_headroom_provider_table(content: &str) -> String {
         .join("\n")
 }
 
-/// Restore a preserved pre-Headroom root `model_provider` after teardown, so a
-/// gateway/alternate-provider user isn't silently left on api.openai.com. No-op
-/// if the config already has a root `model_provider` (user re-added their own).
+/// Restore a saved provider while it is still defined, otherwise use native OpenAI.
+/// Keep a valid provider the user selected after connecting Headroom.
 fn restore_codex_model_provider(provider: &str) -> Result<()> {
+    let _config_lock = crate::extension_config::lock_codex_config();
     let path = codex_config_toml_path();
     let existing = if path.exists() {
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
     } else {
         String::new()
     };
-    if codex_foreign_model_provider(&existing).is_some() {
+    let parsed: toml::Value = existing.parse().map_err(|_| {
+        anyhow!("Codex config is not valid TOML; cannot restore its model provider")
+    })?;
+    let provider_exists = |provider: &str| {
+        matches!(provider, CODEX_NATIVE_PROVIDER | "ollama" | "lmstudio")
+            || parsed
+                .get("model_providers")
+                .and_then(|providers| providers.get(provider))
+                .is_some_and(toml::Value::is_table)
+    };
+    if parsed
+        .get("model_provider")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|current| current != CODEX_HEADROOM_PROVIDER && provider_exists(current))
+    {
         return Ok(());
     }
+    let provider = if provider_exists(provider) {
+        provider
+    } else {
+        CODEX_NATIVE_PROVIDER
+    };
     let line = format!("model_provider = {}", toml_basic_string(provider));
+    let existing = strip_codex_root_model_provider(&existing);
     let trimmed = existing.trim();
     let rebuilt = if trimmed.is_empty() {
         format!("{line}\n")
@@ -4483,6 +4516,7 @@ fn render_codex_config(existing: &str) -> Result<String> {
 fn configure_codex_provider_block(
     allow_takeover: bool,
 ) -> Result<(Vec<String>, Vec<String>, Option<String>)> {
+    let _config_lock = crate::extension_config::lock_codex_config();
     let path = codex_config_toml_path();
     let existing = if path.exists() {
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?
@@ -4532,6 +4566,7 @@ fn configure_codex_provider_block(
 /// the table by header rather than the Headroom marker block, which the
 /// upstream registrar can mis-place around unrelated user tables.
 pub fn pin_codex_mcp_command(entrypoint: &Path) -> Result<Option<String>> {
+    let _config_lock = crate::extension_config::lock_codex_config();
     let path = codex_config_toml_path();
     if !path.exists() {
         return Ok(None);
@@ -5993,6 +6028,7 @@ fn is_compatible_context7_entry(entry: &toml::value::Table) -> bool {
 }
 
 fn remove_codex_provider_block() -> Result<()> {
+    let _config_lock = crate::extension_config::lock_codex_config();
     let path = codex_config_toml_path();
     if !path.exists() {
         return Ok(());
@@ -6017,6 +6053,7 @@ fn remove_codex_provider_block() -> Result<()> {
 }
 
 fn remove_codex_toml_key(key: &str, expected_value: &str) -> Result<()> {
+    let _config_lock = crate::extension_config::lock_codex_config();
     let path = codex_config_toml_path();
     if !path.exists() {
         return Ok(());
@@ -8417,7 +8454,15 @@ fn codex_candidate_paths() -> Vec<PathBuf> {
 fn codex_app_candidates(home: &Path) -> Vec<PathBuf> {
     [PathBuf::from("/Applications"), home.join("Applications")]
         .into_iter()
-        .flat_map(|root| ["Codex.app", "ChatGPT.app"].map(|app| root.join(app).join("Contents/Resources/codex")))
+        .flat_map(|root| {
+            ["Codex.app", "ChatGPT.app"].into_iter().flat_map(move |app| {
+                [
+                    "Contents/Resources/codex",
+                    "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+                ]
+                .map(|binary| root.join(app).join(binary))
+            })
+        })
         .collect()
 }
 
@@ -8532,9 +8577,13 @@ mod tests {
         let candidates = super::codex_app_candidates(home);
         for path in [
             "/Applications/Codex.app/Contents/Resources/codex",
+            "/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
             "/Applications/ChatGPT.app/Contents/Resources/codex",
+            "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
             "/Users/example/Applications/Codex.app/Contents/Resources/codex",
+            "/Users/example/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
             "/Users/example/Applications/ChatGPT.app/Contents/Resources/codex",
+            "/Users/example/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
         ] {
             assert!(candidates.contains(&std::path::PathBuf::from(path)));
         }
@@ -8544,15 +8593,28 @@ mod tests {
     #[test]
     fn bundled_codex_is_resolved_without_shell_path_and_invalid_files_are_skipped() {
         use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("Applications/ChatGPT.app/Contents/Resources/codex");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "#!/bin/sh\n[ \"$1\" = --version ]\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let invalid = root.path().join("codex");
-        std::fs::write(&invalid, "not an executable").unwrap();
-        let candidates = vec![invalid, path.clone()];
-        assert_eq!(crate::claude_cli::first_runnable(candidates.into_iter()), Some(path));
+        for binary in [
+            "Contents/Resources/codex",
+            "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("Applications/ChatGPT.app").join(binary);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "#!/bin/sh\n[ \"$1\" = --version ]\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let invalid = root.path().join("codex");
+            std::fs::write(&invalid, "not an executable").unwrap();
+            let mut candidates = vec![invalid];
+            candidates.extend(
+                super::codex_app_candidates(root.path())
+                    .into_iter()
+                    .filter(|candidate| candidate.starts_with(root.path())),
+            );
+            assert_eq!(
+                crate::claude_cli::first_runnable(candidates.into_iter()),
+                Some(path)
+            );
+        }
     }
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
@@ -8904,6 +8966,22 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn jev_auto_setting_defaults_off_and_preserves_other_settings() {
+        let _home = TestHome::new();
+        let mut state: super::ClientSetupState = serde_json::from_str("{}").unwrap();
+        assert!(!state.jev_auto_enabled);
+        state.auto_learn_disabled = true;
+        super::write_setup_state(&mut state).unwrap();
+        super::set_jev_auto_enabled(true).unwrap();
+        assert!(super::is_jev_auto_enabled());
+        assert!(super::is_auto_learn_disabled());
+        super::set_jev_auto_enabled(false).unwrap();
+        assert!(!super::is_jev_auto_enabled());
+        assert!(super::is_auto_learn_disabled());
+    }
+
+    #[test]
     fn client_setup_state_survives_schema_drift_in_either_direction() {
         // A newer build's extra field must be ignored, and a build that
         // drops/renames configured_clients must still yield the rest. A parse
@@ -9006,6 +9084,7 @@ mod tests {
             preserved_base_urls: BTreeMap::new(),
             rtk_disabled: false,
             auto_learn_disabled: false,
+            jev_auto_enabled: false,
             persistence_blocked: false,
         };
 
@@ -13442,6 +13521,114 @@ keep rtk\n\
             stripped.parse::<toml::Value>().is_ok(),
             "teardown output must stay valid toml, got:\n{stripped}"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn legacy_codex_writer_waits_for_extension_edit_and_preserves_new_fields() {
+        let _home = TestHome::new();
+        let path = super::codex_config_toml_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "model = \"test-model\"\n").unwrap();
+
+        let config_lock = crate::extension_config::lock_codex_config();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = super::configure_codex_provider_block(false);
+            let _ = finished_tx.send(());
+            result
+        });
+        let started = started_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let waited = matches!(
+            finished_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        let edited = crate::extension_config::edit_codex_config(|doc| {
+            doc["mcp_servers"]["external"]["command"] = toml_edit::value("external-command");
+            let mut skill = toml_edit::InlineTable::new();
+            skill.insert("path", "/synthetic/skills/review/SKILL.md".into());
+            skill.insert("enabled", false.into());
+            let mut skills = toml_edit::Array::new();
+            skills.push(skill);
+            doc["skills"]["config"] = toml_edit::value(skills);
+            Ok(())
+        });
+        drop(config_lock);
+        let written = writer.join();
+        // Join before asserting so the isolated HOME cannot be restored while a writer runs.
+        assert!(started.is_ok());
+        assert!(waited, "the legacy writer bypassed the shared configuration lock");
+        edited.unwrap();
+        written.unwrap().unwrap();
+        let saved: toml::Value = std::fs::read_to_string(path).unwrap().parse().unwrap();
+        assert_eq!(saved["model_provider"].as_str(), Some(super::CODEX_HEADROOM_PROVIDER));
+        assert_eq!(saved["mcp_servers"]["external"]["command"].as_str(), Some("external-command"));
+        assert_eq!(saved["skills"]["config"][0]["enabled"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn restore_codex_model_provider_uses_native_for_missing_provider() {
+        for existing in [
+            "model = \"gpt-5.4\"\n",
+            "model_provider = \"removed_gateway\"\nmodel = \"gpt-5.4\"\n",
+        ] {
+            let home = TestHome::new();
+            let path = home.path().join(".codex/config.toml");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, existing).unwrap();
+
+            super::restore_codex_model_provider("codex_local_access").unwrap();
+
+            let restored: toml::Value = fs::read_to_string(&path).unwrap().parse().unwrap();
+            assert_eq!(restored["model_provider"].as_str(), Some("openai"));
+            assert_eq!(restored["model"].as_str(), Some("gpt-5.4"));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn restore_codex_model_provider_restores_existing_foreign_provider() {
+        for definition in [
+            "[model_providers.codex_local_access]\nname = \"Gateway\"\nbase_url = \"https://gateway.example/v1\"",
+            "[ model_providers . \"codex_local_access\" ] # user gateway\nname = \"Gateway\"\nbase_url = \"https://gateway.example/v1\"",
+            "model_providers = { codex_local_access = { name = \"Gateway\", base_url = \"https://gateway.example/v1\" } }",
+        ] {
+            let home = TestHome::new();
+            let path = home.path().join(".codex/config.toml");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let existing = format!("model = \"gpt-5.4\"\n{definition}\n");
+            fs::write(&path, &existing).unwrap();
+
+            super::restore_codex_model_provider("codex_local_access").unwrap();
+
+            let restored = fs::read_to_string(&path).unwrap();
+            let parsed: toml::Value = restored.parse().unwrap();
+            assert_eq!(parsed["model_provider"].as_str(), Some("codex_local_access"));
+            assert!(restored.contains(&existing));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn restore_codex_model_provider_keeps_valid_current_provider() {
+        for existing in [
+            "model_provider = \"openai\"\nmodel = \"gpt-5.4\"\n",
+            "model_provider = \"ollama\"\nmodel = \"gpt-oss\"\n",
+            "model_provider = \"lmstudio\"\nmodel = \"gpt-oss\"\n",
+            "model_provider = \"user_gateway\"\nmodel = \"gpt-5.4\"\n[model_providers.user_gateway]\nname = \"Gateway\"\nbase_url = \"https://gateway.example/v1\"\n",
+            "model_provider = 'user_gateway'\n[model_providers.user_gateway]\nname = \"Gateway\"\nbase_url = \"https://gateway.example/v1\"\n",
+        ] {
+            let home = TestHome::new();
+            let path = home.path().join(".codex/config.toml");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, existing).unwrap();
+
+            super::restore_codex_model_provider("codex_local_access").unwrap();
+
+            assert_eq!(fs::read_to_string(&path).unwrap(), existing);
+        }
     }
 
     #[test]

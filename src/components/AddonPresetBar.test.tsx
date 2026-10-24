@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AddonPresetBar,
   listPresetDisables,
+  matchesRecommendedAddonPreset,
   RECOMMENDED_ADDON_PRESET,
 } from "./AddonPresetBar";
 import { I18nProvider, LOCALE_STORAGE_KEY } from "../lib/i18n";
@@ -29,6 +30,14 @@ function dashboardWith(tools: DashboardState["tools"]): DashboardState {
   return { ...mockDashboard, tools };
 }
 
+function recommendedDashboard(): DashboardState {
+  return dashboardWith(Object.entries(RECOMMENDED_ADDON_PRESET).map(([id, target]) => ({
+    ...tool(id, id, target.enabled, target.enabled ? "healthy" : "not_installed"),
+    defaultMode: target.mode,
+    workflowGroup: ["openspec", "gstack"].includes(id) ? "primary_workflow" : null,
+  })));
+}
+
 function renderBar(dashboard: DashboardState, props: Partial<Parameters<typeof AddonPresetBar>[0]> = {}) {
   return render(
     <I18nProvider>
@@ -49,14 +58,27 @@ beforeEach(() => {
 });
 
 describe("listPresetDisables", () => {
+  it("keeps codebase indexing and learning prompts opt-in without changing current switches", () => {
+    const dashboard = dashboardWith([
+      tool("codebase-memory", "Codebase Memory", true, "healthy"),
+      tool("grill-me", "Grill Me", true, "healthy"),
+    ]);
+    expect(RECOMMENDED_ADDON_PRESET["codebase-memory"].enabled).toBe(false);
+    expect(RECOMMENDED_ADDON_PRESET["grill-me"].enabled).toBe(false);
+    expect(listPresetDisables(dashboard).map((entry) => entry.id)).toEqual([
+      "codebase-memory", "grill-me",
+    ]);
+    expect(dashboard.tools.every((entry) => entry.enabled)).toBe(true);
+  });
+
   it("names the enabled tools the recommended preset would switch off", () => {
     const dashboard = dashboardWith([
       tool("openspec", "OpenSpec", true, "healthy"),
-      tool("superpowers", "Superpowers", false, "not_installed"),
+      tool("gstack", "gstack", true, "healthy"),
       tool("rtk", "RTK", true, "healthy"),
     ]);
 
-    expect(listPresetDisables(dashboard).map((entry) => entry.name)).toEqual(["OpenSpec"]);
+    expect(listPresetDisables(dashboard).map((entry) => entry.name)).toEqual(["gstack"]);
   });
 
   it("ignores tools the preset does not own and tools that are already off", () => {
@@ -69,15 +91,39 @@ describe("listPresetDisables", () => {
     expect(listPresetDisables(dashboard)).toEqual([]);
   });
 
-  it("keeps the optional Codex Security audit off by default", () => {
-    expect(RECOMMENDED_ADDON_PRESET["codex-security"]).toEqual({ enabled: false });
+  it("leaves official plugins outside the recommended preset", () => {
+    expect(RECOMMENDED_ADDON_PRESET.openspec).toEqual({ enabled: true });
+    expect(RECOMMENDED_ADDON_PRESET.superpowers).toBeUndefined();
+    expect(RECOMMENDED_ADDON_PRESET["codex-security"]).toBeUndefined();
 
     const dashboard = dashboardWith([
       tool("codex-security", "Codex Security", true, "healthy"),
     ]);
-    expect(listPresetDisables(dashboard)).toEqual([
-      { id: "codex-security", name: "Codex Security" },
+    expect(listPresetDisables(dashboard)).toEqual([]);
+  });
+
+  it("names active official workflow peers before enabling recommended OpenSpec", () => {
+    const dashboard = dashboardWith([
+      { ...tool("openspec", "OpenSpec", false, "not_installed"), workflowGroup: "primary_workflow" },
+      { ...tool("superpowers", "Superpowers", true, "healthy"), workflowGroup: "primary_workflow" },
+      tool("codex-security", "Codex Security", true, "healthy"),
     ]);
+    expect(listPresetDisables(dashboard)).toEqual([{ id: "superpowers", name: "Superpowers" }]);
+    expect(dashboard.tools[1].enabled).toBe(true);
+  });
+});
+
+describe("matchesRecommendedAddonPreset", () => {
+  it("ignores enabled official plugins that do not conflict with the workflow", () => {
+    const dashboard = recommendedDashboard();
+    dashboard.tools.push(tool("codex-security", "Codex Security", true, "healthy"));
+    expect(matchesRecommendedAddonPreset(dashboard)).toBe(true);
+  });
+
+  it("does not call conflicting OpenSpec and Superpowers a matching preset", () => {
+    const dashboard = recommendedDashboard();
+    dashboard.tools.push({ ...tool("superpowers", "Superpowers", true, "healthy"), workflowGroup: "primary_workflow" });
+    expect(matchesRecommendedAddonPreset(dashboard)).toBe(false);
   });
 });
 

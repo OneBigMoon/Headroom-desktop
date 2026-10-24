@@ -2935,6 +2935,7 @@ select {
 
 .optimize-panel__modal-header {
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   justify-content: space-between;
   padding: 14px 18px 10px;
@@ -5178,7 +5179,8 @@ html.window-hiding {
 }
 
 .activity-card__title-row h1,
-.addons-card__title-row h1 {
+.addons-card__title-row h1,
+.addons-card__title-row h2 {
   margin: 0;
   font-size: var(--text-lg);
   font-weight: 400;

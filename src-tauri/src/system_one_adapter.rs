@@ -93,6 +93,10 @@ pub fn resolve(config: &AdapterConfig) -> Result<ResolvedTarget, String> {
     }
     let (protocol, url) = match config.provider {
         JevProvider::TypeSafe => return Err("adapter_invalid_provider".into()),
+        JevProvider::OpenCodeJev => (
+            AdapterProtocol::OpenAi,
+            "https://opencode.ai/inference/systemone/v1/systemone",
+        ),
         JevProvider::DeepSeek => (
             AdapterProtocol::OpenAi,
             "https://api.deepseek.com/chat/completions",
@@ -536,6 +540,27 @@ mod tests {
             JevProvider::OpenCodeGo,
             None,
             Some("https://evil.example/v1/chat/completions")
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn opencode_jev_uses_its_fixed_native_endpoint() {
+        let target = resolve(&config(JevProvider::OpenCodeJev, None, None)).unwrap();
+        assert_eq!(
+            target.url,
+            "https://opencode.ai/inference/systemone/v1/systemone"
+        );
+        assert!(resolve(&config(
+            JevProvider::OpenCodeJev,
+            None,
+            Some("https://evil.example/")
+        ))
+        .is_err());
+        assert!(resolve(&config(
+            JevProvider::OpenCodeJev,
+            Some(AdapterProtocol::Anthropic),
+            None
         ))
         .is_err());
     }

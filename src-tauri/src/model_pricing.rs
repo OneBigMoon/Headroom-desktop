@@ -76,6 +76,7 @@ struct PriceAdjustmentFile {
 #[derive(Default)]
 struct AdjustmentRuntime {
     loaded: bool,
+    write_blocked: bool,
     state: PriceAdjustmentFile,
     session_adjustment_usd: f64,
 }
@@ -149,35 +150,67 @@ fn ensure_adjustments_loaded(runtime: &mut AdjustmentRuntime) {
     if runtime.loaded {
         return;
     }
-    runtime.loaded = true;
     if cfg!(test) {
+        runtime.loaded = true;
         runtime.state.schema_version = ADJUSTMENTS_SCHEMA_VERSION;
         return;
     }
+    load_adjustments_at(runtime, &adjustments_path());
+}
 
-    let Ok(bytes) = std::fs::read(adjustments_path()) else {
-        runtime.state.schema_version = ADJUSTMENTS_SCHEMA_VERSION;
-        return;
+fn load_adjustments_at(runtime: &mut AdjustmentRuntime, path: &std::path::Path) {
+    runtime.loaded = true;
+    runtime.state.schema_version = ADJUSTMENTS_SCHEMA_VERSION;
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => {
+            runtime.write_blocked = true;
+            log::warn!("cannot read model price adjustment history; writes blocked: {err}");
+            return;
+        }
     };
-    let Ok(state) = serde_json::from_slice::<PriceAdjustmentFile>(&bytes) else {
-        runtime.state.schema_version = ADJUSTMENTS_SCHEMA_VERSION;
-        return;
-    };
-    if state.schema_version == ADJUSTMENTS_SCHEMA_VERSION {
-        runtime.state = state;
-    } else {
-        runtime.state.schema_version = ADJUSTMENTS_SCHEMA_VERSION;
+    let parsed = serde_json::from_slice::<Value>(&bytes);
+    if let Ok(value) = &parsed {
+        if value.get("schemaVersion").and_then(Value::as_u64)
+            != Some(u64::from(ADJUSTMENTS_SCHEMA_VERSION))
+        {
+            runtime.write_blocked = true;
+            log::warn!("unsupported model price adjustment history schema; writes blocked");
+            return;
+        }
+    }
+    match parsed.and_then(serde_json::from_value::<PriceAdjustmentFile>) {
+        Ok(state) => runtime.state = state,
+        Err(err) => {
+            runtime.write_blocked = !crate::client_adapters::quarantine_unparsable(
+                path,
+                "model price adjustment history",
+            );
+            log::warn!("invalid model price adjustment history: {err}");
+        }
     }
 }
 
-fn persist_adjustments(state: &PriceAdjustmentFile) -> anyhow::Result<()> {
+fn persist_adjustments(runtime: &AdjustmentRuntime) -> anyhow::Result<()> {
     if cfg!(test) {
         return Ok(());
     }
     let base = app_data_dir();
     ensure_data_dirs(&base)?;
-    let bytes = serde_json::to_vec_pretty(state)?;
-    crate::client_adapters::atomic_write(&config_file(&base, PRICE_ADJUSTMENTS_FILE), &bytes)
+    persist_adjustments_at(runtime, &config_file(&base, PRICE_ADJUSTMENTS_FILE))
+}
+
+fn persist_adjustments_at(
+    runtime: &AdjustmentRuntime,
+    path: &std::path::Path,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !runtime.write_blocked,
+        "model price adjustment history is protected"
+    );
+    let bytes = serde_json::to_vec_pretty(&runtime.state)?;
+    crate::client_adapters::atomic_write(path, &bytes)
 }
 
 fn builtin_price(model: &str) -> Option<CachedPrice> {
@@ -290,6 +323,9 @@ fn record_forward_adjustments(root: &Value, now: DateTime<Utc>) {
     let hour_key = local_now.format("%Y-%m-%dT%H:00").to_string();
     let mut runtime = lock_adjustments();
     ensure_adjustments_loaded(&mut runtime);
+    if runtime.write_blocked {
+        return;
+    }
     let mut changed = false;
 
     for (raw_model, node) in entries {
@@ -338,7 +374,7 @@ fn record_forward_adjustments(root: &Value, now: DateTime<Utc>) {
     // Daily adjustments are part of the immutable lifetime total. Pruning them
     // would silently rewrite historical savings after the retention window.
     trim_oldest(&mut runtime.state.hourly_adjustments_usd, 31 * 24);
-    if let Err(err) = persist_adjustments(&runtime.state) {
+    if let Err(err) = persist_adjustments(&runtime) {
         eprintln!("model pricing: failed to persist forward adjustments: {err:#}");
     }
 }
@@ -582,6 +618,91 @@ fn parse_official_input_price(html: &str) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adjustment_history_recovers_corrupt_json_with_a_preserved_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PRICE_ADJUSTMENTS_FILE);
+        let corrupt = b"{\"schemaVersion\":1,\"dailyAdjustmentsUsd\":{";
+        std::fs::write(&path, corrupt).unwrap();
+        let mut runtime = AdjustmentRuntime::default();
+        load_adjustments_at(&mut runtime, &path);
+        assert!(!runtime.write_blocked);
+        assert!(!path.exists());
+        let backup = std::fs::read_dir(dir.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(std::fs::read(&backup).unwrap(), corrupt);
+        persist_adjustments_at(&runtime, &path).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn adjustment_history_preserves_future_schema_and_blocks_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PRICE_ADJUSTMENTS_FILE);
+        let future =
+            br#"{"schemaVersion":2,"models":"new-format","dailyAdjustmentsUsd":{"2026-10-23":42}}"#;
+        std::fs::write(&path, future).unwrap();
+        let mut runtime = AdjustmentRuntime::default();
+        load_adjustments_at(&mut runtime, &path);
+        assert!(runtime.write_blocked);
+        assert!(persist_adjustments_at(&runtime, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), future);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn adjustment_history_read_errors_block_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PRICE_ADJUSTMENTS_FILE);
+        std::fs::create_dir(&path).unwrap();
+        let mut runtime = AdjustmentRuntime::default();
+        load_adjustments_at(&mut runtime, &path);
+        assert!(runtime.write_blocked);
+        assert!(persist_adjustments_at(&runtime, &path).is_err());
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn adjustment_history_failed_quarantine_blocks_writes() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // Root bypasses the filesystem permission failure under test.
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PRICE_ADJUSTMENTS_FILE);
+        std::fs::write(&path, b"invalid JSON").unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let mut runtime = AdjustmentRuntime::default();
+        load_adjustments_at(&mut runtime, &path);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(runtime.write_blocked);
+        assert!(persist_adjustments_at(&runtime, &path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"invalid JSON");
+    }
+
+    #[test]
+    fn adjustment_history_roundtrip_retains_existing_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PRICE_ADJUSTMENTS_FILE);
+        let mut runtime = AdjustmentRuntime::default();
+        load_adjustments_at(&mut runtime, &path);
+        assert!(!runtime.write_blocked);
+        runtime
+            .state
+            .daily_adjustments_usd
+            .insert("2026-10-23".into(), 42.0);
+        persist_adjustments_at(&runtime, &path).unwrap();
+        let mut loaded = AdjustmentRuntime::default();
+        load_adjustments_at(&mut loaded, &path);
+        assert!(!loaded.write_blocked);
+        assert_eq!(loaded.state.daily_adjustments_usd["2026-10-23"], 42.0);
+    }
 
     #[test]
     fn parses_standard_input_price_from_official_model_markup() {

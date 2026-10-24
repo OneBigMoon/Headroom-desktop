@@ -1,4 +1,7 @@
 import { InstructionGovernance } from "./components/InstructionGovernance";
+import { McpManagerPanel } from "./components/McpManagerPanel";
+import { SkillManagerPanel } from "./components/SkillManagerPanel";
+import { ExtensionClientToggle } from "./components/ExtensionClientToggle";
 import {
   useEffect,
   useRef,
@@ -24,6 +27,8 @@ import {
   House,
   Key,
   PuzzlePiece,
+  Plugs,
+  Books,
   SignOut,
   Sliders,
   Sparkle,
@@ -72,6 +77,8 @@ import { useTakeoverConfirm } from "./lib/takeoverConfirm";
 import {
   getActivationScopeCopy,
   groupToolsByCategory,
+  addonManagementPage,
+  isHostCuratedAddon,
   localizeWorkflowCopy,
   toolCopy,
   toolCategoryCopy,
@@ -227,6 +234,7 @@ import { WindowChrome } from "./components/WindowChrome";
 import {
   AddonPresetBar,
   listPresetDisables,
+  matchesRecommendedAddonPreset,
   RECOMMENDED_ADDON_PRESET,
 } from "./components/AddonPresetBar";
 import type {
@@ -264,13 +272,7 @@ interface NavItem {
 }
 
 export function recommendedAddonPresetMatches(dashboard: DashboardState): boolean {
-  const matches = Object.entries(RECOMMENDED_ADDON_PRESET).every(([id, target]) => {
-    const tool = dashboard.tools.find((candidate) => candidate.id === id);
-    if (!tool) return false;
-    if (target.enabled !== (tool.status !== "not_installed" && tool.enabled)) return false;
-    return !target.mode || target.mode === tool.defaultMode;
-  });
-  return matches && dashboard.tools.every((tool) => tool.required || RECOMMENDED_ADDON_PRESET[tool.id] || !tool.enabled);
+  return matchesRecommendedAddonPreset(dashboard);
 }
 
 const navItems: NavItem[] = [
@@ -278,6 +280,8 @@ const navItems: NavItem[] = [
   { id: "optimization", labelKey: "nav.optimize", icon: Sliders },
   { id: "notifications", labelKey: "nav.activity", icon: Bell },
   { id: "decisions", labelKey: "nav.decisions", icon: Brain },
+  { id: "mcp", labelKey: "nav.mcp", icon: Plugs },
+  { id: "skills", labelKey: "nav.skills", icon: Books },
   { id: "addons", labelKey: "nav.tools", icon: PuzzlePiece },
 ];
 
@@ -1618,6 +1622,7 @@ function AddonCard({
   defaultMode,
   supportedModes,
   actionsDisabled,
+  clientToggle = false,
   onModeChange = () => undefined,
   onInstall,
   onToggleEnabled,
@@ -1661,6 +1666,7 @@ function AddonCard({
   defaultMode?: string | null;
   supportedModes?: string[];
   actionsDisabled: boolean;
+  clientToggle?: boolean;
   onModeChange?: (mode: string) => void;
   onInstall: () => void;
   onToggleEnabled: () => void;
@@ -1721,7 +1727,7 @@ function AddonCard({
           disabled={actionsDisabled || Boolean(unavailableReason)}
           onChange={onModeChange}
         />
-        {showClients ? (
+        {showClients && !clientToggle ? (
           <AddonClientChips connectors={connectors} savings={savings} />
         ) : null}
         <button type="button" className="addon-card__link" onClick={onOpenSource}>
@@ -1811,14 +1817,26 @@ function AddonCard({
                   : t("addons.update")}
               </button>
             ) : null}
-            <button
-              type="button"
-              className="addon-card__action"
-              disabled={actionsDisabled}
-              onClick={onToggleEnabled}
-            >
-              {enabled ? t("tools.disable") : t("tools.enable")}
-            </button>
+            {clientToggle ? (
+              <ExtensionClientToggle
+                enabled={enabled}
+                disabled={actionsDisabled}
+                onToggle={onToggleEnabled}
+                enabledLabel={t("addons.enabledBadge")}
+                disabledLabel={t("addons.disabledBadge")}
+                enableLabel={t("tools.enable")}
+                disableLabel={t("tools.disable")}
+              />
+            ) : (
+              <button
+                type="button"
+                className="addon-card__action"
+                disabled={actionsDisabled}
+                onClick={onToggleEnabled}
+              >
+                {enabled ? t("tools.disable") : t("tools.enable")}
+              </button>
+            )}
             <button
               type="button"
               className="addon-card__action addon-card__action--danger"
@@ -1861,7 +1879,6 @@ const ADDON_DISPLAY_ORDER = [
   "agent-guard",
   "grill-me",
   "openspec",
-  "superpowers",
   "gstack",
   "allinluna",
   "ralph-loop",
@@ -3225,7 +3242,7 @@ export default function App() {
 
   useEffect(() => {
     if (
-      (activeView !== "addons" && activeView !== "settings") ||
+      (!["addons", "mcp", "skills", "settings"].includes(activeView)) ||
       addonUpdatesChecked ||
       addonUpdateBusy
     ) {
@@ -3358,8 +3375,9 @@ export default function App() {
       if (generation !== addonUpdateGenerationRef.current) {
         return;
       }
-      setAddonUpdateChecks(checks);
-      setAddonUpdateCheckFailed(checks.every((check) => Boolean(check.error)));
+      const visibleChecks = checks.filter((check) => !isHostCuratedAddon(check.id));
+      setAddonUpdateChecks(visibleChecks);
+      setAddonUpdateCheckFailed(visibleChecks.length > 0 && visibleChecks.every((check) => Boolean(check.error)));
     } catch (error) {
       console.error("Failed to check addon updates", error);
       if (generation !== addonUpdateGenerationRef.current) {
@@ -4787,8 +4805,9 @@ export default function App() {
     setAddonPresetMode("recommended");
     setAddonPresetBusy(true);
     try {
+      let currentDashboard = dashboard;
       for (const [id, target] of Object.entries(RECOMMENDED_ADDON_PRESET)) {
-        let tool = dashboard.tools.find((candidate) => candidate.id === id);
+        let tool = currentDashboard.tools.find((candidate) => candidate.id === id);
         if (!tool) continue;
         if (target.enabled && tool.status === "not_installed") {
           // The action already re-reads the dashboard (bounded); reuse that
@@ -4796,13 +4815,16 @@ export default function App() {
           // whole preset on one slow build.
           const after = await runAddonAction("install_addon", id);
           if (!after) continue;
+          currentDashboard = after;
           setDashboard(after);
           tool = after.tools.find((candidate) => candidate.id === id);
         }
         if (!tool) continue;
-        if (tool.enabled !== target.enabled && tool.status !== "not_installed") {
+        const hasConflictingPeer = target.enabled && workflowSwitchPeers(currentDashboard.tools, id).length > 0;
+        if ((tool.enabled !== target.enabled || hasConflictingPeer) && tool.status !== "not_installed") {
           const after = await runAddonAction("set_addon_enabled", id, target.enabled);
           if (!after) continue;
+          currentDashboard = after;
           setDashboard(after);
           tool = after.tools.find((candidate) => candidate.id === id);
         }
@@ -5486,13 +5508,15 @@ export default function App() {
       : null;
   const checkedTools = applyAddonUpdateChecks(dashboard.tools, addonUpdateChecks);
   const checkedRtkTool = checkedTools.find((tool) => tool.id === "rtk");
+  const addonPage = activeView === "mcp" || activeView === "skills" ? activeView : "addons";
+  const pageTools = checkedTools.filter((tool) => addonManagementPage(tool) === addonPage);
   const groupedAddonTools = groupToolsByCategory(
-    checkedTools
+    pageTools
       .filter((tool) => !tool.required && tool.id !== "rtk")
       .sort((a, b) => addonDisplayRank(a.id) - addonDisplayRank(b.id))
   );
-  const addonUpdateFailureCount = addonUpdateChecks.filter((check) => Boolean(check.error)).length;
-  const addonUpdatesFound = checkedTools.filter(
+  const addonUpdateFailureCount = addonUpdateChecks.filter((check) => Boolean(check.error) && pageTools.some((tool) => tool.id === check.id)).length;
+  const addonUpdatesFound = pageTools.filter(
     (tool) =>
       !tool.required &&
       tool.status !== "not_installed" &&
@@ -7180,6 +7204,272 @@ export default function App() {
     </section>
   );
 
+  const addonManagedContent = (
+    <>
+      <article className="soft-card addons-card">
+        <header className="addons-card__head">
+          <div className="addons-card__title-row">
+            <span className="addons-card__title-icon" aria-hidden="true">
+              <PuzzlePiece weight="duotone" />
+            </span>
+            <h2>{t(addonPage === "mcp" ? "extensions.bundledMcp" : addonPage === "skills" ? "extensions.bundledSkills" : "nav.tools")}</h2>
+          </div>
+          <p className="addons-card__blurb">
+            {t(addonPage === "addons" ? "extensions.localToolsDescription" : "extensions.bundledDescription")} {" "}
+            <ProjectIssuesLink onOpen={openExternalLink}>
+              {t("tools.requestAddon")}
+            </ProjectIssuesLink>
+          </p>
+          <div className="addons-card__updates" aria-live="polite">
+            <button
+              type="button"
+              className="secondary-button addons-card__update-button"
+              disabled={addonUpdateBusy}
+              onClick={() => void refreshAddonUpdates()}
+            >
+              <ArrowClockwise aria-hidden="true" size={14} />
+              {addonUpdateBusy ? t("addons.checkingUpdates") : t("addons.checkUpdates")}
+            </button>
+            {addonUpdatesChecked && !addonUpdateBusy ? (
+              <span className={addonUpdateCheckFailed ? "addons-card__update-error" : undefined}>
+                {addonUpdateCheckFailed
+                  ? t("addons.updateCheckFailed")
+                  : addonUpdateFailureCount > 0
+                    ? t("addons.updateCheckPartial", {
+                        count: addonUpdateFailureCount,
+                        updates: addonUpdatesFound,
+                      })
+                    : addonUpdatesFound > 0
+                      ? t("addons.updatesFound", { count: addonUpdatesFound })
+                      : t("addons.allUpToDate")}
+              </span>
+            ) : null}
+          </div>
+          {addonPage === "addons" ? <AddonPresetBar
+            dashboard={dashboard}
+            busy={addonPresetBusy}
+            mode={addonPresetMode}
+            onApplyRecommended={() => void applyRecommendedAddonPreset()}
+            onSelectCustom={() => {
+              addonPresetUserSelectedCustomRef.current = true;
+              setAddonPresetMode("custom");
+            }}
+          /> : null}
+        </header>
+      </article>
+        <div
+          className="addons__groups"
+          role="group"
+          aria-label={t("aria.localTools")}
+        >
+          {TOOL_CATEGORY_ORDER.map((category) => {
+            const categoryTools = groupedAddonTools.get(category) ?? [];
+            const includesRtk = addonPage === "addons" && category === "efficiency";
+            if (!categoryTools.length && !includesRtk) return null;
+            const categoryCopy = toolCategoryCopy[category];
+            const workflowGroup = categoryTools.find((tool) => tool.workflowGroup)?.workflowGroup;
+            const singleSelectLabel = workflowGroup
+              ? localizeWorkflowCopy(workflowGroupCopy[workflowGroup]?.[resolvedLocale] ?? "")
+              : null;
+            return (
+              <section
+ className={`addon-group addon-group--${category}`}
+                key={category}
+                aria-labelledby={`addon-group-${category}`}
+              >
+                <header className="addon-group__head">
+                  <div className="addon-group__copy">
+                    <h2 id={`addon-group-${category}`}>{localizeWorkflowCopy(categoryCopy.title[resolvedLocale])}</h2>
+                    <p>{localizeWorkflowCopy(categoryCopy.description[resolvedLocale])}</p>
+                  </div>
+                  {singleSelectLabel ? (
+              <span className="tool-group__rule">{singleSelectLabel}</span>
+                  ) : null}
+                </header>
+                <ul className="addons__list">
+                  {categoryTools.map((tool) => {
+              const installed = tool.status !== "not_installed";
+              return (
+                <AddonCard
+                  key={tool.id}
+                  toolId={tool.id}
+                  name={tool.name}
+                  version={tool.version}
+                  installed={installed}
+                  enabled={tool.enabled}
+                description={codexOnlyUiCopy(
+                  ADDON_DESCRIPTION_KEYS[tool.id]
+                    ? t(ADDON_DESCRIPTION_KEYS[tool.id])
+                    : localizeWorkflowCopy(toolCopy[tool.id]?.[resolvedLocale] ?? tool.description)
+                )}
+                  activationLabel={localizeWorkflowCopy(getActivationScopeCopy(tool.activationScope)[resolvedLocale])}
+                  copy={codexOnlyAddonCopy(addonCopy[tool.id])}
+                  infoOpen={addonInfoId === tool.id}
+                  onToggleInfo={() =>
+                    setAddonInfoId(addonInfoId === tool.id ? null : tool.id)
+                  }
+                  busy={tool.id in addonBusyById}
+                  busyLabel={addonBusyById[tool.id] ?? null}
+                  resultMessage={addonResultById[tool.id] ?? null}
+                  errorMessage={addonErrorById[tool.id] ?? null}
+                  noticeMessage={addonNoticeById[tool.id] ?? null}
+                  onDismissNotice={() =>
+                    setAddonNoticeById((current) =>
+                      clearAddonOperationMessage(current, tool.id)
+                    )
+                  }
+                  upstreamVersion={tool.upstreamVersion ?? null}
+                  upstreamUpdateAvailable={tool.upstreamUpdateAvailable ?? false}
+                  updateRequiresAppUpdate={tool.updateRequiresAppUpdate ?? false}
+                  supportedVersion={tool.supportedVersion ?? null}
+                  onDismissResult={() =>
+                    setAddonResultById((current) =>
+                      clearAddonOperationMessage(current, tool.id)
+                    )
+                  }
+                  sourceUrl={tool.sourceUrl}
+                  onOpenSource={() => void openExternalLink(tool.sourceUrl)}
+                connectors={addonConnectors(tool.id, connectors)}
+                showClients={installed && tool.enabled}
+                savings={tool.savingsLabel ?? null}
+                defaultMode={tool.defaultMode ?? null}
+                supportedModes={tool.supportedModes ?? []}
+                  actionsDisabled={addonPresetBusy || (addonPage === "addons" && addonPresetMode === "recommended") || tool.id in addonBusyById}
+                    clientToggle={addonPage === "mcp" || addonPage === "skills"}
+                onModeChange={(mode) => void runAddonModeAction(tool.id, mode)}
+                  updateAvailable={tool.updateAvailable ?? false}
+                  updateActionAvailable={tool.updateActionAvailable ?? false}
+                  repairActionAvailable={tool.repairActionAvailable ?? false}
+                  updateCheckFailed={tool.updateCheckFailed ?? false}
+                  availableVersion={tool.availableVersion ?? null}
+                  unavailableReason={tool.unavailableReason ?? null}
+                  onUpdate={() =>
+                    // Pass the current enable state so updating a disabled
+                    // addon refreshes its files without switching it on.
+                    void runAddonAction("install_addon", tool.id, tool.enabled, {
+                      busy: t(tool.repairActionAvailable ? "addons.repairing" : "addons.updating", { name: tool.name }),
+                      done: t(tool.repairActionAvailable ? "addons.repaired" : "addons.updated", { name: tool.name })
+                    }, tool.availableVersion)
+                  }
+                  onInstall={() => void runAddonAction("install_addon", tool.id)}
+                  onToggleEnabled={() =>
+                    void requestAddonToggle(tool)
+                  }
+                  onUninstall={() => void runAddonAction("uninstall_addon", tool.id)}
+                />
+              );
+            })}
+                  {includesRtk ? (
+                    <AddonCard
+            key="rtk"
+            toolId="rtk"
+            name="RTK"
+            version={runtimeStatus?.rtk.version}
+            installed={runtimeStatus?.rtk.installed === true}
+            enabled={runtimeStatus?.rtk.enabled === true}
+            description={
+              <>
+                {t("tools.rtkDescription")}
+                {rtkAvgSavingsPct !== null
+                  ? ` ${t("addons.avgSavings", { value: percent1(rtkAvgSavingsPct) })}`
+                  : ""}
+              </>
+            }
+            activationLabel={localizeWorkflowCopy(getActivationScopeCopy(checkedRtkTool?.activationScope)[resolvedLocale])}
+            copy={addonCopy.rtk}
+            infoOpen={addonInfoId === "rtk"}
+            onToggleInfo={() => setAddonInfoId(addonInfoId === "rtk" ? null : "rtk")}
+            busy={"rtk" in addonBusyById}
+            busyLabel={addonBusyById.rtk ?? null}
+            resultMessage={addonResultById.rtk ?? null}
+            errorMessage={addonErrorById.rtk ?? null}
+            noticeMessage={addonNoticeById.rtk ?? null}
+            onDismissNotice={() =>
+              setAddonNoticeById((current) =>
+                clearAddonOperationMessage(current, "rtk")
+              )
+            }
+            upstreamVersion={checkedRtkTool?.upstreamVersion ?? null}
+            upstreamUpdateAvailable={checkedRtkTool?.upstreamUpdateAvailable ?? false}
+            updateRequiresAppUpdate={checkedRtkTool?.updateRequiresAppUpdate ?? false}
+            supportedVersion={checkedRtkTool?.supportedVersion ?? null}
+            onDismissResult={() =>
+              setAddonResultById((current) =>
+                clearAddonOperationMessage(current, "rtk")
+              )
+            }
+            sourceUrl={
+              dashboard.tools.find((tool) => tool.id === "rtk")?.sourceUrl ??
+              "https://github.com/rtk-ai/rtk"
+            }
+            onOpenSource={() =>
+              void openExternalLink(
+                dashboard.tools.find((tool) => tool.id === "rtk")?.sourceUrl ??
+                  "https://github.com/rtk-ai/rtk"
+              )
+            }
+            connectors={connectors}
+            showClients={
+              runtimeStatus?.rtk.installed === true && runtimeStatus.rtk.enabled === true
+            }
+            savings={rtkSavingsChip}
+            actionsDisabled={addonPresetMode === "recommended" || rtkBusy || "rtk" in addonBusyById || !runtimeStatus}
+            updateAvailable={checkedRtkTool?.updateAvailable ?? false}
+            updateActionAvailable={checkedRtkTool?.updateActionAvailable ?? false}
+            repairActionAvailable={checkedRtkTool?.repairActionAvailable ?? false}
+            updateCheckFailed={checkedRtkTool?.updateCheckFailed ?? false}
+            availableVersion={checkedRtkTool?.availableVersion ?? null}
+            unavailableReason={
+              checkedRtkTool?.unavailableReason ??
+              null
+            }
+            onUpdate={() =>
+              void runAddonAction("install_addon", "rtk", runtimeStatus?.rtk.enabled === true, {
+                busy: t("addons.updating", { name: "RTK" }),
+                done: t("addons.updated", { name: "RTK" })
+              }, checkedRtkTool?.availableVersion)
+            }
+            onInstall={() => void runAddonAction("install_addon", "rtk")}
+            onToggleEnabled={() => void handleRtkToggle(!runtimeStatus?.rtk.enabled)}
+            onUninstall={() => void runAddonAction("uninstall_addon", "rtk")}
+          >
+            {runtimeStatus?.rtk.installed ? (
+              <>
+                <button
+                  type="button"
+                  className="addon-card__link"
+                  onClick={async () => {
+                    const next = !showRtkDetails;
+                    setShowRtkDetails(next);
+                    if (next) {
+                      try {
+                        const lines = await invoke<string[]>("get_rtk_activity", { maxLines: 80 });
+                        setRtkActivityLines(lines);
+                      } catch {
+                        setRtkActivityLines(["Failed to load RTK activity."]);
+                      }
+                    }
+                  }}
+                >
+                  {showRtkDetails ? t("settings.hideLogs") : t("settings.showLogs")}
+                </button>
+                {showRtkDetails ? (
+                  <pre className="runtime-log" ref={rtkActivityRef}>
+                    {rtkActivityLines.length > 0 ? rtkActivityLines.join("\n") : t("settings.noLogs")}
+                  </pre>
+                ) : null}
+              </>
+            ) : null}
+                    </AddonCard>
+                  ) : null}
+                </ul>
+              </section>
+            );
+          })}
+        </div>
+    </>
+  );
+
   const activeNavItem = navItems.find((item) => item.id === activeView);
   const activeViewTitle = activeNavItem ? t(activeNavItem.labelKey) : t("nav.settings");
   return (
@@ -7960,271 +8250,12 @@ export default function App() {
           </div>
         ) : null}
 
-        <div className="tray-content" hidden={activeView !== "addons"}>
-          <article className="soft-card addons-card">
-            <header className="addons-card__head">
-              <div className="addons-card__title-row">
-                <span className="addons-card__title-icon" aria-hidden="true">
-                  <PuzzlePiece weight="duotone" />
-                </span>
-                <h1>{t("nav.tools")}</h1>
-              </div>
-              <p className="addons-card__blurb">
-                {t(
-                  desktopPlatform === "windows"
-                    ? "tools.descriptionDevice"
-                    : "tools.description"
-                )} {" "}
-                <ProjectIssuesLink onOpen={openExternalLink}>
-                  {t("tools.requestAddon")}
-                </ProjectIssuesLink>
-              </p>
-              <div className="addons-card__updates" aria-live="polite">
-                <button
-                  type="button"
-                  className="secondary-button addons-card__update-button"
-                  disabled={addonUpdateBusy}
-                  onClick={() => void refreshAddonUpdates()}
-                >
-                  <ArrowClockwise aria-hidden="true" size={14} />
-                  {addonUpdateBusy ? t("addons.checkingUpdates") : t("addons.checkUpdates")}
-                </button>
-                {addonUpdatesChecked && !addonUpdateBusy ? (
-                  <span className={addonUpdateCheckFailed ? "addons-card__update-error" : undefined}>
-                    {addonUpdateCheckFailed
-                      ? t("addons.updateCheckFailed")
-                      : addonUpdateFailureCount > 0
-                        ? t("addons.updateCheckPartial", {
-                            count: addonUpdateFailureCount,
-                            updates: addonUpdatesFound,
-                          })
-                        : addonUpdatesFound > 0
-                          ? t("addons.updatesFound", { count: addonUpdatesFound })
-                          : t("addons.allUpToDate")}
-                  </span>
-                ) : null}
-              </div>
-              <AddonPresetBar
-                dashboard={dashboard}
-                busy={addonPresetBusy}
-                mode={addonPresetMode}
-                onApplyRecommended={() => void applyRecommendedAddonPreset()}
-                onSelectCustom={() => {
-                  addonPresetUserSelectedCustomRef.current = true;
-                  setAddonPresetMode("custom");
-                }}
-              />
-            </header>
-          </article>
-            <div
-              className="addons__groups"
-              role="group"
-              aria-label={t("aria.localTools")}
-            >
-              {TOOL_CATEGORY_ORDER.map((category) => {
-                const categoryTools = groupedAddonTools.get(category) ?? [];
-                const includesRtk = category === "efficiency";
-                if (!categoryTools.length && !includesRtk) return null;
-                const categoryCopy = toolCategoryCopy[category];
-                const workflowGroup = categoryTools.find((tool) => tool.workflowGroup)?.workflowGroup;
-                const singleSelectLabel = workflowGroup
-                  ? localizeWorkflowCopy(workflowGroupCopy[workflowGroup]?.[resolvedLocale] ?? "")
-                  : null;
-                return (
-                  <section
- className={`addon-group addon-group--${category}`}
-                    key={category}
-                    aria-labelledby={`addon-group-${category}`}
-                  >
-                    <header className="addon-group__head">
-                      <div className="addon-group__copy">
-                        <h2 id={`addon-group-${category}`}>{localizeWorkflowCopy(categoryCopy.title[resolvedLocale])}</h2>
-                        <p>{localizeWorkflowCopy(categoryCopy.description[resolvedLocale])}</p>
-                      </div>
-                      {singleSelectLabel ? (
-                  <span className="tool-group__rule">{singleSelectLabel}</span>
-                      ) : null}
-                    </header>
-                    <ul className="addons__list">
-                      {categoryTools.map((tool) => {
-                  const installed = tool.status !== "not_installed";
-                  return (
-                    <AddonCard
-                      key={tool.id}
-                      toolId={tool.id}
-                      name={tool.name}
-                      version={tool.version}
-                      installed={installed}
-                      enabled={tool.enabled}
-                    description={codexOnlyUiCopy(
-                      ADDON_DESCRIPTION_KEYS[tool.id]
-                        ? t(ADDON_DESCRIPTION_KEYS[tool.id])
-                        : localizeWorkflowCopy(toolCopy[tool.id]?.[resolvedLocale] ?? tool.description)
-                    )}
-                      activationLabel={localizeWorkflowCopy(getActivationScopeCopy(tool.activationScope)[resolvedLocale])}
-                      copy={codexOnlyAddonCopy(addonCopy[tool.id])}
-                      infoOpen={addonInfoId === tool.id}
-                      onToggleInfo={() =>
-                        setAddonInfoId(addonInfoId === tool.id ? null : tool.id)
-                      }
-                      busy={tool.id in addonBusyById}
-                      busyLabel={addonBusyById[tool.id] ?? null}
-                      resultMessage={addonResultById[tool.id] ?? null}
-                      errorMessage={addonErrorById[tool.id] ?? null}
-                      noticeMessage={addonNoticeById[tool.id] ?? null}
-                      onDismissNotice={() =>
-                        setAddonNoticeById((current) =>
-                          clearAddonOperationMessage(current, tool.id)
-                        )
-                      }
-                      upstreamVersion={tool.upstreamVersion ?? null}
-                      upstreamUpdateAvailable={tool.upstreamUpdateAvailable ?? false}
-                      updateRequiresAppUpdate={tool.updateRequiresAppUpdate ?? false}
-                      supportedVersion={tool.supportedVersion ?? null}
-                      onDismissResult={() =>
-                        setAddonResultById((current) =>
-                          clearAddonOperationMessage(current, tool.id)
-                        )
-                      }
-                      sourceUrl={tool.sourceUrl}
-                      onOpenSource={() => void openExternalLink(tool.sourceUrl)}
-                    connectors={addonConnectors(tool.id, connectors)}
-                    showClients={installed && tool.enabled}
-                    savings={tool.savingsLabel ?? null}
-                    defaultMode={tool.defaultMode ?? null}
-                    supportedModes={tool.supportedModes ?? []}
-                    actionsDisabled={addonPresetMode === "recommended" || tool.id in addonBusyById}
-                    onModeChange={(mode) => void runAddonModeAction(tool.id, mode)}
-                      updateAvailable={tool.updateAvailable ?? false}
-                      updateActionAvailable={tool.updateActionAvailable ?? false}
-                      repairActionAvailable={tool.repairActionAvailable ?? false}
-                      updateCheckFailed={tool.updateCheckFailed ?? false}
-                      availableVersion={tool.availableVersion ?? null}
-                      unavailableReason={tool.unavailableReason ?? null}
-                      onUpdate={() =>
-                        // Pass the current enable state so updating a disabled
-                        // addon refreshes its files without switching it on.
-                        void runAddonAction("install_addon", tool.id, tool.enabled, {
-                          busy: t(tool.repairActionAvailable ? "addons.repairing" : "addons.updating", { name: tool.name }),
-                          done: t(tool.repairActionAvailable ? "addons.repaired" : "addons.updated", { name: tool.name })
-                        }, tool.availableVersion)
-                      }
-                      onInstall={() => void runAddonAction("install_addon", tool.id)}
-                      onToggleEnabled={() =>
-                        void requestAddonToggle(tool)
-                      }
-                      onUninstall={() => void runAddonAction("uninstall_addon", tool.id)}
-                    />
-                  );
-                })}
-                      {includesRtk ? (
-                        <AddonCard
-                key="rtk"
-                toolId="rtk"
-                name="RTK"
-                version={runtimeStatus?.rtk.version}
-                installed={runtimeStatus?.rtk.installed === true}
-                enabled={runtimeStatus?.rtk.enabled === true}
-                description={
-                  <>
-                    {t("tools.rtkDescription")}
-                    {rtkAvgSavingsPct !== null
-                      ? ` ${t("addons.avgSavings", { value: percent1(rtkAvgSavingsPct) })}`
-                      : ""}
-                  </>
-                }
-                activationLabel={localizeWorkflowCopy(getActivationScopeCopy(checkedRtkTool?.activationScope)[resolvedLocale])}
-                copy={addonCopy.rtk}
-                infoOpen={addonInfoId === "rtk"}
-                onToggleInfo={() => setAddonInfoId(addonInfoId === "rtk" ? null : "rtk")}
-                busy={"rtk" in addonBusyById}
-                busyLabel={addonBusyById.rtk ?? null}
-                resultMessage={addonResultById.rtk ?? null}
-                errorMessage={addonErrorById.rtk ?? null}
-                noticeMessage={addonNoticeById.rtk ?? null}
-                onDismissNotice={() =>
-                  setAddonNoticeById((current) =>
-                    clearAddonOperationMessage(current, "rtk")
-                  )
-                }
-                upstreamVersion={checkedRtkTool?.upstreamVersion ?? null}
-                upstreamUpdateAvailable={checkedRtkTool?.upstreamUpdateAvailable ?? false}
-                updateRequiresAppUpdate={checkedRtkTool?.updateRequiresAppUpdate ?? false}
-                supportedVersion={checkedRtkTool?.supportedVersion ?? null}
-                onDismissResult={() =>
-                  setAddonResultById((current) =>
-                    clearAddonOperationMessage(current, "rtk")
-                  )
-                }
-                sourceUrl={
-                  dashboard.tools.find((tool) => tool.id === "rtk")?.sourceUrl ??
-                  "https://github.com/rtk-ai/rtk"
-                }
-                onOpenSource={() =>
-                  void openExternalLink(
-                    dashboard.tools.find((tool) => tool.id === "rtk")?.sourceUrl ??
-                      "https://github.com/rtk-ai/rtk"
-                  )
-                }
-                connectors={connectors}
-                showClients={
-                  runtimeStatus?.rtk.installed === true && runtimeStatus.rtk.enabled === true
-                }
-                savings={rtkSavingsChip}
-                actionsDisabled={addonPresetMode === "recommended" || rtkBusy || "rtk" in addonBusyById || !runtimeStatus}
-                updateAvailable={checkedRtkTool?.updateAvailable ?? false}
-                updateActionAvailable={checkedRtkTool?.updateActionAvailable ?? false}
-                repairActionAvailable={checkedRtkTool?.repairActionAvailable ?? false}
-                updateCheckFailed={checkedRtkTool?.updateCheckFailed ?? false}
-                availableVersion={checkedRtkTool?.availableVersion ?? null}
-                unavailableReason={
-                  checkedRtkTool?.unavailableReason ??
-                  null
-                }
-                onUpdate={() =>
-                  void runAddonAction("install_addon", "rtk", runtimeStatus?.rtk.enabled === true, {
-                    busy: t("addons.updating", { name: "RTK" }),
-                    done: t("addons.updated", { name: "RTK" })
-                  }, checkedRtkTool?.availableVersion)
-                }
-                onInstall={() => void runAddonAction("install_addon", "rtk")}
-                onToggleEnabled={() => void handleRtkToggle(!runtimeStatus?.rtk.enabled)}
-                onUninstall={() => void runAddonAction("uninstall_addon", "rtk")}
-              >
-                {runtimeStatus?.rtk.installed ? (
-                  <>
-                    <button
-                      type="button"
-                      className="addon-card__link"
-                      onClick={async () => {
-                        const next = !showRtkDetails;
-                        setShowRtkDetails(next);
-                        if (next) {
-                          try {
-                            const lines = await invoke<string[]>("get_rtk_activity", { maxLines: 80 });
-                            setRtkActivityLines(lines);
-                          } catch {
-                            setRtkActivityLines(["Failed to load RTK activity."]);
-                          }
-                        }
-                      }}
-                    >
-                      {showRtkDetails ? t("settings.hideLogs") : t("settings.showLogs")}
-                    </button>
-                    {showRtkDetails ? (
-                      <pre className="runtime-log" ref={rtkActivityRef}>
-                        {rtkActivityLines.length > 0 ? rtkActivityLines.join("\n") : t("settings.noLogs")}
-                      </pre>
-                    ) : null}
-                  </>
-                ) : null}
-                        </AddonCard>
-                      ) : null}
-                    </ul>
-                  </section>
-                );
-              })}
-            </div>
+        <div className="tray-content" hidden={!["addons", "mcp", "skills"].includes(activeView)}>
+          {activeView === "mcp" ? (
+            <McpManagerPanel active>{addonManagedContent}</McpManagerPanel>
+          ) : activeView === "skills" ? (
+            <SkillManagerPanel active>{addonManagedContent}</SkillManagerPanel>
+          ) : addonManagedContent}
         </div>
 
         {!LOCAL_COMMUNITY_EDITION ? (

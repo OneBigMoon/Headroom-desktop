@@ -129,6 +129,7 @@ mod platform {
         fn SecItemCopyMatching(query: CFDictionaryRef, result: *mut CFTypeRef) -> OSStatus;
         fn SecItemUpdate(query: CFDictionaryRef, attrs_to_update: CFDictionaryRef) -> OSStatus;
         fn SecItemDelete(query: CFDictionaryRef) -> OSStatus;
+        fn SecKeychainSetUserInteractionAllowed(state: u8) -> OSStatus;
     }
 
     unsafe fn cf_string(s: &str) -> CFStringRef {
@@ -166,6 +167,21 @@ mod platform {
         CFRelease(svc);
         CFRelease(acc);
         dict
+    }
+
+    pub fn read_secret_without_interaction(
+        service: &str,
+        account: &str,
+    ) -> Result<Option<String>, String> {
+        // Legacy login-keychain items ignore per-query authentication UI flags.
+        // This process is a short-lived helper, so leave its UI disabled until exit.
+        unsafe {
+            check_status(
+                SecKeychainSetUserInteractionAllowed(0),
+                "disable helper keychain interaction",
+            )?;
+        }
+        read_secret(service, account)
     }
 
     pub fn read_secret(service: &str, account: &str) -> Result<Option<String>, String> {
@@ -419,6 +435,23 @@ mod platform {
 
 pub fn read_secret(service: &str, account: &str) -> Result<Option<String>, String> {
     platform::read_secret(service, account)
+}
+
+/// Only for a dedicated helper process: disables that process's keychain UI.
+/// Never falls back to plaintext credential storage on unsupported builds.
+pub fn read_secret_without_interaction(
+    service: &str,
+    account: &str,
+) -> Result<Option<String>, String> {
+    #[cfg(all(not(debug_assertions), target_os = "macos"))]
+    {
+        platform::read_secret_without_interaction(service, account)
+    }
+    #[cfg(not(all(not(debug_assertions), target_os = "macos")))]
+    {
+        let _ = (service, account);
+        Err("Noninteractive keychain access is unavailable in this build.".into())
+    }
 }
 
 pub fn write_secret(service: &str, account: &str, secret: &str) -> Result<(), String> {

@@ -1,0 +1,61 @@
+.extension-client-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  min-height: 44px;
+  padding: 7px 12px;
+  border: 1px solid var(--border-default);
+  border-radius: 9px;
+  background: var(--surface-sunken);
+  color: var(--text-muted);
+  font: inherit;
+  cursor: pointer;
+}
+
+.extension-client-toggle.is-enabled {
+  border-color: var(--accent);
+  background: var(--accent-tint);
+  color: var(--accent);
+}
+
+.extension-client-toggle:hover:not(:disabled) {
+  background: var(--fill-hover);
+}
+
+.extension-client-toggle.is-enabled:hover:not(:disabled) {
+  background: var(--accent-tint-strong);
+}
+
+.extension-client-toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.extension-client-toggle:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.extension-client-toggle__icon {
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+.extension-client-toggle__copy {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  line-height: 1.25;
+}
+
+.extension-client-toggle__copy strong {
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.extension-client-toggle__copy small {
+  color: inherit;
+  font-size: var(--text-xs);
+}

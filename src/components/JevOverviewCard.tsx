@@ -9,6 +9,7 @@ interface JevOverviewCardProps {
 }
 
 interface JevDashboardSnapshot {
+  autoEnabled?: boolean;
   records: JevRecord[];
 }
 
@@ -36,20 +37,30 @@ export function JevOverviewCard({ active, onOpenDecisions }: JevOverviewCardProp
   useEffect(() => {
     if (!active) return;
     let cancelled = false;
+    let autoEnabled = false;
+    let timer: number | undefined;
     setLoading(true);
     setLoadFailed(false);
-    void invoke<JevDashboardSnapshot>("get_jev_dashboard")
-      .then((result) => {
-        if (!cancelled) setDashboard(result);
-      })
-      .catch(() => {
+    const load = async () => {
+      try {
+        const result = await invoke<JevDashboardSnapshot>("get_jev_dashboard");
+        if (cancelled) return;
+        autoEnabled = result.autoEnabled === true;
+        setDashboard(result);
+        setLoadFailed(false);
+      } catch {
         if (!cancelled) setLoadFailed(true);
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+          if (autoEnabled) timer = window.setTimeout(() => void load(), 4000);
+        }
+      }
+    };
+    void load();
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
     };
   }, [active, retry]);
 
@@ -75,7 +86,7 @@ export function JevOverviewCard({ active, onOpenDecisions }: JevOverviewCardProp
       <header className="jev-overview__header">
         <div>
           <h2 id="jev-overview-title">决策概览</h2>
-          <p>手动评估 · 本次会话最近 200 条</p>
+          <p>手动与 Codex 自动评估 · 最近 200 条</p>
         </div>
         <button type="button" className="jev-overview__link" onClick={onOpenDecisions}>打开决策</button>
       </header>
@@ -88,7 +99,7 @@ export function JevOverviewCard({ active, onOpenDecisions }: JevOverviewCardProp
           <button type="button" className="jev-overview__link" onClick={() => setRetry((value) => value + 1)}>重试</button>
         </div>
       ) : records.length === 0 ? (
-        <p className="jev-overview__state">还没有决策记录。到“类型化决策”进行一次手动评估，结果就会显示在这里。</p>
+        <p className="jev-overview__state">还没有决策记录。到“类型化决策”手动评估，或开启 TypeSafe 自动评估 Codex 请求。</p>
       ) : (
         <>
           <div className="jev-overview__metrics" aria-label="决策会话指标">
@@ -131,7 +142,7 @@ export function JevOverviewCard({ active, onOpenDecisions }: JevOverviewCardProp
           </div>
         </>
       )}
-      <p className="jev-overview__note">质量未评估；confidence 不等于准确率。暂无成本或节省金额基线。</p>
+      <p className="jev-overview__note">质量未评估；confidence 不等于准确率。费用估值见决策面板，分类节省没有基线。</p>
     </section>
   );
 }

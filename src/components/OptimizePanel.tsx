@@ -1,9 +1,11 @@
 import {
   useCallback,
   useEffect,
+  useId,
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import { useI18n } from "../lib/i18n";
 import type { AppliedPatterns, AppliedSection } from "../lib/types";
@@ -50,6 +52,7 @@ export function OptimizePanel({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busyIds, setBusyIds] = useState<Set<string>>(new Set());
   const [modal, setModal] = useState<ModalKind>(null);
+  const closeModal = useCallback(() => setModal(null), []);
 
   // Reading `hasPreloadedApplied` via a ref inside `refetch` keeps its identity
   // stable when the parent flips from "still loading the aggregate" to
@@ -197,7 +200,7 @@ export function OptimizePanel({
       </span>
 
       {modal === "claude" ? (
-        <Modal title={t(source === "codex" ? "optimize.codexAgentsTitle" : "optimize.claudeTitle")} onClose={() => setModal(null)}>
+        <Modal title={t(source === "codex" ? "optimize.codexAgentsTitle" : "optimize.claudeTitle")} onClose={closeModal}>
           {loadError ? <p className="install-progress__error">{loadError}</p> : null}
           {applied === null ? (
             <p className="optimize-panel__empty">{t("settings.loading")}</p>
@@ -217,7 +220,7 @@ export function OptimizePanel({
       ) : null}
 
       {modal === "memory" ? (
-        <Modal title={t(source === "codex" ? "optimize.codexInstructionsTitle" : "optimize.memoryTitle")} onClose={() => setModal(null)}>
+        <Modal title={t(source === "codex" ? "optimize.codexInstructionsTitle" : "optimize.memoryTitle")} onClose={closeModal}>
           {loadError ? <p className="install-progress__error">{loadError}</p> : null}
           {applied === null ? (
             <p className="optimize-panel__empty">{t("settings.loading")}</p>
@@ -249,11 +252,33 @@ function Modal({
   children: React.ReactNode;
 }) {
   const { t } = useI18n();
-  return (
+  const titleId = useId();
+  const closeButtonRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => {
+    const previousFocus = document.activeElement;
+    closeButtonRef.current?.focus();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      if (previousFocus instanceof HTMLElement && previousFocus.isConnected) {
+        previousFocus.focus();
+      }
+    };
+  }, [onClose]);
+
+  return createPortal(
     <div
       className="modal-backdrop"
       role="dialog"
       aria-modal="true"
+      aria-labelledby={titleId}
       onClick={onClose}
     >
       <div
@@ -261,8 +286,9 @@ function Modal({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="optimize-panel__modal-header">
-          <h3>{title}</h3>
+          <h3 id={titleId}>{title}</h3>
           <button
+            ref={closeButtonRef}
             type="button"
             className="optimize-panel__modal-close"
             onClick={onClose}
@@ -273,7 +299,8 @@ function Modal({
         </div>
         <div className="optimize-panel__modal-body">{children}</div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
 

@@ -1,5 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { JevOverviewCard } from "./JevOverviewCard";
 import type { JevRecord } from "./JevPanel";
 
@@ -24,6 +24,23 @@ const nativeRecord: JevRecord = {
 describe("JevOverviewCard", () => {
   beforeEach(() => {
     invokeMock.mockReset();
+  });
+
+  afterEach(() => vi.useRealTimers());
+
+  it("refreshes automatic records while active and stops on leaving the overview", async () => {
+    vi.useFakeTimers();
+    invokeMock.mockResolvedValue({ autoEnabled: true, records: [] });
+    const { rerender } = render(<JevOverviewCard active onOpenDecisions={vi.fn()} />);
+    await act(async () => {});
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    invokeMock.mockResolvedValue({ autoEnabled: true, records: [{ ...nativeRecord, source: "codex" }] });
+    await act(async () => { await vi.advanceTimersByTimeAsync(4000); });
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("coding")).toBeInTheDocument();
+    rerender(<JevOverviewCard active={false} onOpenDecisions={vi.fn()} />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(12000); });
+    expect(invokeMock).toHaveBeenCalledTimes(2);
   });
 
   it("shows the empty state without evaluating or exposing credentials", async () => {

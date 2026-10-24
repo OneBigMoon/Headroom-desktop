@@ -137,6 +137,25 @@ describe("OptimizePanel", () => {
     );
   });
 
+  it.each([
+    /2 learnings in CLAUDE.local\.md/i,
+    /1 reminder in MEMORY\.md/i,
+  ])("opens %s outside a clipping card", async (pillName) => {
+    const { container } = render(
+      <section style={{ transform: "translateZ(0)", backdropFilter: "blur(12px)", overflow: "hidden" }}>
+        <OptimizePanel projectPath="/proj" preloadedApplied={samplePatterns} />
+      </section>
+    );
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("button", { name: pillName }));
+
+    const dialog = screen.getByRole("dialog");
+    expect(dialog.parentElement).toBe(document.body);
+    expect(container).not.toContainElement(dialog);
+    expect(screen.getByRole("button", { name: /^Close$/i })).toBeVisible();
+  });
+
   it("renders a loading state when no preloaded data is supplied and IPC has not resolved", () => {
     invokeMock.mockReturnValue(new Promise(() => {})); // never resolves
     render(<OptimizePanel projectPath="/proj" />);
@@ -291,6 +310,23 @@ describe("OptimizePanel", () => {
     await waitFor(() =>
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
     );
+  });
+
+  it("closes on Escape and returns focus to the result pill", async () => {
+    render(
+      <OptimizePanel projectPath="/proj" preloadedApplied={samplePatterns} />
+    );
+    const user = userEvent.setup();
+    const pill = screen.getByRole("button", { name: /2 learnings in CLAUDE.local\.md/i });
+
+    await user.click(pill);
+
+    expect(screen.getByRole("dialog", { name: "Learnings in CLAUDE.local.md" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Close$/i })).toHaveFocus();
+    await user.keyboard("{Escape}");
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(pill).toHaveFocus();
   });
 
   it("closes the modal when the backdrop is clicked", async () => {

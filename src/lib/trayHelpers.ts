@@ -10,6 +10,8 @@ export type TrayView =
   | "health"
   | "notifications"
   | "addons"
+  | "mcp"
+  | "skills"
   | "upgrade"
   | "upgradeAuth"
   | "settings";

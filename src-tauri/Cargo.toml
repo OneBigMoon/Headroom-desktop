@@ -1,6 +1,6 @@
 [package]
 name = "headroom-local-community"
-version = "1.0.21"
+version = "1.0.22"
 description = "Unofficial local-only community desktop for open-source Headroom tooling"
 authors = ["Headroom Local Community contributors"]
 license = "MIT"
@@ -42,11 +42,13 @@ tempfile = "3"
 tauri = { version = "=2.11.1", features = ["macos-private-api", "tray-icon"] }
 tauri-plugin-autostart = "2.5.1"
 tauri-plugin-deep-link = "2"
+tauri-plugin-dialog = "=2.7.1"
 tauri-plugin-notification = "2.3.3"
 tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2.10.0"
 time = "=0.3.47"
 toml = "0.8"
+toml_edit = "=0.23.4"
 tokio = { version = "=1.50.0", features = ["macros", "rt-multi-thread", "process", "fs", "time"] }
 uuid = { version = "=1.22.0", features = ["v4", "serde"] }
 

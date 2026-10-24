@@ -58,7 +58,7 @@ pub const ROUTER_PROTOCOL_VERSION: &str = "2";
 /// Advertise both the wire-protocol generation and the package version for
 /// diagnostics. The build suffix also replaces an affected helper when a
 /// locally rebuilt app retains the same package version.
-pub const ROUTER_RUNTIME_VERSION: &str = concat!("2/", env!("CARGO_PKG_VERSION"), "+binary-head.1");
+pub const ROUTER_RUNTIME_VERSION: &str = concat!("2/", env!("CARGO_PKG_VERSION"), "+drain.1");
 
 /// Argument understood by the desktop executable before Tauri startup.
 pub const ROUTER_ARG: &str = "--headroom-codex-router";
@@ -203,9 +203,11 @@ pub fn ensure_running() -> std::io::Result<()> {
         match probe_router_owned_version(&control_token) {
             Some(version) if version == ROUTER_RUNTIME_VERSION => return Ok(()),
             Some(version) if router_version_compatible(&version) => {
-                // Only an authenticated, same-protocol helper may be updated.
-                // Keeping an old helper alive also keeps its routing bugs alive
-                // after the GUI is upgraded. Never resolve/kill an arbitrary PID.
+                // Legacy helpers abort active Codex sockets on shutdown. Reuse
+                // them until they exit naturally instead of breaking a live turn.
+                if !version.contains("+drain.") {
+                    return Ok(());
+                }
                 shutdown_and_wait_locked()?;
             }
             Some(_) => {
@@ -879,7 +881,9 @@ fn run_server() -> std::io::Result<()> {
         let address = SocketAddr::from(([127, 0, 0, 1], CODEX_ROUTER_PORT));
         let listener = TcpListener::bind(address).await?;
         let permits = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT));
+        let mut clients = tokio::task::JoinSet::new();
         loop {
+            while clients.try_join_next().is_some() {}
             if ROUTER_SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
                 break;
             }
@@ -889,7 +893,7 @@ fn run_server() -> std::io::Result<()> {
             match tokio::time::timeout(Duration::from_millis(100), listener.accept()).await {
                 Ok(Ok((client, _))) => {
                     let permits = permits.clone();
-                    tokio::spawn(async move {
+                    clients.spawn(async move {
                         let Ok(_permit) = permits.acquire_owned().await else {
                             return;
                         };
@@ -909,8 +913,20 @@ fn run_server() -> std::io::Result<()> {
                 }
             }
         }
+        // Release the stable port first so the new build can accept requests.
+        // Existing sessions keep their old helper until their sockets close.
+        drain_router_clients(listener, clients).await;
         Ok(())
     })
+}
+
+async fn drain_router_clients(listener: TcpListener, mut clients: tokio::task::JoinSet<()>) {
+    drop(listener);
+    // NSIS must release the old executable before it can install on Windows.
+    #[cfg(not(windows))]
+    while clients.join_next().await.is_some() {}
+    #[cfg(windows)]
+    clients.abort_all();
 }
 
 async fn handle_client(mut client: TcpStream) {
@@ -1750,6 +1766,45 @@ pub fn route_mode() -> RouteMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn router_handoff_releases_port_and_keeps_existing_stream_alive() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let (mut router_socket, _) = listener.accept().await.unwrap();
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut router_upstream = TcpStream::connect(upstream.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut provider, _) = upstream.accept().await.unwrap();
+        let mut clients = tokio::task::JoinSet::new();
+        clients.spawn(async move {
+            let _ = tokio::io::copy_bidirectional(&mut router_socket, &mut router_upstream).await;
+        });
+        provider.write_all(b"before").await.unwrap();
+        let mut bytes = [0; 6];
+        client.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"before");
+
+        let draining = tokio::spawn(drain_router_clients(listener, clients));
+        tokio::task::yield_now().await;
+        let replacement = TcpListener::bind(address)
+            .await
+            .expect("new helper can bind");
+        assert!(!draining.is_finished());
+        provider.write_all(b"after!").await.unwrap();
+        client.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"after!");
+        drop(client);
+        drop(provider);
+        tokio::time::timeout(Duration::from_secs(1), draining)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(replacement);
+    }
 
     #[test]
     fn chatgpt_path_drops_openai_v1_prefix() {

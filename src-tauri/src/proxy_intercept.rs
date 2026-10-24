@@ -17,7 +17,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -48,6 +48,95 @@ const CODEX_BACKEND_RECOVERY_WAIT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const CODEX_BACKEND_RECOVERY_WAIT: Duration = Duration::from_millis(100);
 const CODEX_BACKEND_RECOVERY_MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+pub(crate) const CODEX_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
+
+struct CodexDrain {
+    state: Mutex<(bool, usize)>,
+    idle: Condvar,
+}
+
+impl CodexDrain {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new((false, 0)),
+            idle: Condvar::new(),
+        }
+    }
+
+    fn begin(&self) -> Option<CodexRequest<'_>> {
+        let mut state = self.state.lock();
+        if state.0 {
+            return None;
+        }
+        state.1 += 1;
+        Some(CodexRequest(self))
+    }
+
+    fn drain(&self, timeout: Option<Duration>) -> bool {
+        self.state.lock().0 = true;
+        self.wait(timeout)
+    }
+
+    fn wait(&self, timeout: Option<Duration>) -> bool {
+        let deadline = timeout.map(|timeout| std::time::Instant::now() + timeout);
+        let mut state = self.state.lock();
+        while state.1 != 0 {
+            if !state.0 {
+                return false;
+            }
+            if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                self.idle.wait_for(&mut state, remaining);
+            } else {
+                self.idle.wait(&mut state);
+            }
+        }
+        state.0
+    }
+
+    fn resume(&self) {
+        self.state.lock().0 = false;
+        self.idle.notify_all();
+    }
+}
+
+struct CodexRequest<'a>(&'a CodexDrain);
+
+impl Drop for CodexRequest<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock();
+        state.1 -= 1;
+        self.0.idle.notify_all();
+    }
+}
+
+static CODEX_DRAIN: CodexDrain = CodexDrain::new();
+
+pub(crate) fn drain_codex_requests() {
+    if !CODEX_DRAIN.drain(Some(CODEX_DRAIN_TIMEOUT)) {
+        log::warn!("Codex connections still active after shutdown grace period");
+    }
+}
+
+pub(crate) fn retire_codex_requests() -> bool {
+    CODEX_DRAIN.wait(None)
+}
+
+pub(crate) fn begin_codex_retirement() {
+    CODEX_DRAIN.state.lock().0 = true;
+}
+
+pub(crate) fn codex_requests_draining() -> bool {
+    CODEX_DRAIN.state.lock().0
+}
+
+pub(crate) fn resume_codex_requests() {
+    CODEX_DRAIN.resume();
+}
 
 /// Max requests forwarded to the Python backend concurrently. Each forward
 /// holds a client + backend FD for the request's full lifetime (SSE streams
@@ -763,6 +852,12 @@ async fn handle(
     fresh_bearer_tx: FreshBearerNotifier,
     upstream_base: Arc<String>,
 ) {
+    // Count sockets before reading headers, including direct/bypass forwarding.
+    // Late arrivals retry through the detached router's native route.
+    let Some(_connection) = CODEX_DRAIN.begin() else {
+        write_retryable_service_unavailable(&mut client).await;
+        return;
+    };
     // Re-read the backend port on each connection. `tool_manager` selects the
     // port (and may switch to a fallback) when the proxy spawn runs, which
     // happens after this thread is already accepting; reading per-connection
@@ -3132,6 +3227,221 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
         (listener, addr)
+    }
+
+    #[test]
+    fn codex_drain_is_bounded_and_blocks_new_backend_requests() {
+        let drain = super::CodexDrain::new();
+        let active = drain.begin().expect("active request");
+        assert!(!drain.drain(Some(Duration::from_millis(1))));
+        assert!(drain.begin().is_none());
+        drop(active);
+        assert!(drain.drain(Some(Duration::ZERO)));
+    }
+
+    #[test]
+    fn resuming_cancels_retirement_without_dropping_existing_connection() {
+        let drain = Arc::new(super::CodexDrain::new());
+        let active = drain.begin().unwrap();
+        drain.state.lock().0 = true;
+        let waiting = drain.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            done_tx.send(waiting.wait(None)).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drain.resume();
+        assert!(!done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert!(drain.begin().is_some());
+        assert_eq!(drain.state.lock().1, 1, "original connection remains owned");
+        drop(active);
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn codex_shutdown_waits_for_backend_stream_to_finish() {
+        super::resume_codex_requests();
+        let (backend, backend_address) = bind_ephemeral().await;
+        backend_port::set(backend_address.port());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let provider = tokio::spawn(async move {
+            let (mut socket, _) = backend.accept().await.unwrap();
+            read_until_header_end(&mut socket).await;
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\nevent: response.created\n\n").await.unwrap();
+            started_tx.send(()).unwrap();
+            finish_rx.await.unwrap();
+            socket
+                .write_all(b"event: response.completed\ndata: {}\n\n")
+                .await
+                .unwrap();
+        });
+        let (listener, address) = bind_ephemeral().await;
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let (bearer_tx, _bearer_rx) = std::sync::mpsc::channel();
+        let intercept = tokio::spawn(super::handle(
+            socket,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            bearer_tx,
+            Arc::new("http://127.0.0.1:1".into()),
+        ));
+        client
+            .write_all(
+                b"POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
+            )
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        let draining = tokio::task::spawn_blocking(super::drain_codex_requests);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !super::CODEX_DRAIN.state.lock().0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !draining.is_finished(),
+            "backend must stay alive during an active response"
+        );
+        assert!(super::CODEX_DRAIN.begin().is_none());
+        finish_tx.send(()).unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.contains("event: response.completed"));
+        tokio::time::timeout(Duration::from_secs(2), draining)
+            .await
+            .unwrap()
+            .unwrap();
+        intercept.await.unwrap();
+        provider.await.unwrap();
+        super::resume_codex_requests();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn codex_websocket_retirement_preserves_existing_tunnel_and_retries_new_connections() {
+        assert_websocket_retirement(Duration::from_millis(20)).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    #[ignore = "holds a WebSocket beyond the former 120-second shutdown deadline"]
+    async fn codex_websocket_retirement_preserves_tunnel_beyond_120_seconds() {
+        assert_websocket_retirement(Duration::from_secs(125)).await;
+    }
+
+    async fn assert_websocket_retirement(hold: Duration) {
+        use base64::Engine as _;
+
+        struct ResumeOnDrop;
+        impl Drop for ResumeOnDrop {
+            fn drop(&mut self) {
+                super::resume_codex_requests();
+            }
+        }
+        let _restore = ResumeOnDrop;
+        super::resume_codex_requests();
+
+        tokio::time::timeout(hold + Duration::from_secs(5), async {
+            let nonce = base64::engine::general_purpose::STANDARD.encode([0; 16]);
+            // SHA-1 of this public zero nonce plus the RFC 6455 WebSocket GUID.
+            let accept = base64::engine::general_purpose::STANDARD.encode([
+                32, 37, 254, 98, 171, 250, 234, 76, 96, 51, 65, 92, 89, 162, 214, 148, 82, 240, 76, 2,
+            ]);
+            let provider_accept = accept.clone();
+            let (backend, backend_address) = bind_ephemeral().await;
+            backend_port::set(backend_address.port());
+            let provider = tokio::spawn(async move {
+                let (mut socket, _) = backend.accept().await.unwrap();
+                let request = read_until_header_end(&mut socket).await;
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.contains("upgrade: websocket"));
+                assert!(request.contains("connection: upgrade"));
+                let response = format!("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {provider_accept}\r\n\r\n");
+                socket.write_all(response.as_bytes()).await.unwrap();
+
+                // Client frames are masked; server frames are not (RFC 6455).
+                let mut frame = [0; 8];
+                socket.read_exact(&mut frame).await.unwrap();
+                assert_eq!(frame, [0x81, 0x82, 1, 2, 3, 4, b'h' ^ 1, b'i' ^ 2]);
+                socket.write_all(&[0x81, 2, b'o', b'k']).await.unwrap();
+                socket.read_exact(&mut frame).await.unwrap();
+                assert_eq!(frame, [0x88, 0x82, 1, 2, 3, 4, 3 ^ 1, 0xe8 ^ 2]);
+                socket.write_all(&[0x88, 2, 3, 0xe8]).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+
+            let (listener, address) = bind_ephemeral().await;
+            drop(listener);
+            let (bearer_tx, _bearer_rx) = std::sync::mpsc::channel();
+            let intercept = tokio::spawn(run(
+                address,
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(Mutex::new(None)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+                bearer_tx,
+                Arc::new("http://127.0.0.1:1".into()),
+                Arc::new(Mutex::new(None)),
+            ));
+            let mut client = loop {
+                if let Ok(socket) = TcpStream::connect(address).await {
+                    break socket;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            let request = format!("GET /v1/responses HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {nonce}\r\n\r\n");
+            client.write_all(request.as_bytes()).await.unwrap();
+            let response = read_until_header_end(&mut client).await;
+            assert!(response.starts_with(b"HTTP/1.1 101 Switching Protocols\r\n"));
+            assert!(String::from_utf8(response).unwrap().contains(&accept));
+
+            super::begin_codex_retirement();
+            let retiring = tokio::task::spawn_blocking(super::retire_codex_requests);
+            let mut late = TcpStream::connect(address).await.unwrap();
+            let response = read_until_header_end(&mut late).await;
+            let response = String::from_utf8(response).unwrap().to_ascii_lowercase();
+            assert!(response.starts_with("http/1.1 503 service unavailable\r\n"));
+            assert!(response.contains("retry-after: 1\r\n"));
+
+            tokio::time::sleep(hold).await;
+            assert!(!retiring.is_finished(), "idle WebSocket connections have no shutdown deadline");
+            client.write_all(&[0x81, 0x82, 1, 2, 3, 4, b'h' ^ 1, b'i' ^ 2]).await.unwrap();
+            let mut frame = [0; 4];
+            client.read_exact(&mut frame).await.unwrap();
+            assert_eq!(frame, [0x81, 2, b'o', b'k']);
+            assert!(!retiring.is_finished(), "an upgraded tunnel remains owned while retiring");
+            client.write_all(&[0x88, 0x82, 1, 2, 3, 4, 3 ^ 1, 0xe8 ^ 2]).await.unwrap();
+            client.read_exact(&mut frame).await.unwrap();
+            assert_eq!(frame, [0x88, 2, 3, 0xe8]);
+            client.shutdown().await.unwrap();
+            let mut tail = Vec::new();
+            client.read_to_end(&mut tail).await.unwrap();
+            assert!(tail.is_empty());
+            assert!(retiring.await.unwrap());
+            provider.await.unwrap();
+            intercept.abort();
+            let _ = intercept.await;
+        })
+        .await
+        .expect("WebSocket retirement must finish after the close handshake");
     }
 
     /// Read header bytes from `stream` up through (and including) the `\r\n\r\n`
