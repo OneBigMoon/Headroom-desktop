@@ -104,7 +104,7 @@ export function JevOverviewCard({ active, onOpenDecisions }: JevOverviewCardProp
         <>
           <div className="jev-overview__metrics" aria-label="决策会话指标">
             <div><span>请求数</span><strong>{formatCount(records.length)}</strong></div>
-            <div><span>成功率</span><strong>{successPercent.toFixed(1)}%</strong></div>
+            <div><span>调用成功率</span><strong>{successPercent.toFixed(1)}%</strong></div>
             <div><span>延迟 p95</span><strong>{latency === null ? "暂无数据" : `${formatCount(Math.round(latency))} ms`}</strong></div>
             <div>
               <span>输出 token（已上报）</span>
@@ -142,7 +142,7 @@ export function JevOverviewCard({ active, onOpenDecisions }: JevOverviewCardProp
           </div>
         </>
       )}
-      <p className="jev-overview__note">质量未评估；confidence 不等于准确率。费用估值见决策面板，分类节省没有基线。</p>
+      <p className="jev-overview__note">Jev 仅分类观察，未替代 Codex 请求。分类测试结果和额外费用估值见决策面板；调用成功率不代表分类正确率。</p>
     </section>
   );
 }

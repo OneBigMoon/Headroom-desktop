@@ -12,6 +12,7 @@ use crate::keychain;
 use crate::system_one_adapter::{self, AdapterConfig, AdapterProtocol};
 
 mod automatic;
+pub(crate) mod benchmark;
 
 pub fn run_auto_classification_if_requested() -> bool {
     automatic::run_if_requested()
@@ -147,6 +148,7 @@ struct JevInner {
     key: Option<String>,
     adapter_keys: HashMap<JevProvider, AdapterCredential>,
     busy: bool,
+    benchmark_busy: bool,
     auto_enabled: bool,
     records: Vec<JevRecord>,
 }

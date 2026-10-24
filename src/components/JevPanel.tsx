@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { SectionCard } from "./SectionCard";
 import { JevProviderPicker } from "./JevProviderPicker";
+import { JevBenchmarkPanel } from "./JevBenchmarkPanel";
 import "./JevPanel.css";
 
 const MAX_TEXT_LENGTH = 16 * 1024;
@@ -247,6 +248,7 @@ export function JevPanel() {
   const [text, setText] = useState("");
   const [consent, setConsent] = useState(false);
   const [evaluating, setEvaluating] = useState(false);
+  const [benchmarkRunning, setBenchmarkRunning] = useState(false);
   const [autoBusy, setAutoBusy] = useState(false);
   const initialLoadStarted = useRef(false);
   const evaluateInFlight = useRef(false);
@@ -314,10 +316,10 @@ export function JevPanel() {
   }, [loadDashboard]);
 
   useEffect(() => {
-    if (!dashboard.autoEnabled) return;
+    if (!dashboard.autoEnabled && !dashboard.busy) return;
     const interval = window.setInterval(() => void loadDashboard(false, true), 4000);
     return () => window.clearInterval(interval);
-  }, [dashboard.autoEnabled, loadDashboard]);
+  }, [dashboard.autoEnabled, dashboard.busy, loadDashboard]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => setCatalogWorkspaceId(workspaceId.trim()), 500);
@@ -368,7 +370,7 @@ export function JevPanel() {
   }, [provider, goProtocol, region, catalogWorkspaceId, catalogKey, catalogCanSync, catalogRefresh]);
 
   const saveKey = async () => {
-    if (keyBusy || evaluating || dashboard.busy || (provider !== "typesafe" && !endpoint)) return;
+    if (keyBusy || evaluating || benchmarkRunning || dashboard.busy || (provider !== "typesafe" && !endpoint)) return;
     setKeyBusy(true);
     try {
       if (provider === "typesafe") await invoke("set_jev_key", { key });
@@ -385,7 +387,7 @@ export function JevPanel() {
   };
 
   const disconnect = async () => {
-    if (keyBusy || evaluating || dashboard.busy) return;
+    if (keyBusy || evaluating || benchmarkRunning || dashboard.busy) return;
     setKeyBusy(true);
     try {
       if (provider === "typesafe") await invoke("set_jev_key", { key: "" });
@@ -425,7 +427,7 @@ export function JevPanel() {
   };
 
   const evaluate = async () => {
-    if (!providerReady || !consent || !text.trim() || new TextEncoder().encode(text).length > MAX_INPUT_BYTES || evaluating || dashboard.busy || evaluateInFlight.current) return;
+    if (!providerReady || !consent || !text.trim() || new TextEncoder().encode(text).length > MAX_INPUT_BYTES || evaluating || benchmarkRunning || dashboard.busy || evaluateInFlight.current) return;
     evaluateInFlight.current = true;
     setEvaluating(true);
     try {
@@ -474,7 +476,7 @@ export function JevPanel() {
             { id: "custom", label: "自定义模型" },
             ...Object.entries(PROVIDERS).filter(([id]) => id !== "typesafe").map(([id, item]) => ({ id, label: item.label })),
           ]}
-          disabled={evaluating || dashboard.busy || keyBusy}
+          disabled={evaluating || benchmarkRunning || dashboard.busy || keyBusy}
           onChange={(id) => {
             const next = id as DecisionProvider;
             setProvider(next);
@@ -596,15 +598,15 @@ export function JevPanel() {
                 onChange={(event) => setKey(event.target.value)}
                 autoComplete="new-password"
                 placeholder={provider === "typesafe" && dashboard.keyPersistent ? "保存到系统钥匙串" : "仅保留在当前会话"}
-                disabled={keyBusy || evaluating || dashboard.busy}
+                disabled={keyBusy || evaluating || benchmarkRunning || dashboard.busy}
               />
-              <button type="button" className="jev-panel__button" onClick={() => void saveKey()} disabled={keyBusy || evaluating || dashboard.busy || !key.trim() || (provider !== "typesafe" && !endpoint)}>
+              <button type="button" className="jev-panel__button" onClick={() => void saveKey()} disabled={keyBusy || evaluating || benchmarkRunning || dashboard.busy || !key.trim() || (provider !== "typesafe" && !endpoint)}>
                 {keyBusy ? "处理中..." : "设置 key"}
               </button>
             </>
           )}
           {keyConfigured ? (
-            <button type="button" className="jev-panel__button jev-panel__button--danger" onClick={() => void disconnect()} disabled={keyBusy || evaluating || dashboard.busy}>
+            <button type="button" className="jev-panel__button jev-panel__button--danger" onClick={() => void disconnect()} disabled={keyBusy || evaluating || benchmarkRunning || dashboard.busy}>
               断开
             </button>
           ) : null}
@@ -614,16 +616,15 @@ export function JevPanel() {
 
         <div className="jev-panel__metrics" aria-label="最近 200 条指标">
           <div><span>请求数</span><strong>{formatNumber(records.length)}</strong></div>
-          <div><span>问题数</span><strong>{formatNumber(records.length)}</strong></div>
-          <div><span>成功率</span><strong>{successRate === null ? "暂无数据" : `${successRate.toFixed(1)}%`}</strong></div>
+          <div><span>调用成功率</span><strong>{successRate === null ? "暂无数据" : `${successRate.toFixed(1)}%`}</strong></div>
           <div><span>延迟 p50 / p95</span><strong>{formatMetric(percentile(latencyValues, 0.5), " ms")} / {formatMetric(percentile(latencyValues, 0.95), " ms")}</strong></div>
             <div><span>输入 token 总数</span><strong>{tokenRecords.length === 0 ? "暂无数据" : formatNumber(tokenSum)}</strong><small>{missingTokenCount > 0 ? `${missingTokenCount} 条缺少 token 数据` : "完整记录"}</small></div>
             <div><span>输出 token（已上报）</span><strong>{outputTokenRecords.length === 0 ? "暂无数据" : formatNumber(outputTokenSum)}</strong><small>{outputTokenRecords.length}/{records.length} 条有数据；未返回不计为 0</small></div>
-          <div><span>质量</span><strong>NOT EVALUATED</strong><small>confidence != accuracy</small></div>
           <div><span>{provider === "typesafe" ? "TypeSafe 费用估值（USD）" : "成本"}</span><strong>{provider === "typesafe" ? formatEstimatedCost(estimatedCost) : "未提供账单金额"}</strong>{provider === "typesafe" ? <small>已计价 {pricedRecords.length}/{records.length} 条；其余用量或价格未知</small> : null}</div>
-          <div><span>节省</span><strong>无基线</strong></div>
         </div>
-        {provider === "typesafe" ? <p className="jev-panel__hint">Jev 1.13 / 1.14 及当前 jev-latest、jev-preview 按 $0.042/百万输入 Token 估算，输出免费。仅统计已上报用量，未知版本不计价，未扣免费额度或折扣；实际金额以 TypeSafe 账单为准。分类本身没有压缩节省基线。</p> : null}
+        {provider === "typesafe" ? <p className="jev-panel__hint">Jev 1.13 / 1.14 及当前 jev-latest、jev-preview 按 $0.042/百万输入 Token 估算，输出免费。仅统计业务分类的已上报用量，不含下方测试调用，未知版本不计价，未扣免费额度或折扣；实际金额以 TypeSafe 账单为准。</p> : null}
+        <p className="jev-panel__hint">当前仅分类观察，未替代 Codex 请求，不产生可归因的路由节省。额外分类开销见费用估值；调用成功率不代表分类正确率。</p>
+        {provider === "typesafe" && <JevBenchmarkPanel keyConfigured={dashboard.keyConfigured} disabled={loading || keyBusy || evaluating || dashboard.busy} onRunningChange={setBenchmarkRunning} onComplete={() => void loadDashboard(false, true)} />}
 
         <form className="jev-panel__evaluate" onSubmit={(event) => { event.preventDefault(); void evaluate(); }}>
           <div className="jev-panel__evaluate-heading">
@@ -640,7 +641,7 @@ export function JevPanel() {
           <div className="jev-panel__text-meta"><span>最多 16 KiB (UTF-8)</span><span>{inputBytes.toLocaleString()} / {MAX_INPUT_BYTES.toLocaleString()} 字节</span></div>
           {inputBytes > MAX_INPUT_BYTES ? <p className="jev-panel__error" role="alert">文本超过 16 KiB，请缩短后再发送。</p> : null}
           <label className="jev-panel__consent"><input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} /> <span>我同意将这段文本发送到 <span className="jev-panel__endpoint">{endpoint ?? "未设置的接口"}</span>；评估可能产生费用。</span></label>
-          <button type="submit" className="jev-panel__button jev-panel__button--primary" disabled={!providerReady || !consent || !text.trim() || inputBytes > MAX_INPUT_BYTES || evaluating || dashboard.busy}>
+          <button type="submit" className="jev-panel__button jev-panel__button--primary" disabled={!providerReady || !consent || !text.trim() || inputBytes > MAX_INPUT_BYTES || evaluating || benchmarkRunning || dashboard.busy}>
             {evaluating ? "评估中..." : "发送并评估"}
           </button>
         </form>

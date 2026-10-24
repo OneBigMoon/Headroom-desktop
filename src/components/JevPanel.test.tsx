@@ -4,7 +4,8 @@ import userEvent from "@testing-library/user-event";
 import { JevPanel, type JevRecord } from "./JevPanel";
 
 const invokeMock = vi.fn();
-vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invokeMock(...args) }));
+const benchmarkMock = vi.fn();
+vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => String(args[0]).endsWith("_jev_benchmark") ? benchmarkMock(...args) : invokeMock(...args) }));
 
 const deepseekUrl = "https://api.deepseek.com/chat/completions";
 const record: JevRecord = {
@@ -35,6 +36,8 @@ describe("JevPanel", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     invokeMock.mockResolvedValue(dashboard);
+    benchmarkMock.mockReset();
+    benchmarkMock.mockResolvedValue({ datasetVersion: "intent-v1", samples: [{ id: "code", text: "Fix a Rust compiler error.", expected: "coding" }], busy: false, result: null });
   });
 
   afterEach(() => vi.useRealTimers());
@@ -121,6 +124,18 @@ describe("JevPanel", () => {
     expect(invokeMock).toHaveBeenCalledTimes(1);
   });
 
+  it("clears a restored busy state even when automatic classification is off", async () => {
+    vi.useFakeTimers();
+    invokeMock.mockResolvedValueOnce({ ...dashboard, busy: true }).mockResolvedValue(dashboard);
+    render(<JevPanel />);
+    await act(async () => {});
+    expect(screen.getByRole("button", { name: providerTriggerName })).toBeDisabled();
+    await act(async () => { await vi.advanceTimersByTimeAsync(4000); });
+    expect(screen.getByRole("button", { name: providerTriggerName })).not.toBeDisabled();
+    await act(async () => { await vi.advanceTimersByTimeAsync(8000); });
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+  });
+
   it("prices only reported TypeSafe jev-latest input usage and keeps unknowns explicit", async () => {
     const native = { ...record, provider: "typesafe", endpoint: null, model: "jev-latest" };
     invokeMock.mockResolvedValue({ ...dashboard, records: [
@@ -132,7 +147,7 @@ describe("JevPanel", () => {
     expect(await screen.findByText("~$0.084000")).toBeInTheDocument();
     expect(screen.getByText("已计价 1/3 条；其余用量或价格未知")).toBeInTheDocument();
     expect(screen.getByText(/未扣免费额度或折扣；实际金额以 TypeSafe 账单为准/)).toBeInTheDocument();
-    expect(screen.getByText("无基线")).toBeInTheDocument();
+    expect(screen.getByText(/当前仅分类观察，未替代 Codex 请求/)).toBeInTheDocument();
   });
 
   it.each([[0, "~$0.00"], [1, "~<$0.000001"]] as const)("distinguishes reported zero and tiny TypeSafe costs (%s)", async (inputTokens, expected) => {
@@ -390,12 +405,37 @@ describe("JevPanel", () => {
     expect(screen.getByRole("button", { name: "发送并评估" })).toBeDisabled();
   });
 
-  it("reports unknown quality and missing usage without inventing a cost", async () => {
+  it("separates classification tests from business metrics without inventing savings", async () => {
     render(<JevPanel />);
     await screen.findByLabelText("待评估文本");
-    expect(screen.getByText("NOT EVALUATED")).toBeInTheDocument();
+    expect(screen.queryByText("NOT EVALUATED")).not.toBeInTheDocument();
     expect(screen.getByText("暂无用量估值")).toBeInTheDocument();
-    expect(screen.getByText("无基线")).toBeInTheDocument();
+    expect(screen.queryByText("无基线")).not.toBeInTheDocument();
+    expect(screen.queryByText("问题数")).not.toBeInTheDocument();
+    expect(screen.getByText("调用成功率")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "运行分类测试" })).toBeDisabled();
+    expect(benchmarkMock).not.toHaveBeenCalledWith("run_jev_benchmark");
+  });
+
+  it("keeps TypeSafe test results scoped to TypeSafe and blocks conflicting manual calls", async () => {
+    invokeMock.mockResolvedValue({ ...dashboard, keyConfigured: true });
+    let finish!: (value: unknown) => void;
+    benchmarkMock.mockImplementation((command: string) => command === "run_jev_benchmark"
+      ? new Promise((resolve) => { finish = resolve; })
+      : Promise.resolve({ datasetVersion: "intent-v1", samples: [], busy: false, result: null }));
+    render(<JevPanel />);
+    const user = userEvent.setup();
+    await screen.findByText("TypeSafe 官方 Key 已连接，无需重复设置。");
+    await user.type(screen.getByLabelText("待评估文本"), "review this code");
+    await user.click(screen.getByLabelText(/我同意/));
+    await user.click(screen.getByRole("button", { name: "运行分类测试" }));
+    expect(screen.getByRole("button", { name: "发送并评估" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "断开" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: providerTriggerName })).toBeDisabled();
+    await act(async () => finish({ datasetVersion: "intent-v1", samples: [], busy: false, result: null }));
+    await chooseProvider(user, "DeepSeek");
+    expect(screen.queryByRole("heading", { name: "TypeSafe 分类测试" })).not.toBeInTheDocument();
+    expect(invokeMock).not.toHaveBeenCalledWith("evaluate_jev", expect.anything());
   });
 
   it("refreshes failed request record without automatic retry", async () => {

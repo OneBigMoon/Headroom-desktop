@@ -230,10 +230,38 @@
 }
 
 .jev-panel__evaluate,
+.jev-panel__benchmark,
 .jev-panel__records {
   border-top: 1px solid var(--border-subtle);
   margin-top: 20px;
   padding-top: 20px;
+}
+
+.jev-panel__benchmark-details summary {
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 8px 0;
+}
+
+.jev-panel__benchmark-details summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.jev-panel__benchmark-details ol {
+  padding-left: 24px;
+}
+
+.jev-panel__benchmark-details li {
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  padding: 10px 0;
+  overflow-wrap: anywhere;
+}
+
+.jev-panel__benchmark-details p {
+  margin: 6px 0;
+  line-height: 1.5;
 }
 
 .jev-panel__evaluate-heading,
@@ -330,6 +358,10 @@
 }
 
 @media (max-width: 600px) {
+  .jev-panel__benchmark .jev-panel__metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .jev-panel__key-row .jev-panel__button {
     flex: 1 1 120px;
   }

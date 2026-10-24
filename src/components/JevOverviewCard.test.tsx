@@ -67,6 +67,8 @@ describe("JevOverviewCard", () => {
     render(<JevOverviewCard active onOpenDecisions={vi.fn()} />);
 
     expect(await screen.findByText("75.0%")).toBeInTheDocument();
+    expect(screen.getByText("调用成功率")).toBeInTheDocument();
+    expect(screen.getByText(/Jev 仅分类观察，未替代 Codex 请求/)).toBeInTheDocument();
     expect(screen.getByText("300 ms")).toBeInTheDocument();
     expect(screen.getByText("输出 token（已上报）").parentElement).toHaveTextContent("10");
     expect(screen.getByText("2/4 条有数据；未返回不计为 0")).toBeInTheDocument();

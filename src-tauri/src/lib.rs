@@ -5616,6 +5616,8 @@ pub fn run() {
             skill_manager::import_git_skill,
             skill_manager::set_skill_enabled,
             jev::get_jev_dashboard,
+            jev::benchmark::get_jev_benchmark,
+            jev::benchmark::run_jev_benchmark,
             jev::set_jev_auto_enabled,
             jev::get_jev_models,
             jev::set_jev_key,
