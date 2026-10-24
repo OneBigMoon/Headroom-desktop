@@ -236,7 +236,7 @@ pub(crate) fn instruction_targets() -> Vec<(String, PathBuf, Vec<(String, String
 /// Codex nudge: Codex has no command-rewrite hook, so it routes shell commands
 /// through the managed `rtk` binary by being told to prefix them with it.
 fn build_rtk_codex_nudge(managed_rtk_path: &Path) -> String {
-    let bin = format!("\"{}\"", shell_double_quote(&managed_rtk_path.to_string_lossy()));
+    let bin = rtk_shell_prefix(managed_rtk_path, cfg!(windows));
     format!(
         "## Token-saving shell commands (Headroom RTK)\n\
          Follow the system/developer/user instructions and the active project's\n\
@@ -247,6 +247,15 @@ fn build_rtk_codex_nudge(managed_rtk_path: &Path) -> String {
          or `git diff --check` whitespace reports. Compression can omit relevant details.\n\
          If RTK is unavailable or fails, report the issue and use the raw command."
     )
+}
+
+fn rtk_shell_prefix(path: &Path, windows: bool) -> String {
+    let path = path.to_string_lossy();
+    if windows {
+        format!("& '{}'", path.replace('\'', "''"))
+    } else {
+        format!("\"{}\"", shell_double_quote(&path))
+    }
 }
 
 pub fn rtk_integration_status() -> Result<(bool, bool)> {
@@ -1947,9 +1956,8 @@ fn sweep_managed_backups(target: &Path) -> Vec<String> {
 /// deletes only those isolated locations,
 /// so a surviving entry could only ever spawn a failing server.
 fn mcp_command_in_headroom_footprint(command: &str) -> bool {
-    let app_dir = format!("{}/", app_data_dir().display());
-    let dot_headroom = format!("{}/", crate::edition::workspace_dir().display());
-    command.starts_with(&app_dir) || command.starts_with(&dot_headroom)
+    let command = Path::new(command);
+    command.starts_with(app_data_dir()) || command.starts_with(crate::edition::workspace_dir())
 }
 
 /// Headroom-owned MCP entry: the `headroom` server itself (desktop owns that
@@ -11337,7 +11345,12 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
     fn instruction_templates_preserve_raw_and_visual_workflows() {
         let binary = Path::new("/tmp/Headroom Tools/rtk");
         let rtk = super::build_rtk_codex_nudge(binary);
-        assert!(rtk.contains("\"/tmp/Headroom Tools/rtk\""), "quote executable paths");
+        let invocation = if cfg!(windows) {
+            "& '/tmp/Headroom Tools/rtk'"
+        } else {
+            "\"/tmp/Headroom Tools/rtk\""
+        };
+        assert!(rtk.contains(invocation), "quote executable paths");
         assert!(rtk.contains("git diff --check"));
         assert!(rtk.contains("raw"));
         for body in [
@@ -11347,6 +11360,19 @@ export ANTHROPIC_BASE_URL=http://127.0.0.1:6867
             assert!(body.contains("layout"), "text extraction must not replace layout verification");
             assert!(body.contains("available"), "do not assume the converter is available");
         }
+    }
+
+    #[test]
+    fn rtk_shell_prefix_preserves_windows_paths_and_quotes_for_powershell() {
+        let path = Path::new(r"C:\Users\O'Neil $HOME\Headroom Tools\rtk.exe");
+        assert_eq!(
+            super::rtk_shell_prefix(path, true),
+            r"& 'C:\Users\O''Neil $HOME\Headroom Tools\rtk.exe'"
+        );
+        assert_eq!(
+            super::rtk_shell_prefix(Path::new("/tmp/Headroom Tools/rtk"), false),
+            "\"/tmp/Headroom Tools/rtk\""
+        );
     }
 
     #[test]
@@ -15554,6 +15580,26 @@ keep rtk\n\
         super::apply_legacy_client_setup("zcode").unwrap();
         assert_eq!(read_zcode_config_json(&home)["mcp"]["servers"]["memory"]["command"], "user-memory");
         assert_eq!(fs::read_to_string(fallback).unwrap(), original);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn mcp_footprint_uses_native_path_components_and_preserves_siblings() {
+        let _home = TestHome::new();
+        for root in [super::app_data_dir(), crate::edition::workspace_dir()] {
+            let native = root
+                .join("runtime")
+                .join("venv")
+                .join("Scripts")
+                .join("headroom.exe");
+            assert!(super::mcp_command_in_headroom_footprint(
+                &native.to_string_lossy()
+            ));
+            let mixed = format!("{}/runtime/venv/Scripts/headroom.exe", root.display());
+            assert!(super::mcp_command_in_headroom_footprint(&mixed));
+            let sibling = format!("{}-other/runtime/headroom.exe", root.display());
+            assert!(!super::mcp_command_in_headroom_footprint(&sibling));
+        }
     }
 
     #[test]

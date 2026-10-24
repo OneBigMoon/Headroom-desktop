@@ -10953,6 +10953,67 @@ Some unrelated content.
         assert_eq!(String::from_utf8_lossy(&passthrough.stdout).trim(), "login");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn codex_learn_wrapper_windows_isolates_exec_only() {
+        use std::os::windows::process::CommandExt;
+
+        let temporary = tempfile::tempdir().expect("wrapper tempdir");
+        let wrapper = super::write_codex_learn_wrapper(&temporary.path().join("learn wrapper"))
+            .expect("wrapper");
+        let fake_codex = temporary.path().join("fake codex.cmd");
+        crate::client_adapters::atomic_write(&fake_codex, b"@echo off\r\necho %*\r\nexit /b 0\r\n")
+            .expect("fake Codex");
+
+        let run = |args: &[&str]| {
+            // /S removes the outer quote pair; keep the batch path quoted too.
+            let output = crate::proc::command("cmd.exe")
+                .args(["/D", "/S", "/C"])
+                .raw_arg(format!("\"\"{}\" {}\"", wrapper.display(), args.join(" ")))
+                .env("HEADROOM_REAL_CODEX", &fake_codex)
+                .output()
+                .expect("run Windows Learn wrapper");
+            assert!(
+                output.status.success(),
+                "wrapper failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .map(|argument| argument.trim_matches('"').to_string())
+                .collect::<Vec<_>>()
+        };
+
+        for args in [
+            &["exec", "--help"][..],
+            &["exec", "--skip-git-repo-check", "--help"][..],
+        ] {
+            let actual = run(args);
+            assert_eq!(actual.iter().filter(|arg| arg.as_str() == "exec").count(), 1);
+            assert_eq!(
+                actual
+                    .iter()
+                    .filter(|arg| arg.as_str() == "--skip-git-repo-check")
+                    .count(),
+                1
+            );
+            let mut expected = args.to_vec();
+            if !args.contains(&"--skip-git-repo-check") {
+                expected.push("--skip-git-repo-check");
+            }
+            expected.extend([
+                "--ephemeral",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "-c",
+                "model_reasoning_effort='low'",
+            ]);
+            assert_eq!(actual, expected);
+        }
+
+        assert_eq!(run(&["login", "--device-auth"]), ["login", "--device-auth"]);
+    }
+
     #[test]
     fn classify_bootstrap_failure_flags_github_504_as_network() {
         // Mirrors the reqwest chain produced when error_for_status hits a 504 on

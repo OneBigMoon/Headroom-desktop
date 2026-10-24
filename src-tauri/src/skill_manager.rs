@@ -843,7 +843,43 @@ fn rename_without_replace(source: &Path, destination: &Path) -> std::io::Result<
 
 #[cfg(windows)]
 fn rename_without_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
-    fs::rename(source, destination)
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Prefix;
+    use windows_sys::Win32::Storage::FileSystem::MoveFileExW;
+
+    fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
+        if path.as_os_str().encode_wide().any(|unit| unit == 0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Skill paths cannot contain NUL characters.",
+            ));
+        }
+        let absolute = std::path::absolute(path)?;
+        let mut wide: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+        if let Some(Component::Prefix(prefix)) = absolute.components().next() {
+            match prefix.kind() {
+                Prefix::Disk(_) => {
+                    wide.splice(..0, r"\\?\".encode_utf16());
+                }
+                Prefix::UNC(_, _) => {
+                    wide.splice(..2, r"\\?\UNC\".encode_utf16());
+                }
+                _ => {}
+            }
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    let source = wide_path(source)?;
+    let destination = wide_path(destination)?;
+    // No replacement or cross-volume copy: publishing is one same-volume move.
+    // SAFETY: both UTF-16 buffers are NUL-terminated and live through the call.
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) } != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -1017,7 +1053,7 @@ fn git_skill_summary(
 }
 
 fn git_command() -> Command {
-    let mut command = Command::new("git");
+    let mut command = crate::proc::command("git");
     command
         .args([
             "-c",
@@ -1378,7 +1414,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             summary.skill_path,
-            display_path(&destination.join("sample/SKILL.md"))
+            display_path(&destination.join("sample").join("SKILL.md"))
         );
         assert_eq!(fs::read(&manifest).unwrap(), original);
         assert_eq!(
@@ -1450,6 +1486,25 @@ mod tests {
         fs::create_dir(&destination).unwrap();
         assert!(rename_without_replace(&source, &destination).is_err());
         assert!(source.exists() && destination.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn no_clobber_publish_rejects_nul_in_either_path() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let invalid = PathBuf::from(std::ffi::OsString::from_wide(&[120, 0, 121]));
+        for (source, destination) in [
+            (invalid.as_path(), Path::new("destination")),
+            (Path::new("source"), invalid.as_path()),
+        ] {
+            assert_eq!(
+                rename_without_replace(source, destination)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -1571,7 +1626,7 @@ mod tests {
     fn completed_git_child_still_checks_final_repository_size() {
         let temporary = tempfile::tempdir().unwrap();
         let oversized = temporary.path().join("oversized-pack");
-        let mut child = Command::new("/bin/sh")
+        let mut child = crate::proc::command("/bin/sh")
             .args([
                 "-c",
                 "dd if=/dev/zero of=\"$1\" bs=1 count=0 seek=\"$2\" 2>/dev/null",

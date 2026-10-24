@@ -16098,7 +16098,7 @@ No actionable patterns found.
 
     #[test]
     fn jev_auto_observer_env_uses_app_paths_and_preserves_data_dir() {
-        let mut command = std::process::Command::new("python");
+        let mut command = crate::proc::command("python");
         command.env("HEADROOM_DATA_DIR", "isolated-test-data");
         let executable = Path::new("test app/executable");
         let config = Path::new("test data/client-setup.json");
@@ -16120,7 +16120,7 @@ No actionable patterns found.
 
     #[test]
     fn jev_auto_observer_env_disables_inherited_observer_when_executable_is_missing() {
-        let mut command = std::process::Command::new("python");
+        let mut command = crate::proc::command("python");
         command
             .env("HEADROOM_JEV_EXECUTABLE", "stale-executable")
             .env("HEADROOM_JEV_CONFIG", "stale-config");
