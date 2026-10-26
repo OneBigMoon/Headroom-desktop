@@ -6678,6 +6678,7 @@ export default function App() {
       runtimeStatus.kompressEnabled === false
   );
 
+  const routingWarning = runtimeStatus?.routingWarning?.trim();
   const runtimeIssues: string[] = [];
   if (runtimeStatus?.installed === false) {
     runtimeIssues.push(t("status.issue.runtimeNotInstalled"));
@@ -6698,11 +6699,15 @@ export default function App() {
   if (runtimeStatus?.kompressEnabled === false && !kompressWarming) {
     runtimeIssues.push(t("status.issue.kompressDisabled"));
   }
+  if (routingWarning) {
+    runtimeIssues.push(routingWarning);
+  }
 
   const runtimeHealthy = Boolean(
     runtimeStatus &&
       runtimeStatus.running &&
       runtimeStatus.proxyReachable &&
+      !routingWarning &&
       runtimeStatus.mcpConfigured !== false &&
       (runtimeStatus.kompressEnabled !== false || kompressWarming)
   );

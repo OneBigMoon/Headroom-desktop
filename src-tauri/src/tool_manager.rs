@@ -8021,17 +8021,60 @@ impl ToolManager {
     }
 
     fn read_tool_receipt(&self, tool_id: &str) -> Option<Value> {
-        let path = self.runtime.tools_dir.join(format!("{tool_id}.json"));
-        let bytes = std::fs::read(path).ok()?;
-        serde_json::from_slice(&bytes).ok()
+        self.read_tool_receipt_checked(tool_id).ok().flatten()
     }
 
-    /// Optional tools persist an `enabled` flag in their receipt. Required core
-    /// tools (headroom, rtk) are always enabled. Missing flag defaults to true.
+    fn read_tool_receipt_checked(&self, tool_id: &str) -> Result<Option<Value>> {
+        if let Some(plugin) = plugin_addon(tool_id) {
+            return self.read_plugin_receipt(plugin);
+        }
+        let path = self.runtime.tools_dir.join(format!("{tool_id}.json"));
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        };
+        let value: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing managed tool receipt {}", path.display()))?;
+        let object = value.as_object().ok_or_else(|| {
+            anyhow!(
+                "managed tool receipt {} must be a JSON object",
+                path.display()
+            )
+        })?;
+        if object
+            .get("version")
+            .and_then(Value::as_str)
+            .is_none_or(|version| version.trim().is_empty())
+        {
+            bail!(
+                "managed tool receipt {} has no non-empty string version",
+                path.display()
+            );
+        }
+        if object
+            .get("enabled")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            bail!(
+                "managed tool receipt {} has a non-boolean enabled field",
+                path.display()
+            );
+        }
+        Ok(Some(value))
+    }
+
+    /// Missing receipts and legacy records without `enabled` default to true.
+    /// Unreadable or malformed receipts must never imply an enabled tool.
     fn tool_enabled(&self, tool_id: &str) -> bool {
-        self.read_tool_receipt(tool_id)
+        self.tool_enabled_checked(tool_id).unwrap_or(false)
+    }
+
+    fn tool_enabled_checked(&self, tool_id: &str) -> Result<bool> {
+        Ok(self
+            .read_tool_receipt_checked(tool_id)?
             .and_then(|receipt| receipt.get("enabled").and_then(Value::as_bool))
-            .unwrap_or(true)
+            .unwrap_or(true))
     }
 
     pub fn markitdown_entrypoint(&self) -> PathBuf {
@@ -8170,7 +8213,7 @@ impl ToolManager {
             .transpose()?
             .unwrap_or(MARKITDOWN_PINNED_VERSION);
         if let Some(current) = self
-            .read_tool_receipt("markitdown")
+            .read_tool_receipt_checked("markitdown")?
             .and_then(|r| r.get("version").and_then(Value::as_str).map(str::to_owned))
             .and_then(|v| parse_major_minor_patch(&v))
         {
@@ -8250,7 +8293,7 @@ impl ToolManager {
             .and_then(|_| rehome_venv_launchers(&final_venv))
             .and_then(|_| self.ensure_markitdown_shim())
             .and_then(|_| {
-                let enabled = self.tool_enabled("markitdown");
+                let enabled = self.tool_enabled_checked("markitdown")?;
                 self.write_tool_receipt(
                     "markitdown",
                     json!({ "version": version, "enabled": enabled }),
@@ -8295,10 +8338,11 @@ impl ToolManager {
     }
 
     pub fn set_markitdown_enabled(&self, enabled: bool) -> Result<()> {
+        let previous = self.read_tool_receipt_checked("markitdown")?;
         if !self.markitdown_installed() {
             bail!("markitdown is not installed");
         }
-        let stored_version = self.read_tool_receipt("markitdown").and_then(|receipt| {
+        let stored_version = previous.and_then(|receipt| {
             receipt
                 .get("version")
                 .and_then(Value::as_str)
@@ -8376,7 +8420,7 @@ impl ToolManager {
             .transpose()?
             .unwrap_or(SERENA_PINNED_VERSION);
         if let (Some(current), Some(target)) = (
-            self.read_tool_receipt("serena")
+            self.read_tool_receipt_checked("serena")?
                 .and_then(|r| r.get("version").and_then(Value::as_str).map(str::to_owned))
                 .as_deref(),
             parse_major_minor_patch(version),
@@ -8442,7 +8486,13 @@ impl ToolManager {
             .root_dir
             .join(format!("serena-venv.backup-{}", uuid::Uuid::new_v4()));
         let had_old = final_venv.exists();
-        let enabled = self.tool_enabled("serena");
+        let enabled = match self.tool_enabled_checked("serena") {
+            Ok(enabled) => enabled,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(err);
+            }
+        };
         if had_old {
             std::fs::rename(&final_venv, &backup).context("staging existing Serena venv")?;
         }
@@ -8511,6 +8561,7 @@ impl ToolManager {
     }
 
     pub fn set_serena_enabled(&self, enabled: bool) -> Result<()> {
+        let previous = self.read_tool_receipt_checked("serena")?;
         if !self.serena_installed() {
             bail!("serena is not installed");
         }
@@ -8519,7 +8570,7 @@ impl ToolManager {
         } else {
             self.unregister_serena_mcp()?;
         }
-        let stored_version = self.read_tool_receipt("serena").and_then(|receipt| {
+        let stored_version = previous.and_then(|receipt| {
             receipt
                 .get("version")
                 .and_then(Value::as_str)
@@ -8612,7 +8663,7 @@ impl ToolManager {
     pub fn install_context7_version(&self, version: Option<&str>) -> Result<()> {
         let _guard = PACKAGE_UPDATE_LOCK.get_or_init(|| Mutex::new(())).lock();
         let current_version = self
-            .read_tool_receipt("context7")
+            .read_tool_receipt_checked("context7")?
             .and_then(|r| r.get("version").and_then(Value::as_str).map(str::to_owned));
         let version = resolve_context7_install_version(version, current_version.as_deref())?;
         let npx = crate::claude_cli::detect_npx().context(
@@ -8630,8 +8681,11 @@ impl ToolManager {
         .context(
             "context7 failed its smoke test (npx download or startup). Context7 needs Node.js 20.18.1 or newer",
         )?;
-        let previous = self.read_tool_receipt("context7");
-        let enabled = self.tool_enabled("context7");
+        let previous = self.read_tool_receipt_checked("context7")?;
+        let enabled = previous
+            .as_ref()
+            .and_then(|receipt| receipt.get("enabled").and_then(Value::as_bool))
+            .unwrap_or(true);
         if enabled {
             self.register_context7_mcp(&version)?;
         } else {
@@ -8661,11 +8715,12 @@ impl ToolManager {
     }
 
     pub fn set_context7_enabled(&self, enabled: bool) -> Result<()> {
+        let previous = self.read_tool_receipt_checked("context7")?;
         if !self.context7_installed() {
             bail!("context7 is not installed");
         }
         if enabled {
-            let stored_version = self.read_tool_receipt("context7").and_then(|receipt| {
+            let stored_version = previous.as_ref().and_then(|receipt| {
                 receipt
                     .get("version")
                     .and_then(Value::as_str)
@@ -8676,7 +8731,7 @@ impl ToolManager {
         } else {
             self.unregister_context7_mcp()?;
         }
-        let stored_version = self.read_tool_receipt("context7").and_then(|receipt| {
+        let stored_version = previous.and_then(|receipt| {
             receipt
                 .get("version")
                 .and_then(Value::as_str)
@@ -8794,7 +8849,8 @@ impl ToolManager {
                     .with_context(|| format!("removing incomplete {}", receipt.display()))?;
             }
 
-            if self.codebase_memory_installed() && self.tool_enabled("codebase-memory") {
+            let enabled = self.tool_enabled_checked("codebase-memory")?;
+            if self.codebase_memory_installed() && enabled {
                 self.register_codebase_memory_mcp()?;
             } else {
                 self.unregister_codebase_memory_mcp()?;
@@ -8828,6 +8884,7 @@ impl ToolManager {
             .get_or_init(|| Mutex::new(()))
             .lock();
         self.recover_codebase_memory_pending()?;
+        self.read_tool_receipt_checked("codebase-memory")?;
         let artifact = match version {
             None => codebase_memory_distribution_artifact()?,
             Some(version) => fetch_codebase_memory_release(version)?,
@@ -8836,14 +8893,14 @@ impl ToolManager {
         if !valid_codebase_memory_version(target_version) {
             bail!("invalid codebase-memory version: {target_version}");
         }
-        if let Some(current) = self
-            .read_tool_receipt("codebase-memory")
-            .and_then(|receipt| {
-                receipt
-                    .get("version")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
+        if let Some(current) =
+            self.read_tool_receipt_checked("codebase-memory")?
+                .and_then(|receipt| {
+                    receipt
+                        .get("version")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
         {
             if let (Some(current), Some(target)) = (
                 parse_major_minor_patch(&current),
@@ -8942,7 +8999,13 @@ impl ToolManager {
         }
         let had_destination = destination.exists();
         let had_receipt = receipt.exists();
-        let enabled = self.tool_enabled("codebase-memory");
+        let enabled = match self.tool_enabled_checked("codebase-memory") {
+            Ok(enabled) => enabled,
+            Err(err) => {
+                let _ = std::fs::remove_file(&staged);
+                return Err(err);
+            }
+        };
         crate::client_adapters::atomic_write(
             &marker,
             &serde_json::to_vec_pretty(&json!({
@@ -9027,10 +9090,10 @@ impl ToolManager {
     }
 
     pub fn set_codebase_memory_enabled(&self, enabled: bool) -> Result<()> {
+        let previous = self.read_tool_receipt_checked("codebase-memory")?;
         if !self.codebase_memory_installed() {
             bail!("codebase-memory is not installed");
         }
-        let previous = self.read_tool_receipt("codebase-memory");
         let version = previous
             .as_ref()
             .and_then(|receipt| {
@@ -9181,10 +9244,11 @@ impl ToolManager {
                 spec.supported_modes.join(", ")
             )
         })?;
+        let enabled = self.tool_enabled_checked(id)?;
         if !self.plugin_installed(id) {
             bail!("{id} plugin is not installed");
         }
-        if !self.tool_enabled(id) {
+        if !enabled {
             bail!("{id} plugin is disabled");
         }
 
@@ -9216,15 +9280,26 @@ impl ToolManager {
             .collect()
     }
 
+    fn enabled_conflicting_plugins(&self, id: &str) -> Result<Vec<String>> {
+        let mut peers = Vec::new();
+        for peer in self.conflicting_plugin_ids(id) {
+            if let Some(plugin) = plugin_addon(&peer) {
+                if let Some(receipt) = self.read_plugin_receipt(plugin)? {
+                    if receipt
+                        .get("enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(true)
+                    {
+                        peers.push(peer);
+                    }
+                }
+            }
+        }
+        Ok(peers)
+    }
+
     fn enforce_exclusive_plugin_group(&self, id: &str) -> Result<()> {
-        let peers: Vec<String> = self
-            .conflicting_plugin_ids(id)
-            .into_iter()
-            .filter(|peer| {
-                plugin_addon(peer).is_some_and(|plugin| self.plugin_receipt_exists(plugin))
-                    && self.tool_enabled(peer)
-            })
-            .collect();
+        let peers = self.enabled_conflicting_plugins(id)?;
         let mut disabled: Vec<String> = Vec::new();
         for peer in peers {
             if let Err(err) = self.set_plugin_enabled_inner(&peer, false) {
@@ -9667,6 +9742,9 @@ impl ToolManager {
         // mutations so concurrent addon operations cannot lose updates.
         let _guard = PACKAGE_UPDATE_LOCK.get_or_init(|| Mutex::new(())).lock();
         let plugin = plugin_addon(id).with_context(|| format!("unknown plugin addon: {id}"))?;
+        if enable {
+            self.enabled_conflicting_plugins(id)?;
+        }
         // A host registration without a valid Headroom receipt is user-owned
         // state. Refuse to update or adopt it before invoking any host CLI so a
         // failed multi-host install cannot mutate one existing host and leave
@@ -9897,6 +9975,9 @@ impl ToolManager {
 
     pub fn set_plugin_enabled(&self, id: &str, enabled: bool) -> Result<()> {
         let _guard = PACKAGE_UPDATE_LOCK.get_or_init(|| Mutex::new(())).lock();
+        if enabled {
+            self.enabled_conflicting_plugins(id)?;
+        }
         self.set_plugin_enabled_inner(id, enabled)?;
         if enabled {
             self.enforce_exclusive_plugin_group(id)?;
@@ -19672,23 +19753,197 @@ after
     }
 
     #[test]
+    fn managed_tool_receipt_checked_preserves_legacy_flags_and_rejects_invalid_state() {
+        let (root, runtime, manager) = seed_test_runtime("strict-tool-receipt");
+        let receipt = runtime.tools_dir.join("serena.json");
+        assert!(manager
+            .read_tool_receipt_checked("serena")
+            .unwrap()
+            .is_none());
+        assert!(manager.tool_enabled_checked("serena").unwrap());
+        for (source, enabled) in [
+            (r#"{"version":"1.0.0"}"#, true),
+            (r#"{"version":"1.0.0","enabled":false}"#, false),
+            (
+                r#"{"version":"1.0.0","enabled":true,"extra":"preserved"}"#,
+                true,
+            ),
+        ] {
+            fs::write(&receipt, source).unwrap();
+            assert_eq!(manager.tool_enabled_checked("serena").unwrap(), enabled);
+            assert_eq!(fs::read_to_string(&receipt).unwrap(), source);
+        }
+        for source in [
+            "{",
+            "[]",
+            r#"{"enabled":false}"#,
+            r#"{"version":""}"#,
+            r#"{"version":null}"#,
+            r#"{"version":"1.0.0","enabled":"false"}"#,
+        ] {
+            fs::write(&receipt, source).unwrap();
+            assert!(manager.read_tool_receipt_checked("serena").is_err());
+            assert!(!manager.tool_enabled("serena"));
+            assert_eq!(fs::read_to_string(&receipt).unwrap(), source);
+        }
+        fs::remove_file(&receipt).unwrap();
+        fs::create_dir(&receipt).unwrap();
+        assert!(manager.read_tool_receipt_checked("serena").is_err());
+        assert!(!manager.tool_enabled("serena"));
+        assert!(receipt.is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn managed_tool_receipt_blocks_install_and_toggle_before_side_effects() {
+        for id in ["markitdown", "serena", "context7", "codebase-memory"] {
+            for source in [
+                Some("{"),
+                Some(r#"{"version":"1.0.0","enabled":"false"}"#),
+                None,
+            ] {
+                let (root, runtime, manager) = seed_test_runtime("strict-receipt-entrypoints");
+                let _home = HomeGuard::new(&root);
+                let receipt = runtime.tools_dir.join(format!("{id}.json"));
+                if let Some(source) = source {
+                    fs::write(&receipt, source).unwrap();
+                } else {
+                    fs::create_dir(&receipt).unwrap();
+                }
+                let calls = root.join("unexpected-command");
+                let sentinel = format!(
+                    "#!/bin/sh\nprintf called >> '{}'\nexit 23\n",
+                    calls.display()
+                );
+                write_executable(&runtime.managed_python(), &sentinel);
+                write_executable(&runtime.standalone_python(), &sentinel);
+                write_cli_shim(&root.join(".local/bin"), "npx", &sentinel, "");
+                let config = root.join(".codex/config.toml");
+                fs::create_dir_all(config.parent().unwrap()).unwrap();
+                fs::write(&config, "# untouched Codex config\n").unwrap();
+                let expected = manager
+                    .read_tool_receipt_checked(id)
+                    .unwrap_err()
+                    .to_string();
+                let install = match id {
+                    "markitdown" => manager.install_markitdown_version(Some("1.0.0")),
+                    "serena" => manager.install_serena_version(Some("1.7.0")),
+                    "context7" => manager.install_context7_version(Some("4.1.1")),
+                    // Invalid release selection also prevents network access if this guard regresses.
+                    _ => manager.install_codebase_memory_version(Some("invalid")),
+                };
+                assert_eq!(install.unwrap_err().to_string(), expected, "{id} install");
+                for enabled in [false, true] {
+                    let toggle = match id {
+                        "markitdown" => manager.set_markitdown_enabled(enabled),
+                        "serena" => manager.set_serena_enabled(enabled),
+                        "context7" => manager.set_context7_enabled(enabled),
+                        _ => manager.set_codebase_memory_enabled(enabled),
+                    };
+                    assert_eq!(toggle.unwrap_err().to_string(), expected, "{id} toggle");
+                }
+                assert!(
+                    !calls.exists(),
+                    "{id} must fail before starting any command"
+                );
+                assert_eq!(
+                    fs::read_to_string(&config).unwrap(),
+                    "# untouched Codex config\n"
+                );
+                assert_eq!(fs::read_dir(&runtime.downloads_dir).unwrap().count(), 0);
+                if let Some(source) = source {
+                    assert_eq!(fs::read_to_string(&receipt).unwrap(), source);
+                } else {
+                    assert!(receipt.is_dir());
+                }
+                fs::remove_dir_all(&root).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn managed_tool_receipt_keeps_recovery_marker_when_restored_state_is_invalid() {
+        let (root, runtime, manager) = seed_test_runtime("strict-receipt-recovery");
+        let _home = HomeGuard::new(&root);
+        let calls = root.join("unexpected-command");
+        write_executable(
+            &runtime.managed_python(),
+            &format!(
+                "#!/bin/sh\nprintf called >> '{}'\nexit 0\n",
+                calls.display()
+            ),
+        );
+        let receipt = runtime.tools_dir.join("codebase-memory.json");
+        fs::write(&receipt, "{").unwrap();
+        let marker = manager.codebase_memory_pending_marker_path();
+        fs::write(
+            &marker,
+            r#"{"version":"0.10.9","hadDestination":false,"hadReceipt":true}"#,
+        )
+        .unwrap();
+        assert!(manager.recover_codebase_memory_pending().is_err());
+        assert!(marker.exists());
+        assert_eq!(fs::read_to_string(&receipt).unwrap(), "{");
+        assert!(!calls.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn managed_tool_receipt_rejects_invalid_workflow_peer_before_changing_states() {
+        let (root, runtime, manager) = seed_test_runtime("strict-receipt-peer");
+        let peer = manager
+            .conflicting_plugin_ids("openspec")
+            .into_iter()
+            .next()
+            .unwrap();
+        let receipt = runtime.tools_dir.join(format!("{peer}.json"));
+        fs::write(&receipt, "{").unwrap();
+        // Even a regressed peer preflight must stop at the target receipt,
+        // without invoking a real host CLI while this regression test runs.
+        fs::write(runtime.tools_dir.join("openspec.json"), "{").unwrap();
+        let expected = manager
+            .read_tool_receipt_checked(&peer)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            manager
+                .set_plugin_enabled("openspec", true)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+        assert_eq!(
+            manager
+                .install_plugin("openspec", true)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+        assert!(manager.enforce_exclusive_plugin_group("openspec").is_err());
+        assert_eq!(fs::read_to_string(&receipt).unwrap(), "{");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     #[cfg(unix)]
     #[serial_test::serial]
     fn mcp_addon_updates_and_rollback_preserve_enabled_state() {
         for id in ["serena", "context7"] {
-            for enabled in [false, true] {
+            for receipt_enabled in [Some(false), Some(true), None] {
+                let enabled = receipt_enabled.unwrap_or(true);
                 for fail_receipt in [false, true] {
                     let (root, runtime, manager) = seed_test_runtime("mcp-update-enabled");
                     let _home = HomeGuard::new(&root);
                     let receipt = runtime.tools_dir.join(format!("{id}.json"));
-                    fs::write(
-                        &receipt,
-                        serde_json::to_vec(&serde_json::json!({
-                            "version": "1.0.0", "enabled": enabled
-                        }))
-                        .unwrap(),
-                    )
-                    .unwrap();
+                    let mut previous = serde_json::json!({ "version": "1.0.0" });
+                    if let Some(enabled) = receipt_enabled {
+                        previous["enabled"] = serde_json::json!(enabled);
+                    }
+                    fs::write(&receipt, serde_json::to_vec(&previous).unwrap()).unwrap();
                     let calls = root.join("mcp-calls");
                     let sabotage = if fail_receipt {
                         format!(

@@ -306,6 +306,7 @@ export interface RuntimeStatus {
    *  this as a terminal state and lets the user into the app. */
   bypassed: boolean;
   proxyReachable: boolean;
+  routingWarning?: string | null;
   headroomPid?: number | null;
   mcpConfigured?: boolean | null;
   mcpError?: string | null;

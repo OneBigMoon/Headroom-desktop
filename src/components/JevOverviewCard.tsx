@@ -10,6 +10,7 @@ interface JevOverviewCardProps {
 
 interface JevDashboardSnapshot {
   autoEnabled?: boolean;
+  autoError?: string | null;
   records: JevRecord[];
 }
 
@@ -91,6 +92,13 @@ export function JevOverviewCard({ active, onOpenDecisions }: JevOverviewCardProp
         <button type="button" className="jev-overview__link" onClick={onOpenDecisions}>打开决策</button>
       </header>
 
+      {!loading && !loadFailed && dashboard?.autoError ? (
+        <div className="jev-overview__state" role="alert">
+          <p>记录不完整：部分自动评估数据无法读取。{records.length > 0 ? "以下指标仅包含已读取的记录。" : "目前没有可显示的记录，请重试读取历史记录。"}</p>
+          <button type="button" className="jev-overview__link" onClick={() => setRetry((value) => value + 1)}>重试</button>
+        </div>
+      ) : null}
+
       {loading ? (
         <p className="jev-overview__state" role="status">正在读取决策记录…</p>
       ) : loadFailed ? (
@@ -99,7 +107,7 @@ export function JevOverviewCard({ active, onOpenDecisions }: JevOverviewCardProp
           <button type="button" className="jev-overview__link" onClick={() => setRetry((value) => value + 1)}>重试</button>
         </div>
       ) : records.length === 0 ? (
-        <p className="jev-overview__state">还没有决策记录。到“类型化决策”手动评估，或开启 TypeSafe 自动评估 Codex 请求。</p>
+        dashboard?.autoError ? null : <p className="jev-overview__state">还没有决策记录。到“类型化决策”手动评估，或开启 TypeSafe 自动评估 Codex 请求。</p>
       ) : (
         <>
           <div className="jev-overview__metrics" aria-label="决策会话指标">

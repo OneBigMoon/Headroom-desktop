@@ -14,7 +14,7 @@ const MODEL_PAGE_BASE_URL: &str = "https://platform.openai.com/docs/models";
 const PRICE_CACHE_FILE: &str = "official-model-prices.json";
 const PRICE_ADJUSTMENTS_FILE: &str = "official-model-price-adjustments.json";
 const CACHE_SCHEMA_VERSION: u32 = 1;
-const ADJUSTMENTS_SCHEMA_VERSION: u32 = 1;
+const ADJUSTMENTS_SCHEMA_VERSION: u32 = 2;
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const FAILED_RETRY_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const BUILTIN_VERIFIED_AT: &str = "2026-09-30T00:00:00Z";
@@ -172,16 +172,23 @@ fn load_adjustments_at(runtime: &mut AdjustmentRuntime, path: &std::path::Path) 
     };
     let parsed = serde_json::from_slice::<Value>(&bytes);
     if let Ok(value) = &parsed {
-        if value.get("schemaVersion").and_then(Value::as_u64)
-            != Some(u64::from(ADJUSTMENTS_SCHEMA_VERSION))
-        {
+        let version = value.get("schemaVersion").and_then(Value::as_u64);
+        if version != Some(1) && version != Some(u64::from(ADJUSTMENTS_SCHEMA_VERSION)) {
             runtime.write_blocked = true;
             log::warn!("unsupported model price adjustment history schema; writes blocked");
             return;
         }
     }
     match parsed.and_then(serde_json::from_value::<PriceAdjustmentFile>) {
-        Ok(state) => runtime.state = state,
+        Ok(mut state) => {
+            if state.schema_version == 1 {
+                // Alias-based baselines cannot be attributed to raw counters.
+                // Rebaseline future usage without rewriting historical totals.
+                state.models.clear();
+                state.schema_version = ADJUSTMENTS_SCHEMA_VERSION;
+            }
+            runtime.state = state;
+        }
         Err(err) => {
             runtime.write_blocked = !crate::client_adapters::quarantine_unparsable(
                 path,
@@ -318,14 +325,24 @@ fn record_forward_adjustments(root: &Value, now: DateTime<Utc>) {
     let Some(entries) = root.get("by_model").and_then(Value::as_object) else {
         return;
     };
+    let mut runtime = lock_adjustments();
+    ensure_adjustments_loaded(&mut runtime);
+    if runtime.write_blocked || !accumulate_forward_adjustments(&mut runtime, entries, now) {
+        return;
+    }
+    if let Err(err) = persist_adjustments(&runtime) {
+        eprintln!("model pricing: failed to persist forward adjustments: {err:#}");
+    }
+}
+
+fn accumulate_forward_adjustments(
+    runtime: &mut AdjustmentRuntime,
+    entries: &serde_json::Map<String, Value>,
+    now: DateTime<Utc>,
+) -> bool {
     let local_now = now.with_timezone(&Local);
     let day_key = now.format("%Y-%m-%d").to_string();
     let hour_key = local_now.format("%Y-%m-%dT%H:00").to_string();
-    let mut runtime = lock_adjustments();
-    ensure_adjustments_loaded(&mut runtime);
-    if runtime.write_blocked {
-        return;
-    }
     let mut changed = false;
 
     for (raw_model, node) in entries {
@@ -343,7 +360,10 @@ fn record_forward_adjustments(root: &Value, now: DateTime<Utc>) {
                 .unwrap_or(0.0)
                 .max(0.0),
         };
-        let previous = runtime.state.models.insert(model.clone(), current.clone());
+        let previous = runtime
+            .state
+            .models
+            .insert(raw_model.clone(), current.clone());
         changed |= previous.as_ref() != Some(&current);
         let (Some(previous), Some(price)) = (previous, price_snapshot(&model)) else {
             continue;
@@ -368,15 +388,13 @@ fn record_forward_adjustments(root: &Value, now: DateTime<Utc>) {
     }
 
     if !changed {
-        return;
+        return false;
     }
     runtime.state.schema_version = ADJUSTMENTS_SCHEMA_VERSION;
     // Daily adjustments are part of the immutable lifetime total. Pruning them
     // would silently rewrite historical savings after the retention window.
     trim_oldest(&mut runtime.state.hourly_adjustments_usd, 31 * 24);
-    if let Err(err) = persist_adjustments(&runtime) {
-        eprintln!("model pricing: failed to persist forward adjustments: {err:#}");
-    }
+    true
 }
 
 fn calculate_forward_adjustment(
@@ -645,7 +663,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(PRICE_ADJUSTMENTS_FILE);
         let future =
-            br#"{"schemaVersion":2,"models":"new-format","dailyAdjustmentsUsd":{"2026-10-23":42}}"#;
+            br#"{"schemaVersion":3,"models":"new-format","dailyAdjustmentsUsd":{"2026-10-23":42}}"#;
         std::fs::write(&path, future).unwrap();
         let mut runtime = AdjustmentRuntime::default();
         load_adjustments_at(&mut runtime, &path);
@@ -773,6 +791,103 @@ mod tests {
         // A price change alone must never revalue already recorded counters.
         assert_eq!(calculate_forward_adjustment(&current, &current, 2.0), None);
         assert_eq!(calculate_forward_adjustment(&current, &current, 20.0), None);
+    }
+
+    #[test]
+    fn raw_model_counters_remain_independent_across_polls_and_reload() {
+        let now = DateTime::parse_from_rfc3339("2026-10-26T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut stats = serde_json::json!({
+            "gpt-6-sol": {"tokens_saved": 1_000_000, "compression_savings_usd": 1.0},
+            "gpt-6-sol-2026-09-23": {"tokens_saved": 3_000_000, "compression_savings_usd": 3.0}
+        });
+        let mut runtime = AdjustmentRuntime::default();
+        assert!(accumulate_forward_adjustments(
+            &mut runtime,
+            stats.as_object().unwrap(),
+            now
+        ));
+        assert_eq!(runtime.state.models.len(), 2);
+        assert_eq!(runtime.session_adjustment_usd, 0.0);
+        assert!(!accumulate_forward_adjustments(
+            &mut runtime,
+            stats.as_object().unwrap(),
+            now
+        ));
+        assert!(runtime.state.daily_adjustments_usd.is_empty());
+
+        stats["gpt-6-sol"]["tokens_saved"] = serde_json::json!(2_000_000);
+        stats["gpt-6-sol"]["compression_savings_usd"] = serde_json::json!(2.0);
+        assert!(accumulate_forward_adjustments(
+            &mut runtime,
+            stats.as_object().unwrap(),
+            now
+        ));
+        assert_eq!(runtime.session_adjustment_usd, 1.0);
+        assert_eq!(runtime.state.daily_adjustments_usd["2026-10-26"], 1.0);
+        assert!(!accumulate_forward_adjustments(
+            &mut runtime,
+            stats.as_object().unwrap(),
+            now
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PRICE_ADJUSTMENTS_FILE);
+        persist_adjustments_at(&runtime, &path).unwrap();
+        let mut reloaded = AdjustmentRuntime::default();
+        load_adjustments_at(&mut reloaded, &path);
+        assert!(!accumulate_forward_adjustments(
+            &mut reloaded,
+            stats.as_object().unwrap(),
+            now
+        ));
+        assert_eq!(reloaded.state.daily_adjustments_usd["2026-10-26"], 1.0);
+        assert_eq!(reloaded.session_adjustment_usd, 0.0);
+    }
+
+    #[test]
+    fn legacy_alias_baselines_migrate_without_repricing_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PRICE_ADJUSTMENTS_FILE);
+        let original = serde_json::json!({
+            "schemaVersion": 1,
+            "models": {"gpt-6-sol": {"tokensSaved": 3_000_000, "recordedSavingsUsd": 3.0}},
+            "dailyAdjustmentsUsd": {"2026-10-23": 42.0},
+            "hourlyAdjustmentsUsd": {"2026-10-23T12:00": 7.0}
+        });
+        let bytes = serde_json::to_vec(&original).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let mut runtime = AdjustmentRuntime::default();
+        load_adjustments_at(&mut runtime, &path);
+        assert!(!runtime.write_blocked);
+        assert_eq!(runtime.state.schema_version, ADJUSTMENTS_SCHEMA_VERSION);
+        assert!(runtime.state.models.is_empty());
+        assert_eq!(runtime.state.daily_adjustments_usd["2026-10-23"], 42.0);
+        assert_eq!(
+            runtime.state.hourly_adjustments_usd["2026-10-23T12:00"],
+            7.0
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+        let stats = serde_json::json!({
+            "gpt-6-sol": {"tokens_saved": 4_000_000, "compression_savings_usd": 4.0}
+        });
+        assert!(accumulate_forward_adjustments(
+            &mut runtime,
+            stats.as_object().unwrap(),
+            Utc::now()
+        ));
+        assert_eq!(runtime.session_adjustment_usd, 0.0);
+        persist_adjustments_at(&runtime, &path).unwrap();
+        let mut reloaded = AdjustmentRuntime::default();
+        load_adjustments_at(&mut reloaded, &path);
+        assert_eq!(reloaded.state.models["gpt-6-sol"].tokens_saved, 4_000_000);
+        assert_eq!(reloaded.state.daily_adjustments_usd["2026-10-23"], 42.0);
+        assert_eq!(
+            reloaded.state.hourly_adjustments_usd["2026-10-23T12:00"],
+            7.0
+        );
     }
 
     #[test]

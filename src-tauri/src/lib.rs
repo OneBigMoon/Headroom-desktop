@@ -805,6 +805,18 @@ fn get_app_update_configuration(app: AppHandle) -> AppUpdateConfiguration {
     }
 }
 
+const APP_UPDATE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const APP_UPDATE_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn configure_app_update_client(
+    client: reqwest_updater::ClientBuilder,
+) -> reqwest_updater::ClientBuilder {
+    // Bound stalled reads without limiting the total duration of a progressing download.
+    client
+        .connect_timeout(APP_UPDATE_CONNECT_TIMEOUT)
+        .read_timeout(APP_UPDATE_READ_TIMEOUT)
+}
+
 #[tauri::command]
 async fn check_for_app_update(
     app: AppHandle,
@@ -835,6 +847,7 @@ async fn check_for_app_update(
     let teardown = app.clone();
     let updater = app
         .updater_builder()
+        .configure_client(configure_app_update_client)
         .pubkey(config.pubkey)
         .endpoints(config.endpoints)
         .map_err(command_error)?
@@ -5013,7 +5026,6 @@ fn finish_exit_headroom(app: &AppHandle, source: QuitSource, retirement: Arc<Ato
     if let Some(client) = sentry::Hub::current().client() {
         client.flush(Some(std::time::Duration::from_secs(2)));
     }
-    client_adapters::retag_codex_threads_to_native();
     finish_runtime_session();
     EXIT_TEARDOWN_COMPLETE.store(true, Ordering::Release);
     app.exit(0);
@@ -5318,12 +5330,11 @@ pub fn run() {
 
             if previous_runtime_session_unclean {
                 log::warn!(
-            "startup: previous Headroom session ended unexpectedly; restoring native client routes"
+            "startup: previous Headroom session ended unexpectedly; preserving the stable Codex route"
         );
                 if let Err(err) = client_adapters::clear_client_setups_preserving_codex() {
                     log::warn!("startup recovery: clear_client_setups failed: {err}");
                 }
-                client_adapters::retag_codex_threads_to_native();
             }
             setup_tray(app.handle())?;
             spawn_tray_runtime_icon_updater(app.handle().clone());
@@ -5523,14 +5534,9 @@ pub fn run() {
             });
             // Retagging is handled by the readiness-gated startup worker above.
             std::thread::spawn(|| {
-                // restore_client_setups only retags Codex threads back to the
-                // headroom provider for clients in `remembered_clients`, which a
-                // plain Cmd-Q / dock quit / app-update restart never populates
-                // (only pause and the Settings "Quit" do). Those exit paths still
-                // run the quit-time headroom->openai retag, so without this the
-                // Codex history menu stays empty after an update restart. Mirror
-                // the quit retag whenever Codex is still configured.
-                if client_adapters::is_codex_enabled() {
+        // Older builds retagged threads on GUI exit. Repair those tags even
+        // when no remembered setup needs restoring.
+        if client_adapters::is_codex_enabled() {
                     client_adapters::reconcile_codex_thread_providers_on_launch();
                 }
             });
@@ -5718,7 +5724,6 @@ pub fn run() {
                         let _ = client_adapters::clear_client_setups_preserving_codex();
                     }
                     app.state::<AppState>().stop_headroom();
-                    client_adapters::retag_codex_threads_to_native();
                     finish_runtime_session();
                 }
                 _ => {}
@@ -9208,6 +9213,99 @@ mod tests {
         )))
         .expect_err("other failures still bubble up");
         assert!(real.contains("connection reset"), "{real}");
+    }
+
+    #[tokio::test]
+    async fn app_update_http_client_bounds_stalled_headers_and_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        async fn stalled_request(send_headers: bool) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0; 2048];
+                assert!(stream.read(&mut request).await.unwrap() > 0);
+                if send_headers {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n")
+                        .await
+                        .unwrap();
+                }
+                std::future::pending::<()>().await;
+                drop(stream);
+            });
+            let client =
+                super::configure_app_update_client(reqwest_updater::Client::builder().no_proxy())
+                    .build()
+                    .unwrap();
+            let result = tokio::time::timeout(
+                super::APP_UPDATE_READ_TIMEOUT + std::time::Duration::from_secs(10),
+                async {
+                    client
+                        .get(format!("http://{address}/update"))
+                        .send()
+                        .await?
+                        .bytes()
+                        .await
+                },
+            )
+            .await;
+            server.abort();
+            let error = result
+                .expect("a stalled updater read must finish")
+                .unwrap_err();
+            assert!(error.is_timeout(), "{error}");
+        }
+
+        tokio::join!(stalled_request(false), stalled_request(true));
+    }
+
+    #[tokio::test]
+    async fn app_update_http_client_allows_progress_beyond_idle_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let interval = super::APP_UPDATE_READ_TIMEOUT / 4;
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            assert!(stream.read(&mut request).await.unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n")
+                .await
+                .unwrap();
+            for _ in 0..5 {
+                tokio::time::sleep(interval).await;
+                stream.write_all(b"x").await.unwrap();
+            }
+        });
+        let client =
+            super::configure_app_update_client(reqwest_updater::Client::builder().no_proxy())
+                .build()
+                .unwrap();
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            super::APP_UPDATE_READ_TIMEOUT + std::time::Duration::from_secs(15),
+            async {
+                client
+                    .get(format!("http://{address}/update"))
+                    .send()
+                    .await?
+                    .bytes()
+                    .await
+            },
+        )
+        .await;
+        server.abort();
+        let body = result.expect("progressing download must finish").unwrap();
+        assert_eq!(body.as_ref(), b"xxxxx");
+        assert!(started.elapsed() >= super::APP_UPDATE_READ_TIMEOUT);
     }
 
     #[test]

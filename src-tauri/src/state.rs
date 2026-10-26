@@ -3397,6 +3397,11 @@ impl AppState {
             headroom_learn_disabled_reason,
             startup_error,
             startup_error_hint,
+            routing_warning: if crate::client_adapters::is_codex_enabled() {
+                crate::codex_router::migration_warning()
+            } else {
+                None
+            },
             runtime_upgrade_failure: self.runtime_upgrade_failure(),
             rtk: RtkRuntimeStatus {
                 installed: rtk_installed,

@@ -102,4 +102,39 @@ describe("JevOverviewCard", () => {
     expect(await screen.findByText(/还没有决策记录/)).toBeInTheDocument();
     expect(invokeMock).toHaveBeenCalledTimes(2);
   });
+
+  it("warns when automatic records are incomplete while retaining the readable metrics", async () => {
+    invokeMock.mockResolvedValue({
+      autoError: "jev_auto_records_read",
+      records: [nativeRecord],
+    });
+    render(<JevOverviewCard active onOpenDecisions={vi.fn()} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("记录不完整");
+    expect(screen.getByRole("alert")).toHaveTextContent("以下指标仅包含已读取的记录");
+    expect(screen.getByText("请求数").parentElement).toHaveTextContent("1");
+    expect(screen.getByText("100.0%")).toBeInTheDocument();
+    expect(screen.getByText("输出 token（已上报）").parentElement).toHaveTextContent("4");
+    expect(screen.getByRole("img", { name: "成功 1 条，失败 0 条" })).toBeInTheDocument();
+    expect(screen.queryByText(/还没有决策记录/)).not.toBeInTheDocument();
+    expect(screen.queryByText("jev_auto_records_read")).not.toBeInTheDocument();
+  });
+
+  it("does not claim history is empty when no records could be read and allows retry", async () => {
+    invokeMock
+      .mockResolvedValueOnce({ autoError: "jev_auto_records_read", records: [] })
+      .mockResolvedValueOnce({ autoError: null, records: [] });
+    render(<JevOverviewCard active onOpenDecisions={vi.fn()} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("记录不完整");
+    expect(screen.getByRole("alert")).toHaveTextContent("目前没有可显示的记录");
+    expect(screen.queryByText(/还没有决策记录/)).not.toBeInTheDocument();
+    expect(screen.queryByText("调用成功率")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "重试" }));
+    expect(await screen.findByText(/还没有决策记录/)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+    expect(invokeMock).toHaveBeenCalledWith("get_jev_dashboard");
+  });
 });

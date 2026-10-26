@@ -24,6 +24,9 @@ function indicator(runtime: RuntimeStatus | null) {
 describe("RuntimeStatusIndicator", () => {
   it.each([
     ["healthy", {}, "running"],
+    ["healthy with no routing warning", { routingWarning: null }, "running"],
+    ["healthy with an empty routing warning", { routingWarning: "  " }, "running"],
+    ["healthy proxy awaiting safe router migration", { routingWarning: "Router migration needs attention" }, "error"],
     ["starting before health checks finish", { starting: true }, "starting"],
     ["retrying an earlier failure", { starting: true, startupError: "old failure", autoPaused: true }, "starting"],
     ["startup failed", { running: false, proxyReachable: false, startupError: "failed" }, "error"],
@@ -44,6 +47,16 @@ describe("RuntimeStatusIndicator", () => {
     const status = screen.getByRole("status");
     expect(status).toHaveAttribute("data-runtime-state", "starting");
     expect(status).toHaveAttribute("title", "Checking local proxy");
+  });
+
+  it("shows routing attention without changing the real process or proxy status", () => {
+    const runtime = Object.freeze({ ...healthy, routingWarning: "Router migration needs attention" });
+    render(indicator(runtime));
+    const status = screen.getByRole("status");
+    expect(status).toHaveAttribute("data-runtime-state", "error");
+    expect(status).toHaveAttribute("title", "Proxy needs attention");
+    expect(runtime.running).toBe(true);
+    expect(runtime.proxyReachable).toBe(true);
   });
 
   it("updates through stopped, starting, running, and failed polling responses", () => {

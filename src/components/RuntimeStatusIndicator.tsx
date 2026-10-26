@@ -16,6 +16,7 @@ function runtimeState(runtime: RuntimeStatus | null): RuntimeState {
   if (runtime.paused) return "stopped";
   if (runtime.startupError) return "error";
   if (runtime.bypassed || !runtime.installed) return "stopped";
+  if (runtime.routingWarning?.trim()) return "error";
   if (runtime.running !== runtime.proxyReachable) return "error";
   return runtime.running ? "running" : "stopped";
 }

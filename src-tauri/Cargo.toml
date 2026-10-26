@@ -1,6 +1,6 @@
 [package]
 name = "headroom-local-community"
-version = "1.0.23"
+version = "1.0.24"
 description = "Unofficial local-only community desktop for open-source Headroom tooling"
 authors = ["Headroom Local Community contributors"]
 license = "MIT"
@@ -31,10 +31,12 @@ os_info = "3.10"
 parking_lot = "0.12"
 rand = "0.9"
 reqwest = { version = "=0.12.28", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest-updater = { package = "reqwest", version = "=0.13.2", default-features = false }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sentry = { version = "0.35", default-features = false, features = ["backtrace", "contexts", "panic", "reqwest", "rustls"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.149"
+serde_norway = "0.9.42"
 sha2 = "=0.10.9"
 sys-locale = "0.3"
 tar = "0.4"
@@ -45,7 +47,7 @@ tauri-plugin-deep-link = "2"
 tauri-plugin-dialog = "=2.7.1"
 tauri-plugin-notification = "2.3.3"
 tauri-plugin-single-instance = "2"
-tauri-plugin-updater = "2.10.0"
+tauri-plugin-updater = "~2.10.0"
 time = "=0.3.47"
 toml = "0.8"
 toml_edit = "=0.23.4"
@@ -53,6 +55,7 @@ tokio = { version = "=1.50.0", features = ["macros", "rt-multi-thread", "process
 uuid = { version = "=1.22.0", features = ["v4", "serde"] }
 
 [dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 minisign-verify = "0.2.5"
 serial_test = "3"
 

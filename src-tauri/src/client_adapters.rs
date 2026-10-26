@@ -1354,8 +1354,8 @@ fn disable_legacy_client_setup(client_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Clear only Headroom's Codex route while retaining Codex's stable local-router
-/// configuration. The router is switched to native forwarding by lifecycle
+/// Snapshot Codex setup while retaining its stable local-router configuration.
+/// The router is switched to native forwarding by lifecycle
 /// callers before the Headroom backend is stopped, so existing Codex sessions
 /// keep using the same URL while the GUI is closed or has crashed.
 pub fn clear_client_setups_preserving_codex() -> Result<()> {
@@ -1406,7 +1406,13 @@ fn clear_codex_client_setups_with_options(preserve_codex: bool) -> Result<()> {
     // The legacy helper is deliberately invoked only for Codex. It may retain
     // its broader implementation for migration tests, but this public path
     // never dispatches it for Claude, OpenCode, ZCode, or Grok.
-    disable_legacy_client_setup("codex")?;
+    if preserve_codex {
+        // Remove old launchctl overrides without changing the stable route,
+        // shell blocks, provider backup, or thread tags.
+        disable_codex_gui()?;
+    } else {
+        disable_legacy_client_setup("codex")?;
+    }
 
     let mut next = pre;
     next.configured_clients
@@ -3753,21 +3759,8 @@ fn retag_one_codex_db(path: &Path, from: &str, to: &str) -> rusqlite::Result<Opt
     .map(Some)
 }
 
-/// Retag Codex threads back to the native provider. Exposed for the app-quit
-/// hook in `lib.rs`, which covers exit paths (Cmd-Q, dock quit, signals) that
-/// bypass `clear_client_setups` and therefore the disconnect retag.
-pub fn retag_codex_threads_to_native() {
-    // Nothing to hand back when the route was never ours.
-    if codex_route_is_ours() {
-        retag_codex_thread_providers(CODEX_HEADROOM_PROVIDER, CODEX_NATIVE_PROVIDER);
-    }
-}
-
-/// Point Codex's thread provider tags at whoever actually routes Codex.
-/// Exposed for the app-launch hook in `lib.rs`, which must undo the quit-time
-/// native retag on the exit paths (Cmd-Q, dock quit, app-update restart) that
-/// never populate `remembered_clients` and are therefore skipped by
-/// `restore_client_setups`.
+/// Point Codex's thread provider tags at whoever currently routes Codex.
+/// Reconcile older exit-time retags and route changes made by another manager.
 ///
 /// Ownership decides the direction, because the tag is a claim about where
 /// those threads are served. When another manager owns the route -- Cockpit
@@ -4324,34 +4317,34 @@ pub(crate) fn codex_root_provider_for_router() -> Option<String> {
 /// legacy/API-key sessions whose route is supplied through environment
 /// variables instead.
 pub(crate) fn codex_root_provider_allows_native_fallback() -> bool {
-    let path = codex_config_toml_path();
-    let Ok(content) = std::fs::read_to_string(path) else {
-        // A missing file is a valid API-key setup when OPENAI_BASE_URL is
-        // supplied by the shell/environment rather than config.toml.
-        return true;
+    codex_native_fallback_config_allowed(std::fs::read_to_string(codex_config_toml_path()))
+}
+
+fn codex_native_fallback_config_allowed(content: std::io::Result<String>) -> bool {
+    let content = match content {
+        Ok(content) => content,
+        // A missing file is a valid legacy/API-key environment-only setup.
+        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
     };
-    let provider_allowed = codex_root_model_provider(&content)
-        .as_deref()
-        // The legacy official `headroom` provider is safe to migrate *from*,
-        // but its table may still point at an old local port. The root URL
-        // check below decides whether that stale route may be treated as
-        // native; an unknown provider is always denied.
-        .map(|provider| matches!(provider, CODEX_NATIVE_PROVIDER | CODEX_HEADROOM_PROVIDER))
-        .unwrap_or(true);
-    if !provider_allowed {
+    // Takeover's text reader can repair older configs. Forwarding must instead
+    // resolve TOML keys exactly and reject ambiguity before sending auth.
+    let Ok(config) = toml::from_str::<toml::Value>(&content) else {
         return false;
+    };
+    match config.get("model_provider") {
+        None => {}
+        Some(toml::Value::String(provider))
+            if matches!(
+                provider.as_str(),
+                CODEX_NATIVE_PROVIDER | CODEX_HEADROOM_PROVIDER
+            ) => {}
+        Some(_) => return false,
     }
-    // A user can keep the native provider name while overriding its root URL
-    // with a corporate gateway. Validate that URL too; otherwise the detached
-    // helper would silently send the gateway's credential to OpenAI after a
-    // Headroom crash.
-    codex_root_openai_base_urls(&content)
-        .map(|values| {
-            values
-                .iter()
-                .all(|value| codex_native_fallback_base_url_allowed(value))
-        })
-        .unwrap_or(false)
+    match config.get("openai_base_url") {
+        None => true,
+        Some(toml::Value::String(value)) => codex_native_fallback_base_url_allowed(value),
+        Some(_) => false,
+    }
 }
 
 /// Drop any root-scope `model_provider = ...` line so the managed block's
@@ -8759,6 +8752,57 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn public_preserving_clear_keeps_codex_config_threads_and_takeover_backup() {
+        let home = TestHome::new();
+        let codex = home.path().join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        let path = codex.join("config.toml");
+        let original = "# user comment\nmodel_provider = \"headroom\"\n\n[model_providers.headroom]\nbase_url = \"https://gateway.example.invalid/v1\"\n";
+        let managed = super::render_codex_config(original).unwrap();
+        fs::write(&path, &managed).unwrap();
+        let db = codex.join("state_5.sqlite");
+        seed_codex_threads_db(
+            &db,
+            &[("ours", "headroom_local_community"), ("other", "gateway")],
+        );
+        let mut state = super::ClientSetupState::default();
+        state
+            .configured_clients
+            .insert("codex_cli".into(), "configured".into());
+        state
+            .preserved_base_urls
+            .insert("codex_cli".into(), "headroom".into());
+        super::write_setup_state(&mut state).unwrap();
+
+        for _ in 0..2 {
+            super::clear_client_setups_preserving_codex().unwrap();
+            assert_eq!(fs::read_to_string(&path).unwrap(), managed);
+            assert!(super::is_codex_enabled());
+            let state = super::load_setup_state();
+            assert_eq!(
+                state
+                    .preserved_base_urls
+                    .get("codex_cli")
+                    .map(String::as_str),
+                Some("headroom")
+            );
+            assert!(state.remembered_clients.contains_key("codex_cli"));
+            assert_eq!(provider_count(&db, "headroom_local_community"), 1);
+            assert_eq!(provider_count(&db, "gateway"), 1);
+            assert_eq!(provider_count(&db, "openai"), 0);
+        }
+
+        super::disable_client_setup("codex").unwrap();
+        let restored: toml::Value = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(restored["model_provider"].as_str(), Some("headroom"));
+        assert!(!super::is_codex_enabled());
+        assert_eq!(provider_count(&db, "headroom_local_community"), 0);
+        assert_eq!(provider_count(&db, "openai"), 1);
+        assert_eq!(provider_count(&db, "gateway"), 1);
+    }
+
     use super::{
         build_claude_guard_script, build_codex_guard_script, build_headroom_markitdown_hook,
         build_headroom_rtk_hook, build_markitdown_codex_nudge, build_markitdown_office_nudge,
@@ -8769,7 +8813,7 @@ mod tests {
         normalize_setup_state, normalized_setup_id, nvm_binary_candidates, oss_remnant_warnings,
         parse_json_object, pin_codex_mcp_command, reconcile_codex_thread_providers_on_launch,
         remove_managed_block, remove_pre_tool_use_markers, render_codex_config,
-        retag_codex_thread_providers, retag_codex_threads_to_native, retag_one_codex_db,
+        retag_codex_thread_providers, retag_one_codex_db,
         serialize_paths,
         shell_block_contains_in_files, shell_block_contains_text_in_files, shell_double_quote,
         strip_headroom_hook_from_settings, upsert_managed_block, write_file_if_changed,
@@ -13190,6 +13234,61 @@ keep rtk\n\
     }
 
     #[test]
+    fn codex_native_fallback_only_defaults_on_not_found() {
+        assert!(super::codex_native_fallback_config_allowed(Err(
+            std::io::Error::from(std::io::ErrorKind::NotFound)
+        )));
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::Other,
+        ] {
+            assert!(!super::codex_native_fallback_config_allowed(Err(
+                std::io::Error::from(kind)
+            )));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_native_fallback_uses_toml_root_key_semantics() {
+        let home = TestHome::new();
+        let path = home.path().join(".codex/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for (content, allowed) in [
+            ("\"model_provider\" = \"gateway\"\n[model_providers.gateway]\nbase_url = \"https://gateway.example.invalid/v1\"\n", false),
+            ("'model_provider' = 'openai'\n", true),
+            ("model_provider = 'headroom_local_community'\n", true),
+            ("model_provider = ''\n", false),
+            ("model_provider = 17\n", false),
+            ("model_provider = \"openai\"\n[broken\n", false),
+            ("\"openai_base_url\" = \"https://gateway.example.invalid/v1\"\n", false),
+            ("openai_base_url = 17\n", false),
+            ("'openai_base_url' = 'https://api.openai.com/v1'\n", true),
+            ("[profiles.gateway]\nmodel_provider = 'gateway'\n", true),
+        ] {
+            fs::write(&path, content).unwrap();
+            assert_eq!(super::codex_root_provider_allows_native_fallback(), allowed, "route decision for synthetic config: {content}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn codex_native_fallback_rejects_unreadable_config_but_allows_missing_file() {
+        let home = TestHome::new();
+        let path = home.path().join(".codex/config.toml");
+        assert!(super::codex_root_provider_allows_native_fallback());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"model_provider = \"gateway\"\n\xff").unwrap();
+        assert!(!super::codex_root_provider_allows_native_fallback());
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(!super::codex_root_provider_allows_native_fallback());
+    }
+
+    #[test]
     fn codex_takeover_allowlist_keeps_native_and_headroom_routes_only() {
         assert!(super::codex_takeover_provider_allowed("openai"));
         assert!(super::codex_takeover_provider_allowed("headroom"));
@@ -14705,35 +14804,31 @@ keep rtk\n\
         );
     }
 
-    /// The exit hook follows the same rule: with another tool routing Codex
-    /// there is nothing of ours to hand back.
+    /// Startup follows the active provider; GUI exit keeps that route and tags.
     #[test]
     #[serial_test::serial]
     fn thread_retag_hooks_are_gated_on_owning_the_codex_route() {
         let home = TestHome::new();
         let codex = home.path().join(".codex");
-        std::fs::create_dir_all(&codex).unwrap();
+        fs::create_dir_all(&codex).unwrap();
         let db = codex.join("state_5.sqlite");
         seed_codex_threads_db(&db, &[("a", "openai")]);
 
-        // No config.toml at all: Headroom is not routing anything.
         assert!(!codex_route_is_ours());
-        retag_codex_threads_to_native();
         reconcile_codex_thread_providers_on_launch();
         assert_eq!(provider_count(&db, "openai"), 1);
         assert_eq!(provider_count(&db, "headroom_local_community"), 0);
 
-        // Route ours: launch pulls threads in, exit hands them back.
-        std::fs::write(
+        fs::write(
             codex.join("config.toml"),
             "model_provider = \"headroom_local_community\"\n",
         )
         .unwrap();
         assert!(codex_route_is_ours());
         reconcile_codex_thread_providers_on_launch();
+        super::clear_client_setups_preserving_codex().unwrap();
         assert_eq!(provider_count(&db, "headroom_local_community"), 1);
-        retag_codex_threads_to_native();
-        assert_eq!(provider_count(&db, "openai"), 1);
+        assert_eq!(provider_count(&db, "openai"), 0);
     }
 
     #[test]

@@ -58,7 +58,13 @@ pub const ROUTER_PROTOCOL_VERSION: &str = "2";
 /// Advertise both the wire-protocol generation and the package version for
 /// diagnostics. The build suffix also replaces an affected helper when a
 /// locally rebuilt app retains the same package version.
-pub const ROUTER_RUNTIME_VERSION: &str = concat!("2/", env!("CARGO_PKG_VERSION"), "+drain.1");
+pub const ROUTER_RUNTIME_VERSION: &str = concat!(
+    "2/",
+    env!("CARGO_PKG_VERSION"),
+    "+drain.1+strict-fallback.1"
+);
+
+const LEGACY_ROUTER_MIGRATION_HINT: &str = "旧版 Codex 路由已保留运行，新请求使用直连，现有连接不会被主动关闭。请在当前任务结束后重启电脑一次，完成路由迁移。";
 
 /// Argument understood by the desktop executable before Tauri startup.
 pub const ROUTER_ARG: &str = "--headroom-codex-router";
@@ -138,6 +144,25 @@ static START_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static HEARTBEAT_LIFECYCLE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static HEARTBEAT_GENERATION: AtomicU64 = AtomicU64::new(0);
 static ROUTER_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+static MIGRATION_WARNING: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+pub(crate) fn migration_warning() -> Option<String> {
+    migration_warning_slot().lock().clone()
+}
+
+fn migration_warning_slot() -> &'static Mutex<Option<String>> {
+    MIGRATION_WARNING.get_or_init(|| Mutex::new(None))
+}
+
+fn legacy_router_migration_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::WouldBlock, LEGACY_ROUTER_MIGRATION_HINT)
+}
+
+fn keep_legacy_router_direct() -> std::io::Error {
+    stop_heartbeat();
+    *migration_warning_slot().lock() = Some(LEGACY_ROUTER_MIGRATION_HINT.to_string());
+    legacy_router_migration_error()
+}
 
 fn heartbeat_slot() -> &'static Mutex<Option<Arc<AtomicBool>>> {
     HEARTBEAT_STOP.get_or_init(|| Mutex::new(None))
@@ -200,31 +225,26 @@ pub fn ensure_running() -> std::io::Result<()> {
         // per-install state file; an old helper or unrelated process is
         // treated as an occupied port and reported to the caller before any
         // Codex config is written.
-        match probe_router_owned_version(&control_token) {
-            Some(version) if version == ROUTER_RUNTIME_VERSION => return Ok(()),
-            Some(version) if router_version_compatible(&version) => {
-                // Legacy helpers abort active Codex sockets on shutdown. Reuse
-                // them until they exit naturally instead of breaking a live turn.
-                if !version.contains("+drain.") {
-                    return Ok(());
-                }
+        let Some(version) = probe_router_owned_version(&control_token) else {
+            return Err(router_listener_unverified_error());
+        };
+        match router_reuse_action(&version, cfg!(windows)) {
+            RouterReuseAction::Current => {
+                *migration_warning_slot().lock() = None;
+                return Ok(());
+            }
+            RouterReuseAction::GracefulHandoff => {
                 shutdown_and_wait_locked()?;
             }
-            Some(_) => {
-                // A listener that proves ownership but advertises another
-                // protocol generation cannot safely be reused.  Do not send
-                // an authenticated shutdown request to it; callers can
-                // surface this error and leave the user's native Codex route
-                // intact.
+            RouterReuseAction::LegacyDirect => return Err(keep_legacy_router_direct()),
+            RouterReuseAction::Incompatible => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "Codex router protocol version is incompatible",
                 ));
             }
-            None => return Err(router_listener_unverified_error()),
         }
     }
-
     let executable = std::env::current_exe()?;
     let state = state_path();
     let mut command = crate::proc::command(executable);
@@ -256,6 +276,7 @@ pub fn ensure_running() -> std::io::Result<()> {
     let deadline = std::time::Instant::now() + STARTUP_WAIT;
     while std::time::Instant::now() < deadline {
         if probe_router_owned(&control_token) {
+            *migration_warning_slot().lock() = None;
             return Ok(());
         }
         // If something else claimed the port while our child was starting,
@@ -263,13 +284,21 @@ pub fn ensure_running() -> std::io::Result<()> {
         // keeps setup from writing a 6891 route that cannot be owned by us.
         if probe_router_public() {
             if let Some(version) = probe_router_owned_version(&control_token) {
-                if version == ROUTER_RUNTIME_VERSION {
-                    return Ok(());
-                }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "Codex router protocol version is incompatible",
-                ));
+                return match router_reuse_action(&version, cfg!(windows)) {
+                    RouterReuseAction::Current => {
+                        *migration_warning_slot().lock() = None;
+                        Ok(())
+                    }
+                    RouterReuseAction::LegacyDirect => Err(keep_legacy_router_direct()),
+                    RouterReuseAction::GracefulHandoff => Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "Codex router changed while starting; retry the routing handoff",
+                    )),
+                    RouterReuseAction::Incompatible => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Codex router protocol version is incompatible",
+                    )),
+                };
             }
             return Err(router_listener_unverified_error());
         }
@@ -856,6 +885,29 @@ fn probe_router_owned_version(token: &str) -> Option<String> {
 /// Only the same wire protocol permits authenticated replacement of an old
 /// helper. An incompatible generation fails closed without sending control
 /// traffic to it, even if it presents the ownership token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouterReuseAction {
+    Current,
+    GracefulHandoff,
+    LegacyDirect,
+    Incompatible,
+}
+
+fn router_reuse_action(version: &str, windows: bool) -> RouterReuseAction {
+    if version == ROUTER_RUNTIME_VERSION {
+        RouterReuseAction::Current
+    } else if !router_version_compatible(version) {
+        RouterReuseAction::Incompatible
+    } else if !windows && version.contains("+drain.") {
+        RouterReuseAction::GracefulHandoff
+    } else {
+        // Legacy Windows drain.1 aborts clients to release the NSIS image.
+        // Neither that implementation nor pre-drain helpers can hand off
+        // live connections safely, so only a computer restart migrates them.
+        RouterReuseAction::LegacyDirect
+    }
+}
+
 fn router_version_compatible(version: &str) -> bool {
     version
         .strip_prefix(ROUTER_PROTOCOL_VERSION)
@@ -2020,6 +2072,64 @@ mod tests {
             "HTTP/1.1 200 OK\r\n{ROUTER_HEALTH_HEADER}\r\n{ROUTER_HEALTH_HEADER}\r\n{ROUTER_VERSION_HEADER_NAME}: {ROUTER_RUNTIME_VERSION}\r\n{ROUTER_HEALTH_PROBE_ECHO_HEADER_NAME}: {token}\r\n\r\n"
         );
         assert!(parse_router_health_response(response.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn router_reuse_keeps_pre_drain_and_binary_head_helpers_direct() {
+        let rebuilt_binary_head = format!("2/{}+binary-head.1", env!("CARGO_PKG_VERSION"));
+        for version in [
+            "2/1.0.13",
+            "2/1.0.18+binary-head.1",
+            rebuilt_binary_head.as_str(),
+        ] {
+            for windows in [false, true] {
+                assert_eq!(
+                    router_reuse_action(version, windows),
+                    RouterReuseAction::LegacyDirect
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn router_reuse_requires_strict_fallback_and_safe_platform_handoff() {
+        let previous = format!("2/{}+drain.1", env!("CARGO_PKG_VERSION"));
+        assert_ne!(previous, ROUTER_RUNTIME_VERSION);
+        assert!(ROUTER_RUNTIME_VERSION.contains("+strict-fallback.1"));
+        assert_eq!(
+            router_reuse_action(&previous, false),
+            RouterReuseAction::GracefulHandoff
+        );
+        assert_eq!(
+            router_reuse_action(&previous, true),
+            RouterReuseAction::LegacyDirect
+        );
+        for windows in [false, true] {
+            assert_eq!(
+                router_reuse_action(ROUTER_RUNTIME_VERSION, windows),
+                RouterReuseAction::Current
+            );
+            assert_eq!(
+                router_reuse_action("1/1.0.13+drain.1", windows),
+                RouterReuseAction::Incompatible
+            );
+            assert_eq!(
+                router_reuse_action("20/1.0.23+drain.1", windows),
+                RouterReuseAction::Incompatible
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_router_migration_error_explains_direct_mode_and_one_time_restart() {
+        let error = legacy_router_migration_error();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        let hint = error.to_string();
+
+        assert!(hint.contains("直连"));
+        assert!(hint.contains("任务结束后"));
+        assert!(hint.contains("重启电脑一次"));
+        assert!(hint.contains("迁移"));
     }
 
     #[test]

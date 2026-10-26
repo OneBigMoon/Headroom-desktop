@@ -492,6 +492,8 @@ pub struct RuntimeStatus {
     pub headroom_learn_disabled_reason: Option<String>,
     pub startup_error: Option<String>,
     pub startup_error_hint: Option<String>,
+    #[serde(default)]
+    pub routing_warning: Option<String>,
     pub runtime_upgrade_failure: Option<RuntimeUpgradeFailure>,
     pub rtk: RtkRuntimeStatus,
 }

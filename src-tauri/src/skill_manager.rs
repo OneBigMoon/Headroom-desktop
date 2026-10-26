@@ -300,73 +300,75 @@ fn read_manifest(path: &Path) -> Result<String> {
     String::from_utf8(bytes).context("SKILL.md 必须使用 UTF-8 编码。")
 }
 
+#[derive(Debug)]
+struct YamlText(String);
+
+impl<'de> Deserialize<'de> for YamlText {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        match serde_norway::Value::deserialize(deserializer)? {
+            serde_norway::Value::String(value) => Ok(Self(value)),
+            _ => Err(serde::de::Error::custom("expected a string")),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct SkillFrontmatter {
+    name: Option<YamlText>,
+    description: Option<YamlText>,
+}
+
+fn parse_skill_frontmatter(content: &str) -> Result<(String, String)> {
+    let mut lines = content.trim_start_matches('\u{feff}').lines();
+    anyhow::ensure!(
+        lines.next().is_some_and(|line| line.trim() == "---"),
+        "技能导入需要以 --- 包围并闭合的 YAML frontmatter。"
+    );
+    let mut frontmatter = String::new();
+    let mut closed = false;
+    for line in lines {
+        if line.trim() == "---" {
+            closed = true;
+            break;
+        }
+        frontmatter.push_str(line);
+        frontmatter.push('\n');
+    }
+    anyhow::ensure!(closed, "技能导入需要以 --- 包围并闭合的 YAML frontmatter。");
+    // Validate the original YAML before deriving bounded UI text. Never include
+    // parser diagnostics here: they can contain private frontmatter values.
+    let parsed: SkillFrontmatter = serde_norway::from_str(&frontmatter)
+        .map_err(|_| anyhow!("技能 YAML frontmatter 无效；name 和 description 必须是文本。"))?;
+    let normalize = |value: Option<YamlText>| {
+        value
+            .map(|value| value.0.split_whitespace().collect::<Vec<_>>().join(" "))
+            .unwrap_or_default()
+    };
+    let name = normalize(parsed.name);
+    let description = normalize(parsed.description);
+    anyhow::ensure!(
+        !name.is_empty() && !description.is_empty(),
+        "技能导入需要非空的 name 和 description；原技能和已有文件未修改。"
+    );
+    anyhow::ensure!(
+        name.chars().count() <= 64,
+        "技能 YAML frontmatter 的 name 不能超过 64 个字符。"
+    );
+    Ok((name, description))
+}
+
 fn metadata(content: &str, fallback: &str) -> (String, String) {
-    let lines: Vec<_> = content.trim_start_matches('\u{feff}').lines().collect();
-    let mut name = fallback.to_string();
-    let mut description = String::new();
-    if lines.first().is_none_or(|line| line.trim() != "---") {
-        return (name, description);
+    match parse_skill_frontmatter(content) {
+        Ok((name, description)) => (name, description.chars().take(4000).collect()),
+        Err(_) => (fallback.to_string(), String::new()),
     }
-    let end = lines
-        .iter()
-        .skip(1)
-        .position(|line| line.trim() == "---")
-        .map(|index| index + 1)
-        .unwrap_or(1);
-    let mut index = 1;
-    while index < end {
-        let line = lines[index];
-        if line.starts_with(char::is_whitespace) {
-            index += 1;
-            continue;
-        }
-        if let Some((key, raw)) = line.split_once(':') {
-            if matches!(key.trim(), "name" | "description") {
-                let raw = raw.trim();
-                let value = if matches!(raw, ">" | ">-" | ">+" | "|" | "|-" | "|+") {
-                    let mut parts = Vec::new();
-                    while index + 1 < end
-                        && (lines[index + 1].starts_with(char::is_whitespace)
-                            || lines[index + 1].is_empty())
-                    {
-                        index += 1;
-                        parts.push(lines[index].trim());
-                    }
-                    parts.join(if raw.starts_with('|') { "\n" } else { " " })
-                } else if raw.starts_with('"') {
-                    serde_json::from_str::<String>(raw)
-                        .unwrap_or_else(|_| raw.trim_matches('"').to_string())
-                } else if raw.starts_with('\'') && raw.ends_with('\'') {
-                    raw.trim_matches('\'').replace("''", "'")
-                } else {
-                    raw.to_string()
-                };
-                if key.trim() == "name" && !value.is_empty() {
-                    name = value.chars().take(128).collect();
-                }
-                if key.trim() == "description" {
-                    description = value.chars().take(4000).collect();
-                }
-            }
-        }
-        index += 1;
-    }
-    (name, description)
 }
 
 fn validate_import_manifest(content: &str) -> Result<()> {
-    let mut lines = content.trim_start_matches('\u{feff}').lines();
-    anyhow::ensure!(
-        lines.next().is_some_and(|line| line.trim() == "---")
-            && lines.any(|line| line.trim() == "---"),
-        "技能导入需要以 --- 包围并闭合的 YAML frontmatter。"
-    );
-    let (name, description) = metadata(content, "");
-    anyhow::ensure!(
-        !name.trim().is_empty() && !description.trim().is_empty(),
-        "技能导入需要非空的 name 和 description；原技能和已有文件未修改。"
-    );
-    Ok(())
+    parse_skill_frontmatter(content).map(|_| ())
 }
 
 fn summary_at(path: &Path, scope: &str, can_toggle: bool) -> Result<SkillSummary> {
@@ -1277,6 +1279,130 @@ mod tests {
                 "fallback"
             ),
             ("quoted-skill".into(), "Quoted description".into())
+        );
+    }
+
+    fn invalid_yaml_manifests() -> Vec<String> {
+        vec![
+            "---\nname: 'unterminated\ndescription: private-sentinel\n---\n".into(),
+            "---\nname: valid\ndescription: [private-sentinel]\n---\n".into(),
+            "---\nname: valid\ndescription: {text: private-sentinel}\n---\n".into(),
+            "---\nname: valid\ndescription: '' # private-sentinel\n---\n".into(),
+            "---\nname: valid\ndescription: \" \\t \"\n---\n".into(),
+            "---\nname: 123\ndescription: private-sentinel\n---\n".into(),
+            "---\nname: valid\ndescription: true\n---\n".into(),
+            "---\nname: [private-sentinel]\ndescription: valid\n---\n".into(),
+            "---\nname: first\nname: second\ndescription: valid\n---\n".into(),
+            "---\nname: valid\ndescription: valid\nmetadata: [private-sentinel\n---\n".into(),
+            format!("---\nname: {}\ndescription: valid\n---\n", "x".repeat(65)),
+        ]
+    }
+
+    #[test]
+    fn yaml_frontmatter_validates_full_values_and_preserves_valid_multiline_fields() {
+        for content in invalid_yaml_manifests() {
+            let error = validate_import_manifest(&content).unwrap_err().to_string();
+            assert!(!error.contains("private-sentinel"));
+        }
+        let name = "界".repeat(64);
+        let content = format!(
+            "\u{feff}---\r\nname: \"{name}\"\r\ndescription: |-\r\n  First line.\r\n\r\n  Second line: with a colon.\r\nmetadata:\r\n  future: [one, two]\r\n  enabled: true\r\n---\r\n# Body\r\n"
+        );
+        assert_eq!(
+            parse_skill_frontmatter(&content).unwrap(),
+            (name, "First line. Second line: with a colon.".into())
+        );
+        let long_description = "x".repeat(4500);
+        let content =
+            format!("---\nname: long-description\ndescription: {long_description}\n---\n");
+        assert_eq!(parse_skill_frontmatter(&content).unwrap().1.len(), 4500);
+        assert_eq!(metadata(&content, "fallback").1.len(), 4000);
+        assert!(validate_import_manifest(&content).is_ok());
+    }
+
+    #[test]
+    fn yaml_validation_reaches_scan_import_commands_and_git_commit_gate() {
+        struct CodexHomeGuard(Option<std::ffi::OsString>);
+        impl Drop for CodexHomeGuard {
+            fn drop(&mut self) {
+                if let Some(value) = self.0.take() {
+                    std::env::set_var("CODEX_HOME", value);
+                } else {
+                    std::env::remove_var("CODEX_HOME");
+                }
+            }
+        }
+        let _env_lock = crate::test_env_lock::lock_home();
+        let temporary = tempfile::tempdir().unwrap();
+        let codex_home = temporary.path().join("isolated-codex");
+        fs::create_dir(&codex_home).unwrap();
+        let config = codex_home.join("config.toml");
+        fs::write(&config, "# unchanged test config\n").unwrap();
+        let _home = CodexHomeGuard(std::env::var_os("CODEX_HOME"));
+        std::env::set_var("CODEX_HOME", &codex_home);
+        let source = temporary.path().join("source");
+        let project = temporary.path().join("project");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&project).unwrap();
+        let root = project.join(".agents/skills");
+        let url = public_repository_url("https://example.invalid/collection.git").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        for content in invalid_yaml_manifests() {
+            fs::write(source.join(MANIFEST), &content).unwrap();
+            let scan = runtime
+                .block_on(scan_skill_source(display_path(&source)))
+                .unwrap();
+            assert_eq!(scan.skills.len(), 1);
+            assert!(!scan.skills[0].can_toggle);
+            assert_eq!(scan.warnings.len(), 1);
+            assert!(!scan.warnings[0].contains("private-sentinel"));
+            let imported = runtime.block_on(import_skill(
+                display_path(&source),
+                SkillTarget::Project,
+                Some(display_path(&project)),
+            ));
+            assert!(imported.is_err());
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+            assert_eq!(fs::read_to_string(source.join(MANIFEST)).unwrap(), content);
+            assert!(git_skill_summary(".", content.as_bytes(), &url, &root).is_err());
+            let stage = tempfile::tempdir_in(&root).unwrap();
+            fs::write(stage.path().join(MANIFEST), &content).unwrap();
+            assert!(publish_stage(
+                stage,
+                &root,
+                std::ffi::OsStr::new("git-skill"),
+                "project",
+                &DocumentMut::new(),
+            )
+            .is_err());
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        }
+
+        let valid = "---\nname: valid-multiline\ndescription: >-\n  Read the source.\n  Preserve every file.\nmetadata:\n  unknown: {future: true}\n---\n# Original body\n";
+        fs::write(source.join(MANIFEST), valid).unwrap();
+        let scan = runtime
+            .block_on(scan_skill_source(display_path(&source)))
+            .unwrap();
+        assert!(scan.warnings.is_empty());
+        assert_eq!(
+            scan.skills[0].description,
+            "Read the source. Preserve every file."
+        );
+        let imported = runtime
+            .block_on(import_skill(
+                display_path(&source),
+                SkillTarget::Project,
+                Some(display_path(&project)),
+            ))
+            .unwrap();
+        assert_eq!(fs::read_to_string(imported.skill_path).unwrap(), valid);
+        assert_eq!(
+            fs::read_to_string(&config).unwrap(),
+            "# unchanged test config\n"
         );
     }
 
